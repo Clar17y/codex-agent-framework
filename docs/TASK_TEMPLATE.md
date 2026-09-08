@@ -11,6 +11,8 @@ Describe the observable outcome in one or two sentences.
 
 - Required behaviour:
 - Required error or failure behaviour:
+- Complete bounded outcome: own local investigation, implementation, focused validation, routine repairs, command waiting and interpretation, and self-review until criteria pass or a concrete blocker is escalated.
+- Autonomous decisions and escalation: resolve ordinary implementation, design, and repair decisions autonomously within the contract using judgment; escalate to the primary only for concrete blockers (material product, requirements, or architectural decisions; ownership conflicts; missing authorization or unavailable prerequisites; or repeated failures requiring reassessment).
 - Compatibility requirements:
 - Performance or security constraints:
 
@@ -38,6 +40,10 @@ You must not edit:
 - unrelated user changes;
 - generated or vendored files unless explicitly listed.
 
+## Known partial work and evidence
+
+- Prior baseline, existing diffs, or evidence context if continuing or repairing; omit when starting fresh.
+
 ## Repository evidence
 
 - Relevant entry points:
@@ -47,20 +53,22 @@ You must not edit:
 
 ## Validation
 
-Run:
+Worker owns running, waiting for, and interpreting validation:
 - focused test command;
 - relevant lint/type/build command;
-- broader checks when risk, failures, uncertainty, or repository requirements warrant them.
+- repair routine failures before handoff;
+- reuse credible matching evidence; rerun only when inputs change, evidence is missing/unreliable, repository policy requires it, or a specific concern warrants it (worker claims alone are not test evidence).
 
 ## Handoff
 
-Return:
-- files changed;
-- concise design rationale;
-- commands run and results;
-- assumptions, blockers, and residual risks.
-- any concrete unresolved question that would benefit from independent scrutiny.
+Return a concise report without routine status chatter or raw command dumps:
+- completion or blocker status;
+- changed paths within assigned ownership;
+- concise design rationale and key decisions;
+- candidate identity (e.g. HEAD plus scoped diff/status);
+- exact commands run and results;
+- residual concerns and useful log locations;
 - for review repairs: finding IDs, original findings, repair diff, affected behavior, and round number.
 ```
 
-The parent agent should supply concrete acceptance criteria and ownership before an editing agent starts. If two agents need the same file, sequence their work or assign one owner.
+The parent agent supplies concrete acceptance criteria and explicit non-overlapping ownership before an editing agent starts. Substantial delegated workers own the complete bounded outcome. If two tasks need the same file, sequence their work or assign one owner; forbid overlapping writers.

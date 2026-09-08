@@ -18,7 +18,7 @@ python3 install.py
 
 Alternatively, download the ZIP from [Releases](https://github.com/Clar17y/codex-agent-framework/releases), extract it, open Terminal in the extracted directory, and run the same Python commands. No `pip install` is needed.
 
-Start a **new Codex task** after installing. Ask it to list the available custom agents and confirm that `ask-gemini` and `ask-claude` are available. The framework installs twelve personal roles. Custom role discovery depends on the Codex host; see [OpenAI's custom-agent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents). A host without custom-role support must explicitly pass the role's model, effort, and instructions when spawning.
+Start a **new Codex task** after installing. Ask it to list the available custom agents and confirm that `ask-gemini`, `ask-claude`, and `simplify` are available. The framework installs twelve personal roles. Custom role discovery depends on the Codex host; see [OpenAI's custom-agent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents). A host without custom-role support must explicitly pass the role's model, effort, and instructions when spawning.
 
 ### Connect the external providers
 
@@ -63,7 +63,7 @@ The default root is `~/.codex`. The installer honors `CODEX_HOME`; `--codex-home
 | --- | --- |
 | `agent-framework/` | Provider runner, templates, documentation, and locally generated `routing.json` |
 | `agents/` | Twelve custom agent TOML definitions |
-| `skills/ask-gemini/`, `skills/ask-claude/` | Provider delegation skills with local paths |
+| `skills/ask-gemini/`, `skills/ask-claude/`, `skills/simplify/` | Provider delegation and explicit simplification workflows with local paths |
 | `AGENTS.md` | One managed routing-policy block; surrounding instructions are preserved |
 
 Existing replaced files are backed up under `agent-framework/backups/`. `agent-framework/install-manifest.json` records file hashes and backup paths. Unrelated configuration, plugins, roles, skills, credentials, and runtime state are preserved. The installer refuses linked source/target paths and ambiguous policy markers instead of guessing. Run it from an extracted or cloned source package outside the destination Codex directory.
@@ -104,12 +104,14 @@ Tests use temporary installation roots and fake provider processes under `.llm-o
 
 On the Mac, open this repository in a new Codex task after installation and use this handoff:
 
-> Read README.md and docs/FRAMEWORK.md. Verify my installed framework without modifying unrelated Codex settings. Confirm all twelve roles and both provider skills are available. Inspect the locally generated executable paths. Run offline tests. Then run one bounded implementation smoke task and one read-only review smoke task in a scratch workspace with harmless fixture files and explicit ownership. Preserve model pins, CLI restrictions, and pending-run protections; report missing access accurately and verify the native fallback route if needed. Record actual Mac results in issue #1. Never transfer credentials, clear unresolved pending runs, or claim simulated tests establish live provider availability.
+> Read README.md and docs/FRAMEWORK.md. Verify my installed framework without modifying unrelated Codex settings. Confirm all twelve roles, both provider skills, and the simplify skill are available. Inspect the locally generated executable paths. Run offline tests. Then run one bounded implementation smoke task and one read-only review smoke task in a scratch workspace with harmless fixture files and explicit ownership. Preserve model pins, CLI restrictions, and pending-run protections; report missing access accurately and verify the native fallback route if needed. Record actual Mac results in issue #1. Never transfer credentials, clear unresolved pending runs, or claim simulated tests establish live provider availability.
 
 The [Mac port issue](https://github.com/Clar17y/codex-agent-framework/issues/1) tracks machine-specific validation. Account quota is shared by the provider account, but quota caches and ownership state are local to each machine. Use separate working copies; the framework does not coordinate writers across computers or network-mounted workspaces.
 
 ## Source package
 
-This repository contains the reviewed framework source, twelve role definitions, two skills, tests, and optional task/report templates. It excludes Windows runtime state, pending jobs, logs, credentials, personal `config.toml`, backups, and installation manifests. `{{CODEX_ROOT}}` in policy and skill source files is an installer placeholder, replaced with the selected absolute path.
+This repository contains the reviewed framework source, twelve role definitions, three skills, tests, and optional task/report templates. It excludes Windows runtime state, pending jobs, logs, credentials, personal `config.toml`, backups, and installation manifests. `{{CODEX_ROOT}}` in policy and skill source files is an installer placeholder, replaced with the selected absolute path.
 
 The provider runner is imported without behavior changes. Historical benchmark notes are retained in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) as supplied historical evidence, not new performance measurements. No third-party provider executables are bundled. The repository remains private; no open-source license has been selected.
+
+The roles include their own simplification self-check; they do not require invoking the full simplify skill. Use the installed `simplify` skill explicitly for its coordinated review-and-repair workflow. Its provider dependencies are included in this package.

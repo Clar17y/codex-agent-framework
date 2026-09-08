@@ -73,6 +73,11 @@ class TestInstallFramework(unittest.TestCase):
         claude_skill = skills_dir / "ask-claude" / "SKILL.md"
         self.assertTrue(gemini_skill.exists())
         self.assertTrue(claude_skill.exists())
+        simplify = skills_dir / 'simplify/SKILL.md'
+        self.assertTrue(simplify.exists())
+        simplify_text = simplify.read_text(encoding='utf-8')
+        self.assertNotIn('{{CODEX_ROOT}}', simplify_text)
+        self.assertIn(self.dest_root.resolve().as_posix() + '/agent-framework/docs/FRAMEWORK.md', simplify_text)
 
         # Check AGENTS.md
         agents_md = self.dest_root / "AGENTS.md"
@@ -468,7 +473,7 @@ class TestInstallFramework(unittest.TestCase):
         self.assertFalse((framework / 'backups').exists())
 
     def test_missing_runner_and_role_preflight(self):
-        for relative in ('scripts/provider_runner.py', 'agents/implementer.toml'):
+        for relative in ('scripts/provider_runner.py', 'agents/implementer.toml', 'skills/simplify/SKILL.md'):
             path = self.source_root / relative
             retained = path.with_suffix('.retained')
             path.rename(retained)

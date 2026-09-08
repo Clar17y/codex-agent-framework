@@ -87,7 +87,7 @@ def collect_sources(source):
              'routing.example.json', 'install.py', 'scripts/provider_runner.py',
              'scripts/test_provider_runner.py', 'scripts/test_install.py', 'docs/FRAMEWORK.md']
     names += [f'agents/{name}.toml' for name in ROLE_FILES]
-    names += [f'skills/{name}/SKILL.md' for name in ('ask-gemini', 'ask-claude')]
+    names += [f'skills/{name}/SKILL.md' for name in ('ask-gemini', 'ask-claude', 'simplify')]
     # Optional maintained templates, never recursive installation of state or logs.
     names += [p.relative_to(source).as_posix() for p in (source / 'docs').glob('*')
               if p.suffix in ('.md', '.json')]

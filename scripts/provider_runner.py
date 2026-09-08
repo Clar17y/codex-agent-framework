@@ -1,0 +1,507 @@
+"""Bounded external provider execution; exit 20 requests Codex Luna medium fallback."""
+import argparse
+import contextlib
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / (str(uuid.uuid4()) + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def workspace_state_dir(state_dir, workspace):
+    identity = os.path.normcase(str(Path(workspace).resolve()))
+    return state_dir / "workspaces" / hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def normalized_owned_paths(workspace, owned_paths):
+    """Return canonical workspace-relative claims; an empty list claims all files."""
+    if not isinstance(owned_paths, list) or not all(isinstance(path, str) and path for path in owned_paths):
+        raise ValueError("owned_paths must be a list of non-empty paths")
+    normalized = set()
+    for name in owned_paths:
+        if any(character in name for character in "*?"):
+            raise ValueError("Owned paths must be literal paths; wildcards are not allowed")
+        path = (workspace / name).resolve()
+        if not path.is_relative_to(workspace):
+            raise ValueError("Owned paths must remain within workspace")
+        relative = path.relative_to(workspace).as_posix()
+        if relative == ".":
+            return []
+        normalized.add(os.path.normcase(relative))
+    return sorted(normalized)
+
+
+def claims_overlap(first_workspace, first, second_workspace, second):
+    """Compare canonical claims; an empty claim is its workspace directory."""
+    left_claims = first or [os.path.normcase(str(Path(first_workspace).resolve()))]
+    right_claims = second or [os.path.normcase(str(Path(second_workspace).resolve()))]
+    for left in left_claims:
+        for right in right_claims:
+            left_path, right_path = Path(left), Path(right)
+            if left_path.is_relative_to(right_path) or right_path.is_relative_to(left_path):
+                return True
+    return False
+
+
+def pending_records(workspace_state):
+    """Read both the old workspace marker and the per-run record directory."""
+    paths = [workspace_state / "gemini-pending.json"]
+    directory = workspace_state / "gemini-pending"
+    if directory.is_dir():
+        paths.extend(sorted(directory.glob("*.json")))
+    records = []
+    for path in paths:
+        if path.exists():
+            try:
+                records.append((path, read_json(path)))
+            except (OSError, ValueError, json.JSONDecodeError):
+                # An unreadable record is uncertain and must block this workspace.
+                records.append((path, {}))
+    return records
+
+
+def pending_claims(pending):
+    """Legacy or malformed ownership deliberately fails closed to the workspace."""
+    if not isinstance(pending, dict):
+        return None, []
+    owner = pending.get("workspace")
+    if not isinstance(owner, str) or not Path(owner).is_absolute():
+        return None, []
+    workspace = Path(owner).resolve()
+    claims = pending.get("owned_paths")
+    if claims is None:
+        return workspace, []
+    try:
+        return workspace, [os.path.normcase(str((workspace / path).resolve())) for path in normalized_owned_paths(workspace, claims)]
+    except ValueError:
+        return workspace, []
+
+
+def all_pending_records(state_dir):
+    """Find per-workspace records so nested workspace aliases share claims."""
+    root = state_dir / "workspaces"
+    if not root.is_dir():
+        return []
+    records = []
+    for workspace_state in root.iterdir():
+        if workspace_state.is_dir():
+            records.extend(pending_records(workspace_state))
+    return records
+
+
+def legacy_pending_for(state_dir, workspace):
+    """Preserve old evidence, but scope identifiable legacy runs to their workspace."""
+    path = state_dir / "gemini-pending.json"
+    if not path.exists():
+        return None
+    pending = read_json(path)
+    if not isinstance(pending, dict):
+        return {}
+    if pending.get("status") == "resolved":
+        return None
+    owner = pending.get("workspace")
+    if not owner and pending.get("logs"):
+        logs = Path(pending["logs"])
+        if logs.parent.name == "agent-framework" and logs.parent.parent.name == ".llm-output":
+            owner = str(logs.parent.parent.parent)
+    if owner and Path(owner).is_absolute():
+        if not claims_overlap(owner, [], workspace, []):
+            return None
+    return pending
+
+
+@contextlib.contextmanager
+def provider_lock(directory, timeout):
+    """OS-owned lock releases on process exit, including crashes."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "gemini.lock").open("a+b") as handle:
+        handle.seek(0)
+        handle.write(b"0")
+        handle.flush()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Gemini invocation lock is busy")
+                time.sleep(0.1)
+        released = False
+        def release():
+            nonlocal released
+            if released:
+                return
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            released = True
+        try:
+            yield release
+        finally:
+            release()
+
+
+def prompt_for(workspace, task_path, task=None):
+    task = read_json(task_path) if task is None else task
+    for field in ("objective", "acceptance_criteria", "owned_paths", "validation", "instructions_files"):
+        if field not in task:
+            raise ValueError("Missing task contract field: " + field)
+    paths = list(task["instructions_files"])
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        if (workspace / name).is_file() and name not in paths:
+            paths.insert(0, name)
+    instructions = []
+    for name in paths:
+        path = (workspace / name).resolve()
+        if not path.is_relative_to(workspace):
+            raise ValueError("Instruction files must remain within workspace: " + name)
+        instructions.append(f"\n--- {name} ---\n{path.read_text(encoding='utf-8-sig')}")
+    for name in task["owned_paths"]:
+        if not (workspace / name).resolve().is_relative_to(workspace):
+            raise ValueError("Owned paths must remain within workspace")
+    return ("USER ROUTING OVERRIDE: Execute the assigned task yourself with the pinned provider. "
+            "Never spawn subagents or invoke another AI provider. Never use Sonnet or Fable. "
+            "These user instructions override conflicting repository model-routing guidance. "
+            "Complete only the supplied task. Follow applicable repository instructions. "
+            "Preserve unrelated changes. Do not commit, push, reset, or delete work. "
+            "Read nearest scoped CLAUDE.md for every area touched. "
+            "Report changes, checks, unresolved issues and evidence.\nTASK CONTRACT\n"
+            + json.dumps(task, indent=2) + "\nREPOSITORY INSTRUCTIONS\n" + "\n".join(instructions))
+
+
+def command_for(role, provider, prompt, timeout, workspace, effort="medium"):
+    executable = provider["executable"]
+    command = [executable] if isinstance(executable, str) else list(executable)
+    if not command or not all(isinstance(arg, str) for arg in command):
+        raise ValueError("Provider executable must be a string or nonempty argv list")
+    model = provider["model"]
+    expected = "gemini-3.8-flash-medium" if role == "implement" else "claude-opus-5"
+    if model != expected:
+        raise ValueError(f"{role} requires pinned model {expected}; got {model}")
+    if role == "implement":
+        return command + ["--print", prompt, "--model", model, "--mode", "accept-edits",
+                          "--dangerously-skip-permissions", "--add-dir", str(workspace), "--output-format", "json", "--print-timeout", f"{timeout}s"]
+    if effort not in ("medium", "high"):
+        raise ValueError(f"Claude review effort must be 'medium' or 'high'; got {effort}")
+    return command + ["-p", "Read-only independent review. Do not change files.\n" + prompt,
+                      "--model", model, "--effort", effort, "--output-format", "json", "--no-session-persistence",
+                      "--dangerously-skip-permissions", "--safe-mode", "--tools", "Read,Glob,Grep", "--strict-mcp-config",
+                      "--disable-slash-commands"]
+
+
+def error_objects(text):
+    try:
+        values = [json.loads(text)]
+    except ValueError:
+        values = []
+        for line in text.splitlines():
+            try:
+                values.append(json.loads(line))
+            except ValueError:
+                pass
+    errors = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        error = value.get("error")
+        if error:
+            errors.append(error if isinstance(error, dict) else {"message": str(error)})
+        if value.get("is_error") is True or value.get("type") == "error":
+            errors.append(value)
+        elif str(value.get("status", "")).upper() in ("ERROR", "FAILED", "FAILURE"):
+            errors.append({**value, "message": value.get("message", value.get("response", "Provider reported failure"))})
+    return errors
+
+
+def successful_response(text, role):
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return False
+    if not isinstance(value, dict):
+        return False
+    if value.get("denied_actions") or value.get("permission_denials"):
+        return False
+    if role == "implement":
+        return value.get("status") == "SUCCESS" and isinstance(value.get("response"), str)
+    return value.get("type") == "result" and value.get("is_error") is False and value.get("subtype") == "success"
+
+
+def permission_denials(text):
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return []
+    if not isinstance(value, dict):
+        return []
+    return value.get("denied_actions") or value.get("permission_denials") or []
+
+
+def plain_terminal_error(stderr, exit_code):
+    """Recognize only exact, standalone CLI diagnostics on failed invocations."""
+    if exit_code == 0:
+        return None
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None  # Mixed output cannot establish a terminal launch failure.
+    line = lines[0]
+    if re.fullmatch(r"Error: (?:(?:daily|plan|monthly) quota (?:exhausted|exceeded)|(?:daily|monthly) usage limit reached)[.!]?", line, re.IGNORECASE):
+        return {"code": "QUOTA_EXHAUSTED", "message": line, "source": "terminal_stderr"}
+    if re.fullmatch(r"Error: (?:not logged in|authentication required|invalid model|model not found)[.!]?", line, re.IGNORECASE):
+        return {"code": "CLI_SETUP_ERROR", "message": line, "source": "terminal_stderr"}
+    return None
+
+
+def quota_error(errors):
+    for error in errors:
+        code = str(error.get("code", error.get("status", ""))).upper()
+        message = str(error.get("message", error.get("result", ""))).lower()
+        # RESOURCE_EXHAUSTED/429 alone also means short-term throttling: do not cache.
+        if any(phrase in message for phrase in ("per minute", "per second", "requests/min", "requests/sec", "rate limit", "rate quota")):
+            continue
+        if code in ("QUOTA_EXHAUSTED", "INSUFFICIENT_QUOTA") or any(
+            phrase in message for phrase in ("daily quota exhausted", "daily quota exceeded", "daily limit exceeded",
+                                             "daily usage limit reached", "plan quota exhausted", "plan quota exceeded",
+                                             "monthly usage limit reached")
+        ):
+            return error
+    return None
+
+
+def retry_at(error, cooldown):
+    value = error.get("reset_at", error.get("resets_at"))
+    if isinstance(value, str):
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo and parsed.timestamp() > time.time():
+                return parsed.timestamp(), "provider_reset"
+        except ValueError:
+            pass
+    return time.time() + cooldown, "probe_cooldown"
+
+
+def stop_process(process):
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           capture_output=True, timeout=30, check=False)
+        finally:
+            if process.poll() is None:
+                process.kill()
+    else:
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait(timeout=10)
+
+
+def git_evidence(workspace, output):
+    paths = {}
+    for name, args in (("status", ["status", "--short"]), ("diff", ["diff", "HEAD", "--"]),
+                       ("head", ["rev-parse", "HEAD"])):
+        path = output / (name + ".txt")
+        try:
+            run = subprocess.run(["git", "-C", str(workspace)] + args,
+                                 capture_output=True, timeout=30, check=False)
+            path.write_bytes(run.stdout + run.stderr)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            path.write_text(str(exc), encoding="utf-8")
+        paths[name] = str(path)
+    return paths
+
+
+def execute(args):
+    workspace = Path(args.workspace).resolve(strict=True)
+    if not workspace.is_dir():
+        raise ValueError("Workspace must be a directory")
+    config = read_json(args.config)
+    provider_name = "gemini" if args.role == "implement" else "claude"
+    provider = config["providers"][provider_name]
+    timeout = float(config.get("timeout_seconds", 1800))
+    if timeout <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    review_effort_arg = getattr(args, "review_effort", None)
+    review_reason_arg = getattr(args, "review_reason", None)
+    if args.role == "implement":
+        if review_effort_arg is not None or review_reason_arg is not None:
+            raise ValueError("Review effort and reason options are only permitted for review role")
+        review_effort = None
+        review_reason = None
+    else:
+        configured_effort = provider.get("effort", "medium")
+        if configured_effort != "medium":
+            raise ValueError(f"Configured Claude effort must be 'medium'; got {configured_effort}")
+        if review_effort_arg is None:
+            review_effort = "medium"
+        elif review_effort_arg in ("medium", "high"):
+            review_effort = review_effort_arg
+        else:
+            raise ValueError(f"Claude review effort must be 'medium' or 'high'; got {review_effort_arg}")
+        if review_effort == "high":
+            if not review_reason_arg or not review_reason_arg.strip():
+                raise ValueError("High review effort requires a non-empty review reason")
+            review_reason = review_reason_arg.strip()
+        else:
+            review_reason = review_reason_arg.strip() if (review_reason_arg and review_reason_arg.strip()) else None
+    task = read_json(args.task_file)
+    owned_paths = normalized_owned_paths(workspace, task.get("owned_paths"))
+    owned_claims = [os.path.normcase(str((workspace / path).resolve())) for path in owned_paths]
+    prompt = prompt_for(workspace, args.task_file, task)
+    command = command_for(args.role, provider, prompt, timeout, workspace, review_effort or "medium")
+    state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
+    if args.dry_run:
+        dry_run_meta = {"status": "dry_run", "provider": provider_name, "model": provider["model"],
+                        "cwd": str(workspace), "command": command, "state_dir": str(state_dir)}
+        if args.role == "review":
+            dry_run_meta["review_effort"] = review_effort
+            dry_run_meta["review_reason"] = review_reason
+        return dry_run_meta, 0
+    output = workspace / ".llm-output" / "agent-framework" / str(uuid.uuid4())
+    output.mkdir(parents=True)
+    # Avoid Windows' command-line length limit; providers have a Read tool.
+    prompt_path = output / "prompt.txt"
+    prompt_path.write_text(prompt, encoding="utf-8")
+    command = command_for(args.role, provider,
+                          f"Read the complete task contract and instructions in {prompt_path} and follow them. "
+                          "Execute the task yourself; never spawn subagents or use another AI provider.", timeout, workspace, review_effort or "medium")
+    result = {"provider": provider_name, "model": provider["model"], "logs": str(output)}
+    if args.role == "review":
+        result["review_effort"] = review_effort
+        result["review_reason"] = review_reason
+    workspace_state = workspace_state_dir(state_dir, workspace)
+    # This lock covers only the check-and-claim transaction.  Provider processes run
+    # concurrently once their disjoint ownership claims have been persisted.
+    lock = provider_lock(state_dir, float(config.get("lock_timeout_seconds", 30))) if args.role == "implement" else contextlib.nullcontext()
+    try:
+        with lock as release_claim_lock:
+            state_path = state_dir / "gemini-quota.json"
+            pending_path = workspace_state / "gemini-pending" / (str(uuid.uuid4()) + ".json")
+            if args.role == "implement":
+                pending_path.parent.mkdir(parents=True, exist_ok=True)
+                result["pending_path"] = str(pending_path)
+                legacy = legacy_pending_for(state_dir, workspace)
+                if legacy is not None:
+                    result.update(status="blocked_pending_run", pending=legacy,
+                                  pending_path=str(state_dir / "gemini-pending.json"),
+                                  error="Unresolved legacy run belongs to this workspace or has unknown ownership. Confirm it stopped before resolving its pending record.")
+                    release_claim_lock()
+                    return finish(result, output, workspace, 1)
+            if args.role == "implement":
+                for existing_path, pending in all_pending_records(state_dir):
+                    if not isinstance(pending, dict) or pending.get("status") != "resolved":
+                        pending_workspace, pending_owned_paths = pending_claims(pending)
+                        if pending_workspace is None or claims_overlap(workspace, owned_claims, pending_workspace, pending_owned_paths):
+                            result.update(status="blocked_pending_run", pending=pending,
+                                          pending_path=str(existing_path),
+                                          error="An unresolved provider run owns overlapping paths. Confirm it stopped, then mark its pending record resolved before retrying.")
+                            release_claim_lock()
+                            return finish(result, output, workspace, 1)
+            if args.role == "implement" and state_path.exists():
+                state = read_json(state_path)
+                if state.get("retry_at", 0) > time.time():
+                    result.update(status="fallback_required", fallback={"model": "gpt-5.6-luna", "effort": "medium"}, quota=state, cached=True)
+                    release_claim_lock()
+                    return finish(result, output, workspace, 20)
+            with (output / "stdout.log").open("wb") as stdout, (output / "stderr.log").open("wb") as stderr:
+                if args.role == "implement":
+                    write_json(pending_path, {"status": "launching", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output)})
+                process = None
+                try:
+                    process = subprocess.Popen(command, cwd=workspace, shell=False, stdout=stdout, stderr=stderr,
+                                               start_new_session=os.name != "nt")
+                    if args.role == "implement":
+                        write_json(pending_path, {"status": "running", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "pid": process.pid})
+                        release_claim_lock()
+                    code = process.wait(timeout=timeout)
+                except BaseException as exc:
+                    if process is not None:
+                        stop_process(process)
+                    elif args.role == "implement" and isinstance(exc, OSError):
+                        # Popen raised before returning a process: no writer was launched.
+                        write_json(pending_path, {"status": "resolved", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "launch_error": str(exc)})
+                    raise
+            errors = error_objects((output / "stdout.log").read_text(encoding="utf-8", errors="replace"))
+            errors += error_objects((output / "stderr.log").read_text(encoding="utf-8", errors="replace"))
+            plain_error = plain_terminal_error((output / "stderr.log").read_text(encoding="utf-8", errors="replace"), code)
+            if plain_error and not (output / "stdout.log").read_text(encoding="utf-8", errors="replace").strip():
+                errors.append(plain_error)
+            valid_success = successful_response((output / "stdout.log").read_text(encoding="utf-8", errors="replace"), args.role)
+            denied = permission_denials((output / "stdout.log").read_text(encoding="utf-8", errors="replace"))
+            if args.role == "implement" and (errors or valid_success or denied):
+                write_json(pending_path, {"status": "resolved", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "exit_code": code})
+            if denied:
+                result.update(status="permission_denied", exit_code=code, denied_actions=denied,
+                              error="Provider denied required tools or file access. Task is incomplete; no automatic fallback or permission bypass.")
+                return finish(result, output, workspace, 1)
+            quota = quota_error(errors) if args.role == "implement" and not valid_success else None
+            if quota:
+                next_attempt, source = retry_at(quota, float(config.get("quota_probe_seconds", 3600)))
+                state = {"retry_at": next_attempt, "reason": source, "error": quota}
+                write_json(state_path, state)
+                result.update(status="fallback_required", fallback={"model": "gpt-5.6-luna", "effort": "medium"}, quota=state, cached=False)
+                return finish(result, output, workspace, 20)
+            result.update(status="completed" if code == 0 and not errors and valid_success else "provider_error", exit_code=code)
+            if args.role == "implement" and not errors and not valid_success:
+                result["error"] = "No structured terminal result; backend completion uncertain. Pending state blocks new implementation until confirmed stopped."
+            return finish(result, output, workspace, 0 if result["status"] == "completed" else 1)
+    except subprocess.TimeoutExpired:
+        result.update(status="timeout", error="CLI process tree stopped after timeout; provider backend completion remains unverified. No automatic fallback. Confirm provider session stopped before resolving pending state.")
+    except (OSError, ValueError, TimeoutError) as exc:
+        result.update(status="setup_error", error=str(exc))
+    except KeyboardInterrupt:
+        result.update(status="cancelled", error="CLI process tree stopped on interruption; provider backend completion remains unverified. No automatic fallback. Confirm provider session stopped before resolving pending state.")
+    return finish(result, output, workspace, 1)
+
+
+def finish(result, output, workspace, code):
+    result["evidence"] = git_evidence(workspace, output)
+    write_json(output / "result.json", result)
+    return result, code
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("role", choices=("implement", "review"))
+    parser.add_argument("--workspace", required=True)
+    parser.add_argument("--task-file", required=True)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--state-dir")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--review-effort", choices=("medium", "high"), default=None)
+    parser.add_argument("--review-reason", default=None)
+    args = parser.parse_args()
+    try:
+        result, code = execute(args)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        result, code = {"status": "setup_error", "error": str(exc)}, 1
+    print(json.dumps(result, indent=2))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

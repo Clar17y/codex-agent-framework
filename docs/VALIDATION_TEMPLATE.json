@@ -1,0 +1,24 @@
+{
+  "usage": "Optional for evidence reuse or substantial verification. Small tasks can record commands/results in conversation or one run note. Scope identities to relevant inputs; use aggregate hashes instead of exhaustive file inventories.",
+  "candidate_before": {
+    "head": "<HEAD>",
+    "tracked_diff_hash": "<hash>",
+    "untracked_manifest": null,
+    "relevant_ignored_input_manifest": null
+  },
+  "candidate_after": {
+    "head": "<HEAD>",
+    "tracked_diff_hash": "<hash>",
+    "untracked_manifest": null,
+    "relevant_ignored_input_manifest": null
+  },
+  "command": "<exact command>",
+  "cwd": "<working directory>",
+  "exit_code": null,
+  "configuration_identity": "<config identity>",
+  "environment_identity": "<runtime/environment identity without secrets>",
+  "log": "<path to saved log>",
+  "timestamp": "<timestamp>",
+  "author": "<name or agent>",
+  "result": "unverified"
+}

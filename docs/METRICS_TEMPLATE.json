@@ -1,0 +1,11 @@
+{
+  "task_id": "<task-id>",
+  "review_batch": "<batch identifier>",
+  "review_rounds": null,
+  "actionable_findings": null,
+  "rechecks": null,
+  "recheck_reasons": [],
+  "supervisor_calls": null,
+  "tokens": null,
+  "tokens_note": "unknown when unavailable"
+}

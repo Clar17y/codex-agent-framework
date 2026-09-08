@@ -1,0 +1,17 @@
+{
+  "version": 4,
+  "providers": {
+    "gemini": {
+      "executable": "agy",
+      "model": "gemini-3.8-flash-medium"
+    },
+    "claude": {
+      "executable": "claude",
+      "model": "claude-opus-5",
+      "effort": "medium"
+    }
+  },
+  "timeout_seconds": 900,
+  "quota_probe_seconds": 3600,
+  "lock_timeout_seconds": 30
+}

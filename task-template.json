@@ -3,8 +3,8 @@
   "acceptance_criteria": [
     "Required behavior",
     "Required failure behavior",
-    "Complete bounded outcome: Own local investigation, implementation, focused validation, routine repairs, command waiting and interpretation, and self-review until criteria pass or a concrete blocker is escalated.",
-    "Autonomous decisions and escalation: Resolve ordinary implementation, design, and repair decisions autonomously within the contract using judgment. Escalate to the primary only for concrete blockers: material product, requirements, or architectural decisions; ownership conflicts; missing authorization or unavailable prerequisites; or repeated failures requiring reassessment.",
+    "For implementation tasks: Own the complete bounded outcome: local investigation, implementation, focused validation, routine repairs, command waiting and interpretation, and self-review until criteria pass or a concrete blocker is escalated.",
+    "For implementation tasks: Resolve ordinary implementation, design, and repair decisions autonomously within the contract using judgment. Escalate to the primary only for concrete blockers: material product, requirements, or architectural decisions; ownership conflicts; missing authorization or unavailable prerequisites; or repeated failures requiring reassessment.",
     "For implementation tasks: Before implementation, confirm that the assigned change addresses the underlying cause or intended feature behavior and relevant affected cases. Look for related uses and existing reusable components, keeping investigation proportional. If the assignment misses coverage or a better shared implementation would cross your owned files, tell the primary before expanding ownership; do not silently deliver a known-incomplete fix. Validate representative affected cases and mention deliberate exclusions concisely. This is a lightweight scope check, not a required report or extra review round.",
     "For implementation tasks: Before handing over implementation, inspect your changes for reuse, clarity, and unnecessary work. Apply justified simplifications within your ownership, preserve observable behavior and others' edits, and rerun affected checks if needed. Include a short summary and check results in the handoff. Perform this pass yourself; separate review or verification is chosen by the primary according to risk."
   ],
@@ -12,15 +12,15 @@
     "path/to/owned/source"
   ],
   "validation": [
-    "Worker owns running and interpreting required focused commands and repairing routine failures before handoff.",
-    "Reuse credible matching evidence; rerun only when inputs change, evidence is missing/unreliable, repository policy requires it, or a specific concern warrants it (worker claims alone are not test evidence)."
+    "For implementation or verification tasks authorized to run commands: Own running and interpreting required focused commands and repair routine failures before handoff.",
+    "Reuse credible matching evidence. Tasks authorized to run checks rerun them only when inputs change, evidence is missing or unreliable, repository policy requires it, or a specific concern warrants it (worker claims alone are not test evidence)."
   ],
   "instructions_files": [
     "AGENTS.md",
     "CLAUDE.md"
   ],
   "known_partial_work": "Prior baseline, existing diffs, or evidence context if continuing or repairing; omit when starting fresh.",
-  "handoff": "Return completion or blocker status, owned changed paths, key design decisions, candidate identity (e.g. HEAD plus scoped diff/status), exact checks and results, residual concerns, and useful log locations without chatter or raw dumps.",
+  "handoff": "Return completion or blocker status, candidate identity, key decisions or findings, checks or evidence assessed, residual concerns, and useful log locations without chatter or raw dumps. For implementation tasks, also include owned changed paths.",
   "risk": "ordinary",
   "risk_reason": "Briefly explain risk and the chosen check/review depth; no separate risk record is needed.",
   "scope": "State the affected uses or feature flow, existing reusable components, chosen owning layer, and deliberate exclusions as applicable. Keep this concise; do not create a separate scope report.",

@@ -11,8 +11,8 @@ Describe the observable outcome in one or two sentences.
 
 - Required behaviour:
 - Required error or failure behaviour:
-- Complete bounded outcome: own local investigation, implementation, focused validation, routine repairs, command waiting and interpretation, and self-review until criteria pass or a concrete blocker is escalated.
-- Autonomous decisions and escalation: resolve ordinary implementation, design, and repair decisions autonomously within the contract using judgment; escalate to the primary only for concrete blockers (material product, requirements, or architectural decisions; ownership conflicts; missing authorization or unavailable prerequisites; or repeated failures requiring reassessment).
+- For implementation tasks, own the complete bounded outcome: local investigation, implementation, focused validation, routine repairs, command waiting and interpretation, and self-review until criteria pass or a concrete blocker is escalated.
+- For implementation tasks, resolve ordinary implementation, design, and repair decisions autonomously within the contract using judgment; escalate to the primary only for concrete blockers (material product, requirements, or architectural decisions; ownership conflicts; missing authorization or unavailable prerequisites; or repeated failures requiring reassessment).
 - Compatibility requirements:
 - Performance or security constraints:
 
@@ -53,20 +53,20 @@ You must not edit:
 
 ## Validation
 
-Worker owns running, waiting for, and interpreting validation:
+For implementation or verification tasks authorized to run commands, own running, waiting for, and interpreting validation:
 - focused test command;
 - relevant lint/type/build command;
 - repair routine failures before handoff;
-- reuse credible matching evidence; rerun only when inputs change, evidence is missing/unreliable, repository policy requires it, or a specific concern warrants it (worker claims alone are not test evidence).
+- reuse credible matching evidence; tasks authorized to run checks rerun them only when inputs change, evidence is missing/unreliable, repository policy requires it, or a specific concern warrants it (worker claims alone are not test evidence).
 
 ## Handoff
 
 Return a concise report without routine status chatter or raw command dumps:
 - completion or blocker status;
-- changed paths within assigned ownership;
+- for implementation tasks, changed paths within assigned ownership;
 - concise design rationale and key decisions;
 - candidate identity (e.g. HEAD plus scoped diff/status);
-- exact commands run and results;
+- exact commands run and results, or evidence assessed for read-only tasks;
 - residual concerns and useful log locations;
 - for review repairs: finding IDs, original findings, repair diff, affected behavior, and round number.
 ```

@@ -20,11 +20,11 @@ Claude `claude-opus-5` review explicitly defaults to `--effort medium` for routi
 
 Before assigning files or editing, treat the reported example as evidence, not necessarily the full scope. For a bug, trace the cause to its owning component or layer and look for related affected uses; for a feature, identify the intended flow, integration points, and existing reusable components. Choose the smallest complete change, respecting explicit user exclusions and avoiding speculative expansion. Keep this proportional: a quick search and inspection may suffice; use the existing explorer for a bounded investigation when useful. Briefly state the cause or intended behavior, affected scope, chosen location, and any deliberate exclusions in conversation or the task handoff. No separate scope report, persona, or approval stage is needed; surface material scope decisions to the user when necessary.
 
-Implementers confirm the proposed scope and raise missing coverage or reuse opportunities before expanding file ownership. The primary remains responsible for the smallest complete change.
+Substantial delegated workers own the complete bounded outcome: local investigation, implementation, focused validation, routine repairs, command waiting and interpretation, and self-review. Implementers confirm the proposed scope and resolve ordinary implementation and design decisions autonomously within the contract. They escalate material product or architectural decisions, ownership conflicts, missing authorization or unavailable prerequisites, and repeated failures requiring reassessment. The primary remains responsible for scope, architecture, decomposition, ownership boundaries, material decisions, integration, risk assessment, and final acceptance; it does not duplicate the worker's routine execution.
 
 ## Implementation handoff
 
-Before handing over implementation, inspect your changes for reuse, clarity, and unnecessary work. Apply justified simplifications within your ownership, preserve observable behavior and others' edits, and rerun affected checks if needed. Include a short summary and check results in the handoff. Perform this pass yourself; separate review or verification is chosen by the primary according to risk.
+Before handing over implementation, inspect your changes for reuse, clarity, and unnecessary work. Apply justified simplifications within your ownership, preserve observable behavior and others' edits, and rerun affected checks if needed. Perform this pass yourself; separate review or verification is chosen by the primary according to risk. Return a concise handoff including completion or blocker status, changed paths within assigned ownership, key design decisions, candidate identity (e.g. HEAD plus scoped diff/status), exact checks and results, residual concerns, and useful log locations, without routine status chatter or raw command dumps.
 
 ## Invocation
 
@@ -47,7 +47,7 @@ Replace `implement` with `review` for Opus. Routine review explicitly passes `--
 
 ## Results and quota handling
 
-- Exit 0: provider completed; read its output and independently verify its claimed work.
+- Exit 0: provider completed; read its structured result and evidence. Reuse credible matching evidence; worker claims alone are not test evidence. Rerun checks only when relevant inputs changed, evidence is missing or unreliable, explicit repository requirements mandate it, or a specific concern warrants independent verification.
 - Exit 20 / `fallback_required`: parent launches native Luna medium immediately with the same contract, captured partial diff and prior checks. The adapter deliberately does not start nested Codex processes.
 - Other nonzero exit, including `blocked_pending_run`: report the actual provider/setup/timeout blocker and use the pre-authorized native Luna medium fallback without asking again, once file ownership is safe. It is not proof of quota exhaustion; do not modify quota state to force fallback. A previous writer must be stopped before handing over overlapping files; an unresolved run in another workspace does not block a fresh, non-overlapping Luna task. Keep pending-state protection intact and respect Codex permissions and safety review.
 
@@ -61,7 +61,7 @@ Choose implementation, review, and verification effort proportionate to the chan
 
 The routing table applies when delegation is useful. The primary may implement a small fix directly. When choosing delegated routine implementation, use Gemini first with the existing safe fallback route. If review is chosen, prefer one integrated review; revisit material findings only when the repair or remaining uncertainty needs another independent look. Repeated unsuccessful repairs are a reason to reassess the approach or ownership, rather than continue a fixed loop.
 
-The primary can run checks directly. Delegate verification when it adds useful independence or substantial parallel work, not merely to obtain a fresh agent. Record the candidate and enough relevant input, command, configuration, and environment context to judge whether evidence still applies. For small tasks, HEAD, the scoped diff/status, and command results usually suffice. Use scoped hashes or aggregate generated-input hashes when reuse or concurrent changes warrant them; avoid exhaustive repository, dependency, ignored-file, or scratch-file inventories. Rerun checks when relevant inputs changed or evidence is uncertain, stale, or missing, not just because ownership or an unrelated commit changed. Keep secrets out of records. Review output is not test evidence.
+The primary can run checks directly. Delegate verification when it adds useful independence or substantial parallel work, not merely to obtain a fresh agent. Worker claims alone are not test evidence. Reuse credible matching evidence when relevant inputs, commands, and conditions match; do not automatically duplicate verification. Require reruns only when relevant inputs changed, evidence is missing or unreliable, explicit repository requirements mandate it, or a specific concern warrants it. Record the candidate and enough relevant input, command, configuration, and environment context to judge whether evidence still applies. For small tasks, HEAD, the scoped diff/status, and command results usually suffice. Use scoped hashes or aggregate generated-input hashes when reuse or concurrent changes warrant them; avoid exhaustive repository, dependency, ignored-file, or scratch-file inventories. Keep secrets out of records. Review output is not test evidence.
 
 ## Lightweight records
 
@@ -69,7 +69,7 @@ Keep useful command logs and provider-required task/result files in the active w
 
 For a small task, conversation and PR notes are enough. If continuity or handoff needs a durable scratch record, prefer one `run.md` containing scope, decisions, material findings, and check results. The templates in `docs/` are optional aids for larger work; omit unused fields and do not automatically create a repo map, decisions file, brief, validation manifest, metrics file, and worker report. Collect metrics only when useful for diagnosing workflow cost or requested by the user.
 
-Workers report completion, blockers, owned paths, decisions, and checks concisely. Use one designated writer for shared records and avoid routine polling. Records are reconstructible and may be swept by repository scratch cleanup; keep credentials out of them. This framework provides no service, database, automatic telemetry, or provider cache.
+Workers report completion, blockers, owned paths, decisions, candidate identity, and checks concisely. Assign command, test, or CI waiting and failure diagnosis to one owner; avoid routine status polling, chatter, or duplicate monitoring by the primary. Use one designated writer for shared records. Records are reconstructible and may be swept by repository scratch cleanup; keep credentials out of them. This framework provides no service, database, automatic telemetry, or provider cache.
 
 ## Maintenance and activation
 

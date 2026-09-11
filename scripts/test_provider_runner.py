@@ -2,12 +2,14 @@ import argparse
 import concurrent.futures
 import json
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import time
 import unittest
 from unittest import mock
 import uuid
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import provider_runner as runner
 
@@ -44,6 +46,12 @@ class ProviderTests(unittest.TestCase):
         runner.write_json(path, {"objective": name, "acceptance_criteria": ["Done"],
                                  "owned_paths": owned_paths, "validation": [], "instructions_files": []})
         return path
+
+    def require_london_zone(self):
+        try:
+            ZoneInfo("Europe/London")
+        except ZoneInfoNotFoundError:
+            self.skipTest("IANA timezone data unavailable; cooldown behavior is tested separately")
 
     def test_parallel_workspaces_for_both_providers(self):
         for role in ("implement", "review"):
@@ -433,6 +441,256 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(reason, "provider_reset")
         stamp, reason = runner.retry_at({"reset_at": "invalid"}, 3600)
         self.assertEqual(reason, "probe_cooldown")
+
+    def test_gemini_individual_quota_duration_is_provider_reset(self):
+        observed = 1_000_000
+        stamp, reason = runner.retry_at({"message": "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 47h3m1s."}, 3600, observed)
+        self.assertEqual(reason, "provider_reset")
+        self.assertEqual(stamp, observed + 47 * 3600 + 3 * 60 + 1)
+        self.assertEqual(runner.quota_error([{"message": "error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 47h3m1s."}], "gemini")["message"].startswith("error:"), True)
+
+    def test_claude_dated_reset_and_explicit_matching(self):
+        self.require_london_zone()
+        observed = runner.dt.datetime(2026, 9, 11, 15, 0, tzinfo=runner.UTC).timestamp()
+        stamp, reason = runner.retry_at({"message": "You've hit your weekly limit · resets Sep 13, 2am (Europe/London)"}, 3600, observed)
+        self.assertEqual(reason, "provider_reset")
+        self.assertEqual(stamp, runner.dt.datetime(2026, 9, 13, 1, 0, tzinfo=runner.UTC).timestamp())
+        self.assertIsNotNone(runner.quota_error([{"message": "You've hit your Opus limit"}], "claude"))
+        self.assertIsNone(runner.quota_error([{"message": "The weekly limit is discussed in the task prose"}], "claude"))
+
+    def test_past_or_ambiguous_human_reset_uses_cooldown_without_year_rollover(self):
+        observed = runner.dt.datetime(2026, 9, 14, 15, 0, tzinfo=runner.UTC).timestamp()
+        for message in (
+                "You've hit your weekly limit · resets Sep 13, 2am (Europe/London)",
+                "You've hit your weekly limit · resets Sunday Sep 13, 2am (Europe/London)",
+                "You've hit your weekly limit · resets Oct 25, 1:30am (Europe/London)"):
+            with self.subTest(message=message):
+                stamp, reason = runner.retry_at({"message": message}, 3600, observed)
+                self.assertEqual((stamp, reason), (observed + 3600, "probe_cooldown"))
+
+    def test_invalid_or_conflicting_reset_data_uses_cooldown(self):
+        observed = runner.dt.datetime(2026, 9, 11, 15, 0, tzinfo=runner.UTC).timestamp()
+        for error in (
+                {"reset_at": float("inf")}, {"reset_at": True}, {"reset_at": 1e100},
+                {"message": "resets Sep 13, 25am (Europe/London)"},
+                {"message": "resets Sep 13, 0pm (Europe/London)"},
+                {"message": "resets Sep 13, 2:99am (Europe/London)"},
+                {"message": "resets Monday Sep 13, 2am (Europe/London)"},
+                {"message": "resets Sep 13, 2am (No/Such_Zone)"},
+                {"message": "resets in 2h then maybe later"}):
+            with self.subTest(error=error):
+                stamp, reason = runner.retry_at(error, 3600, observed)
+                self.assertEqual((stamp, reason), (observed + 3600, "probe_cooldown"))
+
+    def test_invalid_state_and_finite_retry_are_rejected_without_overwrite(self):
+        state_path = self.root / "state" / "gemini-quota.json"
+        state_path.parent.mkdir()
+        state_path.write_text('{"retry_at": NaN}', encoding="utf-8")
+        before = state_path.read_text()
+        with self.assertRaises(ValueError):
+            runner.quota_record("gemini", {"message": "Daily quota exhausted"}, self.root / "state", "operator", self.settings)
+        self.assertEqual(state_path.read_text(), before)
+        for value in (float("nan"), float("inf"), 0, -1, True):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    runner.retry_at({}, value)
+        self.settings["quota_probe_seconds"] = True
+        with self.assertRaisesRegex(ValueError, "finite positive"):
+            runner.quota_record("gemini", {"message": "Daily quota exhausted"}, self.root / "other-state", "operator", self.settings)
+
+    def test_claude_limit_result_falls_back_and_sonnet_only_does_not(self):
+        self.args.role = "review"
+        self.fake_result({"type": "result", "is_error": True, "result": "You've hit your limit · resets 3pm (Europe/London)"})
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("fallback_required", 20))
+        self.assertTrue((self.root / "state" / "claude-quota.json").exists())
+        self.args.workspace = str(self.root / "sonnet")
+        Path(self.args.workspace).mkdir()
+        self.args.state_dir = str(self.root / "sonnet-state")
+        self.fake_result({"type": "result", "is_error": True, "result": "You've hit your Sonnet limit"})
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("provider_error", 1))
+
+    def test_cli_quota_set_and_status_without_task(self):
+        runner.write_json(self.config, self.settings)
+        command = [sys.executable, str(Path(runner.__file__)), "quota-set", "--provider", "gemini", "--config", str(self.config), "--state-dir", str(self.root / "state"), "--reason", "operator observed exhaustion"]
+        recorded = json.loads(subprocess.check_output(command, text=True))
+        self.assertEqual(recorded["status"], "recorded")
+        command = [sys.executable, str(Path(runner.__file__)), "status", "--provider", "gemini", "--config", str(self.config), "--state-dir", str(self.root / "state")]
+        completed = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(completed.returncode, 20)
+        status = json.loads(completed.stdout)
+        self.assertEqual(status["status"], "fallback_required")
+        self.assertEqual(status["available_to_try"], 0)
+        self.assertEqual(status["cached_evidence"]["provenance"], "operator_report")
+
+    def test_status_aggregate_error_wins_over_other_provider_block(self):
+        runner.write_json(self.config, self.settings)
+        state = self.root / "state"
+        state.mkdir()
+        (state / "gemini-quota.json").write_text('{"retry_at": NaN}', encoding="utf-8")
+        runner.write_json(state / "claude-quota.json", {"retry_at": time.time() + 3600})
+        command = [sys.executable, str(Path(runner.__file__)), "status", "--config", str(self.config), "--state-dir", str(state)]
+        completed = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(completed.returncode, 1)
+        report = json.loads(completed.stdout)
+        self.assertEqual(report["providers"]["gemini"]["status"], "state_error")
+        self.assertEqual(report["providers"]["claude"]["status"], "fallback_required")
+
+    def test_status_bad_config_without_selected_provider_has_no_invented_fallback(self):
+        bad_config = self.root / "bad-config.json"
+        bad_config.write_text("{", encoding="utf-8")
+        command = [sys.executable, str(Path(runner.__file__)), "status", "--config", str(bad_config)]
+        completed = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(completed.returncode, 1)
+        self.assertNotIn("fallback", json.loads(completed.stdout))
+
+    def test_both_provider_caches_prevent_spawns_and_are_isolated(self):
+        for role, payload, filename in (
+                ("implement", {"error": {"code": "QUOTA_EXHAUSTED", "message": "Daily quota exhausted"}}, "gemini-quota.json"),
+                ("review", {"type": "result", "is_error": True, "result": "You've hit your weekly limit"}, "claude-quota.json")):
+            with self.subTest(role=role):
+                self.args.role = role
+                self.fake_result(payload)
+                self.assertEqual(self.run_provider()[1], 20)
+                self.fake.write_text("raise SystemExit('cached provider spawned')", encoding="utf-8")
+                other = self.root / (role + "-other")
+                other.mkdir()
+                self.args.workspace = str(other)
+                result, code = self.run_provider()
+                self.assertEqual((result["status"], code), ("fallback_required", 20))
+                self.assertTrue((self.root / "state" / filename).exists())
+        self.assertTrue((self.root / "state" / "gemini-quota.json").exists())
+        self.assertTrue((self.root / "state" / "claude-quota.json").exists())
+
+    def test_expired_cache_allows_attempt_and_concurrent_records_keep_longest_block(self):
+        state_dir = self.root / "state"
+        runner.write_json(state_dir / "gemini-quota.json", {"retry_at": time.time() - 1})
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("completed", 0))
+        observed = time.time()
+        with mock.patch.object(runner.time, "time", return_value=observed):
+            shorter = runner.quota_record("gemini", {"message": "Daily quota exhausted"}, state_dir, "operator", self.settings)
+            self.settings["quota_probe_seconds"] = 7200
+            longer = runner.quota_record("gemini", {"message": "Daily quota exhausted"}, state_dir, "operator", self.settings)
+        self.assertGreater(longer["retry_at"], shorter["retry_at"])
+        self.settings["quota_probe_seconds"] = 3600
+        with mock.patch.object(runner.time, "time", return_value=observed):
+            retained = runner.quota_record("gemini", {"message": "Daily quota exhausted"}, state_dir, "operator", self.settings)
+        self.assertEqual(retained["retry_at"], longer["retry_at"])
+        self.assertEqual(runner.read_json(state_dir / "gemini-quota.json")["retry_at"], longer["retry_at"])
+
+    def test_concurrent_exhaustions_leave_complete_longest_quota_record(self):
+        first, second = self.root / "quota-one", self.root / "quota-two"
+        first.mkdir()
+        second.mkdir()
+        later = (runner.dt.datetime.now(runner.UTC) + runner.dt.timedelta(hours=2)).isoformat()
+        self.fake.write_text(
+            "from pathlib import Path\nimport json\n"
+            f"reset = {later!r} if Path.cwd().name == 'quota-two' else None\n"
+            "error = {'code':'QUOTA_EXHAUSTED', 'message':'Daily quota exhausted'}\n"
+            "if reset: error['reset_at'] = reset\nprint(json.dumps({'error': error}))", encoding="utf-8")
+        runner.write_json(self.config, self.settings)
+        arguments = [argparse.Namespace(**{**vars(self.args), "workspace": str(workspace)})
+                     for workspace in (first, second)]
+        # Both requests must be in flight before either records exhaustion.
+        # Otherwise correctly skipping the second request is a valid outcome.
+        both_finished = threading.Barrier(2)
+        classify = runner.quota_error
+        def classify_together(*args):
+            both_finished.wait(timeout=5)
+            return classify(*args)
+        with mock.patch.object(runner, "quota_error", side_effect=classify_together):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(runner.execute, arguments))
+        self.assertEqual([code for _, code in results], [20, 20])
+        state = runner.read_json(self.root / "state" / "gemini-quota.json")
+        self.assertGreaterEqual(state["retry_at"], runner.dt.datetime.fromisoformat(later).timestamp())
+        self.assertEqual(state["reason"], "provider_reset")
+
+    def test_reset_boundary_never_rolls_into_next_year(self):
+        self.require_london_zone()
+        reset = runner.dt.datetime(2026, 9, 13, 1, tzinfo=runner.UTC).timestamp()
+        error = {"message": "You've hit your weekly limit · resets Sep 13, 2am (Europe/London)"}
+        self.assertEqual(runner.retry_at(error, 3600, reset - 1), (reset, "provider_reset"))
+        for observed in (reset, reset + 1):
+            self.assertEqual(runner.retry_at(error, 3600, observed), (observed + 3600, "probe_cooldown"))
+
+    def test_missing_timezone_data_uses_probe_and_offset_iso_still_works(self):
+        observed = runner.dt.datetime(2026, 9, 11, 15, tzinfo=runner.UTC).timestamp()
+        with mock.patch("zoneinfo.ZoneInfo", side_effect=ZoneInfoNotFoundError("missing")):
+            self.assertEqual(runner.retry_at({"message": "resets Sep 13, 2am (Europe/London)"}, 3600, observed),
+                             (observed + 3600, "probe_cooldown"))
+            self.assertEqual(runner.retry_at({"reset_at": "2026-09-13T02:00:00+01:00"}, 3600, observed),
+                             (runner.dt.datetime(2026, 9, 13, 1, tzinfo=runner.UTC).timestamp(), "provider_reset"))
+
+    def test_bad_provider_reset_still_records_confirmed_exhaustion(self):
+        for index, reset in enumerate((float("inf"), float("nan"), 1e100, True)):
+            with self.subTest(reset=reset):
+                self.args.state_dir = str(self.root / f"invalid-reset-{index}")
+                self.fake_result({"error": {"code": "QUOTA_EXHAUSTED", "message": "Daily quota exhausted", "reset_at": reset}})
+                result, code = self.run_provider()
+                self.assertEqual((result["status"], code), ("fallback_required", 20))
+                self.assertEqual(result["quota"]["reason"], "probe_cooldown")
+                self.assertIsNone(result["quota"]["reset_at"])
+                self.assertAlmostEqual(result["quota"]["retry_at"] - runner.dt.datetime.fromisoformat(result["quota"]["observed_at"]).timestamp(), 3600, delta=0.001)
+
+    def test_status_is_read_only_and_never_starts_a_process(self):
+        runner.write_json(self.config, self.settings)
+        args = argparse.Namespace(provider=None, config=str(self.config), state_dir=str(self.root / "missing-state"))
+        with mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("status launched a process")), \
+                mock.patch.object(runner, "write_json", side_effect=AssertionError("status wrote state")):
+            result, code = runner.cli_quota_status(args)
+        self.assertEqual(code, 0)
+        self.assertEqual({item["status"] for item in result["providers"].values()}, {"available_to_try"})
+        self.assertFalse(Path(args.state_dir).exists())
+
+    def test_unreadable_quota_is_not_treated_as_missing(self):
+        with mock.patch.object(runner, "read_json", side_effect=PermissionError("denied")):
+            state, error = runner.quota_state(self.root / "state", "claude")
+        self.assertIsNone(state)
+        self.assertIn("denied", error)
+
+    def test_error_prose_quoting_limits_does_not_poison_cache(self):
+        for provider, message in (
+                ("claude", "Unable to parse the example: You've hit your weekly limit"),
+                ("gemini", "Test failed while checking Individual quota reached"),
+                ("claude", "The task mentions daily quota exhausted but login failed")):
+            self.assertIsNone(runner.quota_error([{"message": message}], provider))
+
+    def test_in_flight_success_preserves_a_newer_exhaustion(self):
+        success = runner.successful_response
+        for role, provider, payload in (
+                ("implement", "gemini", {"status": "SUCCESS", "response": "Done"}),
+                ("review", "claude", {"type": "result", "subtype": "success", "is_error": False})):
+            self.args.role = role
+            self.args.state_dir = str(self.root / f"in-flight-{provider}")
+            path = Path(self.args.state_dir) / f"{provider}-quota.json"
+            record = {"retry_at": time.time() + 7200, "error": "Another request exhausted quota"}
+            self.fake_result(payload, code=0)
+            def observe_success(text, selected_role):
+                valid = success(text, selected_role)
+                if valid:
+                    runner.write_json(path, record)
+                return valid
+            with mock.patch.object(runner, "successful_response", side_effect=observe_success):
+                self.assertEqual(self.run_provider()[1], 0)
+            self.assertEqual(runner.read_json(path), record)
+
+    def test_manual_reset_requires_future_offset(self):
+        runner.write_json(self.config, self.settings)
+        args = argparse.Namespace(provider="claude", config=str(self.config), state_dir=str(self.root / "state"),
+                                  reason="User reported exhaustion", reset_at=None)
+        for stamp in ("invalid", "2099-01-01T12:00:00", "2000-01-01T12:00:00Z"):
+            args.reset_at = stamp
+            with self.assertRaises(ValueError):
+                runner.cli_quota_set(args)
+        self.assertFalse(Path(args.state_dir).exists())
+        args.reset_at = "2099-01-01T12:00:00+01:00"
+        result, code = runner.cli_quota_set(args)
+        self.assertEqual(code, 0)
+        self.assertEqual(result["quota"]["reset_at"], "2099-01-01T11:00:00Z")
+        self.assertEqual(result["quota"]["provenance"], "operator_report")
 
     def test_claude_omitted_legacy_config_effort_defaults_to_medium(self):
         self.args.role = "review"

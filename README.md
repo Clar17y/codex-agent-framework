@@ -92,6 +92,22 @@ Each install retains a separate backup snapshot (empty on a fresh install). Back
 
 Keep the source clone separate from the installed copy. The copied installer is retained for inspection; upgrades must run from a complete source package, which also includes the role and skill sources.
 
+## Provider availability
+
+Both provider skills check a shared local quota record before calling a CLI. When a confirmed usage limit is active, Gemini work goes straight to the native Luna medium implementer and Claude reviews go straight to the native Astra low reviewer. The adapter enforces the same check even when a caller skips the skill's preflight.
+
+Inspect either provider without contacting it or creating a task contract:
+
+```powershell
+$frameworkRoot = Join-Path $HOME '.codex/agent-framework'
+python "$frameworkRoot/scripts/provider_runner.py" status --provider gemini --config "$frameworkRoot/routing.json"
+python "$frameworkRoot/scripts/provider_runner.py" status --provider claude --config "$frameworkRoot/routing.json"
+```
+
+Use your selected Codex root if it differs. On macOS/Linux, use `python3` and the same arguments with `$HOME/.codex/agent-framework` paths. `fallback_required` returns exit 20; `available_to_try` returns 0 and means only that no cached block is active. `state_error` returns 1 and directs the orchestrator to the appropriate fallback while preserving unreadable evidence.
+
+The files are `agent-framework/state/gemini-quota.json` and `claude-quota.json`, shared by workspaces using the installed routing config. They record the failure, observation time, known reset when available, and next eligible attempt. Unknown reset times use `quota_probe_seconds` (default one hour), explicitly labeled as a probe cooldown. There is no background polling, and a status check does not measure remaining account usage. See [quota handling and manual entries](docs/FRAMEWORK.md#provider-availability-and-manual-entries) for details.
+
 ## Validation and Mac handoff
 
 Run all offline tests from the source directory:
@@ -112,6 +128,6 @@ The [Mac port issue](https://github.com/Clar17y/codex-agent-framework/issues/1) 
 
 This repository contains the reviewed framework source, twelve role definitions, three skills, tests, and optional task/report templates. It excludes Windows runtime state, pending jobs, logs, credentials, personal `config.toml`, backups, and installation manifests. `{{CODEX_ROOT}}` in policy and skill source files is an installer placeholder, replaced with the selected absolute path.
 
-The provider runner is imported without behavior changes. Historical benchmark notes are retained in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) as supplied historical evidence, not new performance measurements. No third-party provider executables are bundled. The repository remains private; no open-source license has been selected.
+The provider runner and its offline tests are maintained in `scripts/`. Historical benchmark notes are retained in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) as supplied historical evidence, not new performance measurements. No third-party provider executables are bundled. The repository remains private; no open-source license has been selected.
 
 The roles include their own simplification self-check; they do not require invoking the full simplify skill. Use the installed `simplify` skill explicitly for its coordinated review-and-repair workflow. Its provider dependencies are included in this package.

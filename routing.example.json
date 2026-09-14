@@ -1,9 +1,15 @@
 {
-  "version": 4,
+  "version": 5,
   "providers": {
     "gemini": {
       "executable": "agy",
       "model": "gemini-3.8-flash-medium"
+    },
+    "deepseek": {
+      "executable": "codex",
+      "profile": "deepseek",
+      "model": "deepseek-flash",
+      "api_key_env": "DEEPSEEK_API_KEY"
     },
     "claude": {
       "executable": "claude",

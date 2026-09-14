@@ -22,15 +22,17 @@ Start a **new Codex task** after installing. Ask it to list the available custom
 
 ### Connect the external providers
 
-Install and sign into the **Antigravity CLI (`agy`)** and **Claude Code CLI (`claude`)** on the Mac, following their official instructions:
+Install and sign into the **Antigravity CLI (`agy`)**, **Codex CLI (`codex`)** for DeepSeek, and **Claude Code CLI (`claude`)** on the Mac, following their official instructions:
 
 - [Antigravity installation and authentication](https://www.antigravity.google/docs/cli/install/)
+- [OpenAI Codex CLI setup](https://learn.chatgpt.com/docs/codex-cli) (uses profile `deepseek` and `DEEPSEEK_API_KEY` for DeepSeek Flash v4.1)
 - [Claude Code quickstart](https://code.claude.com/docs/en/quickstart)
 
 The framework installer does not install provider software or transfer sign-in credentials. It can install the native roles even when a provider CLI is absent, and reports the missing CLI. Once the providers are installed and visible on `PATH`, run:
 
 ```bash
 command -v agy
+command -v codex
 command -v claude
 python3 install.py --refresh-routing
 ```
@@ -38,10 +40,10 @@ python3 install.py --refresh-routing
 If a CLI is outside `PATH`, supply its full path:
 
 ```bash
-python3 install.py --gemini "$HOME/.local/bin/agy" --claude "$HOME/.local/bin/claude"
+python3 install.py --gemini "$HOME/.local/bin/agy" --deepseek "$HOME/.local/bin/codex" --claude "$HOME/.local/bin/claude"
 ```
 
-The existing routing is preserved: Gemini `gemini-3.8-flash-medium`, Claude `claude-opus-5` with medium review effort by default, and the configured native fallback roles. **Installation does not establish that these models are available to your account.** The Mac handoff below includes live checks.
+The existing routing is preserved: Gemini `gemini-3.8-flash-medium` as primary implementer, DeepSeek Flash v4.1 under the local `deepseek-flash` alias (profile `deepseek`) as quota-exhaustion fallback, Claude `claude-opus-5` with medium review effort by default, and configured native fallback roles (`gpt-5.6-luna` medium for implementation; Astra low for review). **Installation does not establish that these models are available to your account.** The Mac handoff below includes live checks.
 
 ### Windows
 
@@ -94,19 +96,28 @@ Keep the source clone separate from the installed copy. The copied installer is 
 
 ## Provider availability
 
-Both provider skills check a shared local quota record before calling a CLI. When a confirmed usage limit is active, Gemini work goes straight to the native Luna medium implementer and Claude reviews go straight to the native Astra low reviewer. The adapter enforces the same check even when a caller skips the skill's preflight.
+Provider skills check a shared local quota/balance record before calling a CLI. Routine implementation follows a three-tier chain: Gemini Flash (`gemini-3.8-flash-medium`) is primary; upon Gemini quota exhaustion, implementation falls back to DeepSeek Flash v4.1 (`deepseek-flash` via `codex exec -p deepseek`); if the live DeepSeek preflight finds depleted balance, a missing API key, or an unverified balance, it routes to native Luna medium (`gpt-5.6-luna`) without launching the model. A runtime HTTP 402 can occur only after launch and also routes to Luna. Non-quota Gemini failure routes directly to Luna medium. Review remains Claude-only (`claude-opus-5`), falling back to Astra low.
 
-Inspect either provider without contacting it or creating a task contract:
+Inspect provider availability without creating a task contract:
 
 ```powershell
 $frameworkRoot = Join-Path $HOME '.codex/agent-framework'
 python "$frameworkRoot/scripts/provider_runner.py" status --provider gemini --config "$frameworkRoot/routing.json"
+python "$frameworkRoot/scripts/provider_runner.py" status --provider deepseek --config "$frameworkRoot/routing.json"
 python "$frameworkRoot/scripts/provider_runner.py" status --provider claude --config "$frameworkRoot/routing.json"
 ```
 
-Use your selected Codex root if it differs. On macOS/Linux, use `python3` and the same arguments with `$HOME/.codex/agent-framework` paths. `fallback_required` returns exit 20; `available_to_try` returns 0 and means only that no cached block is active. `state_error` returns 1 and directs the orchestrator to the appropriate fallback while preserving unreadable evidence.
+To query DeepSeek's live monetary balance from the official `GET /user/balance` endpoint (using standard library `urllib.request` and `DEEPSEEK_API_KEY`), pass `--check-live`:
 
-The files are `agent-framework/state/gemini-quota.json` and `claude-quota.json`, shared by workspaces using the installed routing config. They record the failure, observation time, known reset when available, and next eligible attempt. Unknown reset times use `quota_probe_seconds` (default one hour), explicitly labeled as a probe cooldown. There is no background polling, and a status check does not measure remaining account usage. See [quota handling and manual entries](docs/FRAMEWORK.md#provider-availability-and-manual-entries) for details.
+```powershell
+python "$frameworkRoot/scripts/provider_runner.py" status --provider deepseek --check-live --config "$frameworkRoot/routing.json"
+```
+
+By default, status checks for Gemini and Claude are strictly local and read-only without contacting external providers. For DeepSeek, default status inspects the local `deepseek-balance.json` snapshot without network calls; `--check-live` performs an explicit balance query and updates the snapshot. DeepSeek credentials are removed from Gemini, Claude, and Git-evidence subprocess environments and redacted from retained framework text artifacts and structured results after a child terminates. Git evidence also disables repository-configured fsmonitor, external diff, and textconv execution. This is defense in depth, not a hard same-user process-containment boundary.
+
+Use your selected Codex root if it differs. On macOS/Linux, use `python3` and the same arguments with `$HOME/.codex/agent-framework` paths. `fallback_required` returns exit 20; `available_to_try` returns 0 and means only that no cached block is active. `state_error` or `balance_check_failed` returns 1 and directs the orchestrator to the appropriate fallback while preserving unreadable evidence.
+
+The files are `agent-framework/state/gemini-quota.json`, `claude-quota.json`, and `deepseek-balance.json`, shared by workspaces using the installed routing config. Gemini and Claude records track observation time, known reset when available, and next eligible attempt (or `quota_probe_seconds` cooldown). DeepSeek records track monetary balance, `is_available`, and observation time. There is no background polling, and a status check does not measure remaining account usage for rate-limited providers. See [quota handling and manual entries](docs/FRAMEWORK.md#provider-availability-and-manual-entries) for details.
 
 ## Validation and Mac handoff
 

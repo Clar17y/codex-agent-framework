@@ -104,7 +104,7 @@ class TestInstallFramework(unittest.TestCase):
 
         # Check manifest contents
         manifest = json.loads((af_dir / "install-manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest.get("version"), 4)
+        self.assertEqual(manifest.get("version"), 5)
         self.assertIn("installed_at", manifest)
         self.assertIsInstance(manifest.get("files"), list)
         self.assertGreater(len(manifest["files"]), 15)
@@ -118,10 +118,13 @@ class TestInstallFramework(unittest.TestCase):
 
         # Check routing.json
         routing = json.loads((af_dir / "routing.json").read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 4)
+        self.assertEqual(routing.get("version"), 5)
         self.assertIn("providers", routing)
         self.assertIn("gemini", routing["providers"])
+        self.assertIn("deepseek", routing["providers"])
         self.assertIn("claude", routing["providers"])
+        self.assertEqual(routing["providers"]["deepseek"]["model"], "deepseek-flash")
+        self.assertEqual(routing["providers"]["deepseek"]["profile"], "deepseek")
 
         # Check lock released
         self.assertFalse((self.dest_root / ".agent-framework-install.lock").exists())
@@ -543,6 +546,103 @@ class TestInstallFramework(unittest.TestCase):
         self.assertEqual(backups[0].read_bytes(), personal.read_bytes())
         self.assertFalse((self.dest_root / '.agent-framework-install.lock').exists())
         self.assertFalse((self.dest_root / 'agent-framework/install-manifest.json').exists())
+
+
+    def test_deepseek_executable_override(self):
+        """Specifying custom deepseek executable path overrides discovery."""
+        install_framework(
+            str(self.dest_root),
+            source=str(self.source_root),
+            deepseek_override="/custom/path/to/codex",
+        )
+        routing = json.loads((self.dest_root / "agent-framework/routing.json").read_text(encoding="utf-8"))
+        self.assertEqual(routing["providers"]["deepseek"]["executable"], "/custom/path/to/codex")
+        self.assertEqual(routing["providers"]["deepseek"]["profile"], "deepseek")
+        self.assertEqual(routing["providers"]["deepseek"]["model"], "deepseek-flash")
+
+    def test_upgrade_injects_deepseek_preserving_customizations(self):
+        """Upgrade on older routing.json without deepseek adds deepseek while preserving existing customizations."""
+        # 1. First install
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+
+        # 2. Simulate a pre-v5 routing file: remove deepseek, customize gemini
+        del routing["providers"]["deepseek"]
+        routing["version"] = 4
+        routing["providers"]["gemini"]["model"] = "gemini-custom-ultra"
+        routing["custom_field"] = "custom_value"
+        routing_path.write_text(json.dumps(routing, indent=2), encoding="utf-8")
+
+        # 3. Upgrade without refresh_routing
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        updated_routing = json.loads(routing_path.read_text(encoding="utf-8"))
+
+        # 4. Verify custom settings preserved and deepseek added
+        self.assertEqual(updated_routing["providers"]["gemini"]["model"], "gemini-custom-ultra")
+        self.assertEqual(updated_routing["custom_field"], "custom_value")
+        self.assertIn("deepseek", updated_routing["providers"])
+        self.assertEqual(updated_routing["providers"]["deepseek"]["model"], "deepseek-flash")
+        self.assertEqual(updated_routing["providers"]["deepseek"]["profile"], "deepseek")
+        self.assertEqual(updated_routing["providers"]["deepseek"]["api_key_env"], "DEEPSEEK_API_KEY")
+
+    def test_v5_preserves_deliberate_deepseek_absence(self):
+        """The one-time v4 migration must not re-enable a v5 opt-out by removal."""
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        del routing["providers"]["deepseek"]
+        routing["version"] = 5
+        routing_path.write_text(json.dumps(routing), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        updated = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertNotIn("deepseek", updated["providers"])
+
+    def test_malformed_routing_version_fails_preflight(self):
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        for bad_version in ("5", True, 5.0):
+            with self.subTest(version=bad_version):
+                routing["version"] = bad_version
+                routing_path.write_text(json.dumps(routing), encoding="utf-8")
+                with self.assertRaisesRegex(PreflightError, "version must be an integer"):
+                    install_framework(str(self.dest_root), source=str(self.source_root))
+
+    def test_positional_calling_convention_backward_compatibility(self):
+        """Legacy 6 positional arguments (codex_home, dry_run, gemini, claude, refresh_routing, source) must work without shift."""
+        install_framework(
+            str(self.dest_root),  # codex_home
+            False,                # dry_run
+            None,                 # gemini_override
+            None,                 # claude_override
+            False,                # refresh_routing
+            str(self.source_root) # source
+        )
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        self.assertTrue(routing_path.exists())
+        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertIn("deepseek", routing["providers"])
+        self.assertIn("gemini", routing["providers"])
+        self.assertIn("claude", routing["providers"])
+
+    def test_malformed_source_routing_fails_preflight_before_mutation(self):
+        """During migration with preserving routing, malformed source routing.example.json must raise PreflightError before mutation."""
+        # 1. Initial install
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        original_routing_bytes = routing_path.read_bytes()
+
+        # 2. Corrupt source routing.example.json
+        (self.source_root / "routing.example.json").write_text("{malformed json", encoding="utf-8")
+
+        # 3. Upgrade with preserving routing
+        with self.assertRaises(PreflightError) as ctx:
+            install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        self.assertIn("routing", str(ctx.exception).lower())
+
+        # 4. Verify no mutation occurred on target
+        self.assertEqual(routing_path.read_bytes(), original_routing_bytes)
 
 
 if __name__ == "__main__":

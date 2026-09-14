@@ -272,7 +272,6 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
             else:
                 schema_file = Path(workspace) / ".llm-output" / "output_schema.json"
             return command + ["exec", "-p", profile, "--model", model,
-                              "--sandbox", "workspace-write",
                               "--approve-for-me",
                               "-c", "shell_environment_policy.ignore_default_excludes=false",
                               "--json",

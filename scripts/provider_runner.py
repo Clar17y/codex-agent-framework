@@ -307,6 +307,16 @@ def error_objects(text):
     return errors
 
 
+def structured_error_message(errors):
+    """Return the first useful message from normalized provider errors."""
+    for error in errors:
+        for field in ("message", "result", "response"):
+            value = error.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
 def parse_deepseek_final_output(output_dir, stdout_text):
     """Parse and validate final JSON output object from DeepSeek.
     Success requires explicit success status plus a string response.
@@ -1268,7 +1278,10 @@ def execute(args):
                     return finish(result, output, workspace, 20, secrets=secrets)
 
                 result.update(status="provider_error", exit_code=code if code != 0 else 1, fallback=luna_fallback())
-                if not errors and not is_terminal:
+                if errors and not is_terminal:
+                    result["error"] = (structured_error_message(errors)
+                                       or "DeepSeek provider reported an error without details.")
+                elif not errors and not is_terminal:
                     result["error"] = "No structured terminal result from DeepSeek; output missing or malformed."
                 elif is_terminal and not valid_success:
                     result["error"] = (ds_output.get("response")

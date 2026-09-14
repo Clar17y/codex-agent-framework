@@ -1184,6 +1184,36 @@ class ProviderTests(unittest.TestCase):
         # Ensure 429 rate limit did NOT trigger code 20 or mark balance depleted
         self.assertNotEqual(code, 20)
 
+    def test_deepseek_structured_provider_error_preserves_message(self):
+        secret = "test-deepseek-secret-token"
+        detail = "Authentication failed for the configured DeepSeek profile using "
+        self.fake.write_text(
+            "import json, os, sys\n"
+            f"print(json.dumps({{'type': 'error', 'error': {{'code': 'authentication_error', 'message': {detail!r} + os.environ['DEEPSEEK_API_KEY']}}}}))\n"
+            "sys.exit(1)\n",
+            encoding="utf-8"
+        )
+        self.settings["providers"]["deepseek"] = {
+            "executable": [sys.executable, str(self.fake)],
+            "profile": "deepseek",
+            "model": "deepseek-flash",
+            "api_key_env": "TEST_DS_KEY",
+        }
+        self.args.provider = "deepseek"
+        valid_payload = {
+            "is_available": True,
+            "balance_infos": [{"currency": "USD", "total_balance": "10.00", "granted_balance": "0.00", "topped_up_balance": "10.00"}]
+        }
+        with mock.patch.dict(os.environ, {"TEST_DS_KEY": secret}):
+            with mock.patch.object(runner, "query_deepseek_balance", return_value=(valid_payload, None)):
+                result, code = self.run_provider()
+
+        self.assertEqual(code, 1)
+        self.assertEqual(result["status"], "provider_error")
+        self.assertEqual(result["error"], detail + "[REDACTED]")
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+
     def test_gemini_quota_exhaustion_points_to_deepseek_when_configured(self):
         self.settings["providers"]["deepseek"] = {
             "executable": "codex",

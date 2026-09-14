@@ -43,6 +43,43 @@ If a CLI is outside `PATH`, supply its full path:
 python3 install.py --gemini "$HOME/.local/bin/agy" --deepseek "$HOME/.local/bin/codex" --claude "$HOME/.local/bin/claude"
 ```
 
+#### Configure the DeepSeek Codex profile
+
+The routing entry installed by this framework references a user-level Codex profile named `deepseek`; the installer deliberately does not create or overwrite personal Codex profiles. Current Codex profile files live next to `config.toml` under `$CODEX_HOME` and are selected with `--profile`. On a default Mac installation, create `~/.codex/deepseek.config.toml` with the following content. If that file already exists, merge the required settings instead of overwriting it:
+
+```toml
+model = "deepseek-flash"
+model_provider = "deepseek"
+model_reasoning_effort = "high"
+web_search = "disabled"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com/"
+wire_api = "responses"
+env_key = "DEEPSEEK_API_KEY"
+env_key_instructions = "Set DEEPSEEK_API_KEY before starting Codex."
+```
+
+This follows the [official OpenAI configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference): provider settings must be user-level, profile files are selected with `--profile`, and `env_key` names the environment variable containing the credential. Never paste the API key into the TOML file. If an existing working profile specifies `model_catalog_json`, retain it and make sure its path exists on the Mac; do not copy an absolute path from another computer. Without a compatible catalog, Codex may warn that `deepseek-flash` is using fallback metadata; that warning is distinct from authentication or balance failure, but the optional paid smoke test below remains the definitive end-to-end check.
+
+Make the key available to the process that launches Codex using your normal secret-management approach. An `export` in a Terminal only reaches processes started from that shell; restart Codex after changing its environment. Then run these non-inference checks:
+
+```bash
+test -n "${DEEPSEEK_API_KEY:-}" || { echo "DEEPSEEK_API_KEY is not visible" >&2; exit 1; }
+codex --profile deepseek debug prompt-input "profile validation" >/dev/null
+python3 "$HOME/.codex/agent-framework/scripts/provider_runner.py" status \
+  --provider deepseek --check-live \
+  --config "$HOME/.codex/agent-framework/routing.json"
+```
+
+The first Codex command validates that the profile loads without starting a model run. The framework command calls DeepSeek's balance endpoint but does not invoke the model; expect `available_to_try` only when the key is accepted and the account has positive balance. A final end-to-end smoke test uses paid API tokens:
+
+```bash
+codex exec --profile deepseek --model deepseek-flash --sandbox read-only --ephemeral \
+  "Reply with exactly OK. Do not call tools."
+```
+
 The existing routing is preserved: Gemini `gemini-3.8-flash-medium` as primary implementer, DeepSeek Flash v4.1 under the local `deepseek-flash` alias (profile `deepseek`) as quota-exhaustion fallback, Claude `claude-opus-5` with medium review effort by default, and configured native fallback roles (`gpt-5.6-luna` medium for implementation; Astra low for review). **Installation does not establish that these models are available to your account.** The Mac handoff below includes live checks.
 
 ### Windows
@@ -127,7 +164,7 @@ Run all offline tests from the source directory:
 python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
-Tests use temporary installation roots and fake provider processes under `.llm-output/`. They never use real provider credentials or modify your live Codex installation. GitHub Actions runs the suite on Windows, macOS, and Linux. These checks do not prove authentication, pinned-model availability, or role discovery in the Mac's Codex app.
+Tests use temporary installation roots and fake provider processes under `.llm-output/`. They never use real provider credentials or modify your live Codex installation. GitHub Actions runs the suite on Windows, macOS, and Linux. These checks do not prove authentication, pinned-model availability, or role discovery in the Mac's Codex app; use the profile, balance, and optional paid smoke checks above for machine-specific DeepSeek validation.
 
 On the Mac, open this repository in a new Codex task after installation and use this handoff:
 

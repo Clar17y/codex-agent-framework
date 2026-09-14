@@ -61,19 +61,21 @@ env_key = "DEEPSEEK_API_KEY"
 env_key_instructions = "Set DEEPSEEK_API_KEY before starting Codex."
 ```
 
-This follows the [official OpenAI configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference): provider settings must be user-level, profile files are selected with `--profile`, and `env_key` names the environment variable containing the credential. Never paste the API key into the TOML file. If an existing working profile specifies `model_catalog_json`, retain it and make sure its path exists on the Mac; do not copy an absolute path from another computer. Without a compatible catalog, Codex may warn that `deepseek-flash` is using fallback metadata; that warning is distinct from authentication or balance failure, but the optional paid smoke test below remains the definitive end-to-end check.
+This follows the [official OpenAI configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference): provider settings must be user-level, profile files are selected with `--profile`, and `env_key` names the environment variable containing the credential. Never paste the API key into the TOML file. Do not add a `sandbox_mode` setting to this profile; the adapter's `--approve-for-me` flag selects the workspace-write sandbox. If an existing working profile specifies `model_catalog_json`, retain it and make sure its path exists on the Mac; do not copy an absolute path from another computer.
 
-Make the key available to the process that launches Codex using your normal secret-management approach. An `export` in a Terminal only reaches processes started from that shell; restart Codex after changing its environment. Then run these non-inference checks:
+The sample above, without `model_catalog_json`, was exercised against DeepSeek with Codex CLI 0.154.0 and completed successfully. Codex may warn that `deepseek-flash` is using fallback metadata; that warning is distinct from authentication or balance failure, but the optional paid smoke test below remains the definitive end-to-end check.
+
+Make the key available to the process that launches Codex using your normal secret-management approach. An `export` in a Terminal only reaches processes started from that shell; restart Codex after changing its environment. Run these non-inference checks in the environment from which you launch Codex:
 
 ```bash
-test -n "${DEEPSEEK_API_KEY:-}" || { echo "DEEPSEEK_API_KEY is not visible" >&2; exit 1; }
+if [ -z "${DEEPSEEK_API_KEY:-}" ]; then echo "DEEPSEEK_API_KEY is not visible" >&2; else echo "DEEPSEEK_API_KEY is visible"; fi
 codex --profile deepseek debug prompt-input "profile validation" >/dev/null
 python3 "$HOME/.codex/agent-framework/scripts/provider_runner.py" status \
   --provider deepseek --check-live \
   --config "$HOME/.codex/agent-framework/routing.json"
 ```
 
-The first Codex command validates that the profile loads without starting a model run. The framework command calls DeepSeek's balance endpoint but does not invoke the model; expect `available_to_try` only when the key is accepted and the account has positive balance. A final end-to-end smoke test uses paid API tokens:
+The first Codex command validates that the profile loads without starting a model run. The framework command calls DeepSeek's balance endpoint but does not invoke the model; expect `available_to_try` only when the key is accepted and the account has positive balance. If you use the Codex desktop app or an IDE integration, have a new task in that same app run the framework command too: success in a separate Terminal does not prove that the GUI process received the key. A final end-to-end smoke test uses paid API tokens:
 
 ```bash
 codex exec --profile deepseek --model deepseek-flash --sandbox read-only --ephemeral \
@@ -123,7 +125,7 @@ python3 install.py --dry-run
 python3 install.py
 ```
 
-On Windows, substitute `python`. ZIP users should download and extract a new release, then run its installer. Updates preserve installed routing settings; `--refresh-routing` resets routing from the packaged defaults and rediscovers executables. `--gemini` or `--claude` updates only the selected executable.
+On Windows, substitute `python`. ZIP users should download and extract a new release, then run its installer. Updates preserve installed routing settings; `--refresh-routing` resets routing from the packaged defaults and rediscovers executables. `--gemini`, `--deepseek`, or `--claude` updates only the selected executable.
 
 To restore an overwritten file, use its `backup` path in the installation manifest. Files that were newly created have no prior backup. Do not restore or delete entire Codex directories: they also contain unrelated settings and sessions. There is no automatic uninstaller.
 

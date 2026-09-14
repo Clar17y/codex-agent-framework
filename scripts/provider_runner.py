@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -226,6 +227,30 @@ def prompt_for(workspace, task_path, task=None):
             + json.dumps(task, indent=2) + "\nREPOSITORY INSTRUCTIONS\n" + "\n".join(instructions))
 
 
+def direct_windows_codex_command(command, platform_name=None):
+    """Replace an npm .cmd shim with its direct Node argv, without invoking cmd.exe."""
+    if (platform_name or os.name) != "nt":
+        return command
+    launcher = Path(command[0])
+    discovered = shutil.which(command[0])
+    if discovered:
+        launcher = Path(discovered)
+    if launcher.suffix.lower() not in (".cmd", ".bat"):
+        return command
+
+    launcher = launcher.resolve()
+    codex_js = launcher.parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+    sibling_node = launcher.parent / "node.exe"
+    node = str(sibling_node) if sibling_node.is_file() else shutil.which("node")
+    if not codex_js.is_file() or not node:
+        raise ValueError(
+            "DeepSeek's Windows Codex launcher is a batch shim, but its direct npm "
+            "Node entrypoint could not be found. Reinstall Codex or configure providers.deepseek.executable "
+            "as an argv list containing the Node executable and @openai/codex/bin/codex.js."
+        )
+    return [str(Path(node).resolve()), str(codex_js), *command[1:]]
+
+
 def command_for(role, provider, prompt, timeout, workspace, effort="medium", provider_name=None, output_dir=None):
     executable = provider["executable"]
     command = [executable] if isinstance(executable, str) else list(executable)
@@ -239,6 +264,9 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
             provider_name = "deepseek"
         else:
             provider_name = "gemini"
+
+    if provider_name == "deepseek":
+        command = direct_windows_codex_command(command)
 
     model = provider["model"]
     if role == "review":

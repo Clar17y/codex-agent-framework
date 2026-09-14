@@ -781,7 +781,7 @@ class ProviderTests(unittest.TestCase):
         output_dir = self.root / "output"
         output_dir.mkdir()
         deepseek_config = {
-            "executable": "codex",
+            "executable": "codex.exe",
             "profile": "deepseek",
             "model": "deepseek-flash",
         }
@@ -795,14 +795,18 @@ class ProviderTests(unittest.TestCase):
             provider_name="deepseek",
             output_dir=output_dir,
         )
-        self.assertEqual(cmd[0], "codex")
+        self.assertEqual(cmd[0], "codex.exe")
         self.assertEqual(cmd[1], "exec")
         self.assertIn("-p", cmd)
         self.assertEqual(cmd[cmd.index("-p") + 1], "deepseek")
         self.assertIn("--model", cmd)
         self.assertEqual(cmd[cmd.index("--model") + 1], "deepseek-flash")
         self.assertNotIn("--sandbox", cmd)
+        self.assertNotIn("-s", cmd)
+        self.assertFalse(any(arg.startswith("sandbox_mode") for arg in cmd))
         self.assertIn("--approve-for-me", cmd)
+        self.assertIn("-c", cmd)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "shell_environment_policy.ignore_default_excludes=false")
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
         self.assertIn("--json", cmd)
         self.assertIn("--output-schema", cmd)
@@ -837,6 +841,30 @@ class ProviderTests(unittest.TestCase):
                                          dry_run=True, provider="deepseek")
         with self.assertRaisesRegex(ValueError, "Claude-only"):
             runner.execute(review_args)
+
+    def test_windows_deepseek_cmd_uses_direct_node_launcher(self):
+        launcher_dir = self.root / "npm"
+        codex_js = launcher_dir / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+        codex_js.parent.mkdir(parents=True)
+        codex_js.write_text("", encoding="utf-8")
+        node = launcher_dir / "node.exe"
+        node.write_bytes(b"")
+        shim = launcher_dir / "codex.cmd"
+        shim.write_text("@echo off", encoding="utf-8")
+
+        command = runner.direct_windows_codex_command([str(shim), "exec", "prompt"], platform_name="nt")
+
+        self.assertEqual(command, [str(node.resolve()), str(codex_js), "exec", "prompt"])
+        with mock.patch.object(runner.shutil, "which", return_value=str(shim)):
+            discovered_command = runner.direct_windows_codex_command(["codex", "exec", "prompt"], platform_name="nt")
+        self.assertEqual(discovered_command, [str(node.resolve()), str(codex_js), "exec", "prompt"])
+
+    def test_windows_deepseek_unrecognized_batch_launcher_fails_closed(self):
+        shim = self.root / "custom-codex.cmd"
+        shim.write_text("@echo off", encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "direct npm Node entrypoint could not be found"):
+            runner.direct_windows_codex_command([str(shim)], platform_name="nt")
 
     def test_child_environment_isolates_and_maps_deepseek_credentials(self):
         config = {"providers": {"deepseek": {"api_key_env": "CUSTOM_DEEPSEEK_KEY"}}}
@@ -1417,7 +1445,7 @@ class ProviderTests(unittest.TestCase):
     def test_deepseek_command_args_and_output_schema_generation(self):
         """Codex command must be pinned to exec, profile deepseek, model deepseek-flash, ephemeral JSONL, bypass, and output-schema."""
         provider_config = {
-            "executable": "codex",
+            "executable": "codex.exe",
             "profile": "deepseek",
             "model": "deepseek-flash",
         }
@@ -1426,14 +1454,18 @@ class ProviderTests(unittest.TestCase):
         cmd = runner.command_for("implement", provider_config, "Prompt text", 600, self.root, provider_name="deepseek", output_dir=output_dir)
 
         # Verify command flags
-        self.assertEqual(cmd[0], "codex")
+        self.assertEqual(cmd[0], "codex.exe")
         self.assertEqual(cmd[1], "exec")
         self.assertIn("-p", cmd)
         self.assertEqual(cmd[cmd.index("-p") + 1], "deepseek")
         self.assertIn("--model", cmd)
         self.assertEqual(cmd[cmd.index("--model") + 1], "deepseek-flash")
         self.assertNotIn("--sandbox", cmd)
+        self.assertNotIn("-s", cmd)
+        self.assertFalse(any(arg.startswith("sandbox_mode") for arg in cmd))
         self.assertIn("--approve-for-me", cmd)
+        self.assertIn("-c", cmd)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "shell_environment_policy.ignore_default_excludes=false")
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
         self.assertIn("--json", cmd)
         self.assertIn("--ephemeral", cmd)

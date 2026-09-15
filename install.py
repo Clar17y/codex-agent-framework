@@ -122,7 +122,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
             raise PreflightError(f'Source routing file {source_example_path} must contain a providers object.')
         source_defaults = source_example['providers']
 
-    target_version = config.get('version', 1) if preserving else 5
+    target_version = config.get('version', 1) if preserving else 6
     if isinstance(target_version, bool) or not isinstance(target_version, int):
         raise PreflightError('Routing configuration version must be an integer.')
 
@@ -182,10 +182,19 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
             if not discovered:
                 print(f'Warning: {command} not found on PATH; retaining command name.')
 
-    if preserving and target_version < 5:
-        config['version'] = 5
+    # v6 separates Gemini's provider soft timeout from the historical global
+    # 900-second default.  Only migrate the known untouched v5 shape: custom
+    # global/provider timing remains authoritative and is never overwritten.
+    if preserving and target_version < 6:
+        gemini = config['providers'].get('gemini')
+        if isinstance(gemini, dict) and config.get('timeout_seconds') == 900:
+            defaults = source_defaults.get('gemini', {})
+            for key in ('timeout_seconds', 'termination_grace_seconds', 'heartbeat_seconds'):
+                if key in defaults and key not in gemini:
+                    gemini[key] = defaults[key]
+        config['version'] = 6
     elif not preserving:
-        config['version'] = 5
+        config['version'] = 6
     return config
 
 

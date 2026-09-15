@@ -118,7 +118,7 @@ class TestInstallFramework(unittest.TestCase):
 
         # Check routing.json
         routing = json.loads((af_dir / "routing.json").read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 5)
+        self.assertEqual(routing.get("version"), 6)
         self.assertIn("providers", routing)
         self.assertIn("gemini", routing["providers"])
         self.assertIn("deepseek", routing["providers"])
@@ -265,6 +265,55 @@ class TestInstallFramework(unittest.TestCase):
 
         refreshed_data = json.loads(routing_path.read_text(encoding="utf-8"))
         self.assertEqual(refreshed_data["timeout_seconds"], 900)
+        self.assertEqual(refreshed_data["providers"]["gemini"]["timeout_seconds"], 1800)
+
+    def test_v5_global_900_migrates_gemini_lifecycle_defaults_only(self):
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework" / "routing.json"
+        data = json.loads(routing_path.read_text(encoding="utf-8"))
+        data["version"] = 5
+        data["providers"]["gemini"].pop("timeout_seconds")
+        data["providers"]["gemini"].pop("termination_grace_seconds")
+        data["providers"]["gemini"].pop("heartbeat_seconds")
+        data["timeout_seconds"] = 900
+        routing_path.write_text(json.dumps(data), encoding="utf-8")
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        migrated = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["version"], 6)
+        self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 1800)
+        self.assertEqual(migrated["providers"]["gemini"]["termination_grace_seconds"], 120)
+
+    def test_v5_custom_timeout_is_preserved(self):
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework" / "routing.json"
+        data = json.loads(routing_path.read_text(encoding="utf-8"))
+        data["version"] = 5
+        data["providers"]["gemini"].pop("timeout_seconds")
+        data["providers"]["gemini"].pop("termination_grace_seconds")
+        data["providers"]["gemini"].pop("heartbeat_seconds")
+        data["timeout_seconds"] = 5555
+        routing_path.write_text(json.dumps(data), encoding="utf-8")
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        migrated = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["timeout_seconds"], 5555)
+        self.assertNotIn("timeout_seconds", migrated["providers"]["gemini"])
+
+    def test_v5_partial_gemini_timing_preserves_set_values_and_fills_missing_defaults(self):
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework" / "routing.json"
+        data = json.loads(routing_path.read_text(encoding="utf-8"))
+        data["version"] = 5
+        data["timeout_seconds"] = 900
+        gemini = data["providers"]["gemini"]
+        gemini["timeout_seconds"] = 321
+        gemini.pop("termination_grace_seconds")
+        gemini.pop("heartbeat_seconds")
+        routing_path.write_text(json.dumps(data), encoding="utf-8")
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        migrated = json.loads(routing_path.read_text(encoding="utf-8"))["providers"]["gemini"]
+        self.assertEqual(migrated["timeout_seconds"], 321)
+        self.assertEqual(migrated["termination_grace_seconds"], 120)
+        self.assertEqual(migrated["heartbeat_seconds"], 60)
 
     def test_dry_run_makes_no_changes(self):
         """--dry-run must perform preflight and make zero changes to disk."""

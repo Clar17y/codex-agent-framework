@@ -31,7 +31,7 @@ class ProviderTests(unittest.TestCase):
         self.fake.write_text("print('{\"status\":\"SUCCESS\",\"response\":\"Done\"}')", encoding="utf-8")
         self.config = self.root / "config.json"
         self.settings = {"providers": {
-            "gemini": {"executable": [sys.executable, str(self.fake)], "model": "gemini-3.8-flash-medium"},
+            "gemini": {"executable": [sys.executable, str(self.fake)], "model": "gemini-3.8-flash-medium", "heartbeat_seconds": 0},
             "claude": {"executable": [sys.executable, str(self.fake)], "model": "claude-opus-5"}},
             "timeout_seconds": 5}
         self.args = argparse.Namespace(role="implement", workspace=str(self.root), task_file=str(self.task),
@@ -110,6 +110,37 @@ class ProviderTests(unittest.TestCase):
                 self.args.task_file = str(self.task_for("overlap" + str(len(paths)), paths))
                 result, code = self.run_provider()
                 self.assertEqual((result["status"], code), ("blocked_pending_run", 1))
+
+    def test_malformed_legacy_pending_state_fails_closed(self):
+        legacy = Path(self.args.state_dir) / "gemini-pending.json"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("{", encoding="utf-8")
+
+        result, code = self.run_provider()
+
+        self.assertEqual((result["status"], code), ("blocked_pending_run", 1))
+        self.assertEqual(result["pending"]["status"], "unreadable")
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
+        self.assertFalse((self.root / "started").exists())
+
+    def test_pending_inventory_enumeration_failure_fails_closed(self):
+        inventory = Path(self.args.state_dir) / "workspaces"
+        inventory.mkdir(parents=True)
+        real_iterdir = Path.iterdir
+
+        def fail_inventory(path):
+            if path == inventory:
+                raise PermissionError("injected inventory failure")
+            return real_iterdir(path)
+
+        with mock.patch.object(Path, "iterdir", new=fail_inventory):
+            result, code = self.run_provider()
+
+        self.assertEqual((result["status"], code), ("blocked_pending_run", 1))
+        self.assertEqual(result["pending"]["status"], "unreadable")
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
 
     def test_unresolved_file_claim_allows_disjoint_file_and_blocks_same_file(self):
         state = runner.workspace_state_dir(Path(self.args.state_dir), self.root) / "gemini-pending"
@@ -312,7 +343,7 @@ class ProviderTests(unittest.TestCase):
     def test_transient_stderr_not_fallback(self):
         self.fake.write_text("import sys\nprint('Error: 429 Too many requests',file=sys.stderr)\nsys.exit(1)", encoding="utf-8")
         result, code = self.run_provider()
-        self.assertEqual((result["status"], code), ("provider_error", 1))
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
         self.assertFalse((self.root / "state" / "gemini-quota.json").exists())
 
     def test_plain_error_classifier_rejects_ambiguous_output(self):
@@ -360,13 +391,91 @@ class ProviderTests(unittest.TestCase):
     def test_timeout(self):
         self.fake.write_text("import time\ntime.sleep(30)", encoding="utf-8")
         self.settings["timeout_seconds"] = 0.2
+        self.settings["providers"]["gemini"]["termination_grace_seconds"] = 0
         result, code = self.run_provider()
         self.assertEqual((result["status"], code), ("timeout", 1))
+        self.assertEqual(runner.read_json(self.pending_path)["status"], "timeout")
+        self.assertTrue(result["cleanup"]["attempted"])
         result, code = self.run_provider()
         self.assertEqual(result["status"], "blocked_pending_run")
 
+    def test_gemini_command_uses_soft_timeout_and_provider_log(self):
+        self.settings["providers"]["gemini"].update(timeout_seconds=7, termination_grace_seconds=3)
+        self.args.dry_run = True
+        result, code = self.run_provider()
+        self.assertEqual(code, 0)
+        command = result["command"]
+        self.assertEqual(command[command.index("--print-timeout") + 1], "7.0s")
+        self.assertEqual(Path(command[command.index("--log-file") + 1]).name, "provider.log")
+        self.assertEqual(result["outer_timeout_seconds"], 10)
+
+    def test_nonfinite_provider_timing_rejected(self):
+        for key, value in (("timeout_seconds", "NaN"), ("termination_grace_seconds", "Infinity"), ("heartbeat_seconds", "-Infinity")):
+            with self.subTest(key=key):
+                self.settings["providers"]["gemini"][key] = value
+                with self.assertRaises(ValueError):
+                    self.run_provider()
+                self.settings["providers"]["gemini"].pop(key)
+        self.settings["providers"]["gemini"].update(timeout_seconds=1e308, termination_grace_seconds=1e308)
+        with self.assertRaises(ValueError):
+            self.run_provider()
+
+    def test_exit_within_termination_grace_is_not_killed(self):
+        self.fake.write_text("import time\ntime.sleep(.16)\nprint('{\\\"status\\\":\\\"SUCCESS\\\",\\\"response\\\":\\\"Done\\\"}')", encoding="utf-8")
+        self.settings["providers"]["gemini"].update(timeout_seconds=.05, termination_grace_seconds=.3, heartbeat_seconds=.02)
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("completed", 0))
+        heartbeat = runner.read_json(Path(result["logs"]) / "heartbeat.json")
+        self.assertEqual(heartbeat["state"], "finished")
+        self.assertIn("process_alive", heartbeat)
+
+    def test_cleanup_failure_does_not_mask_timeout(self):
+        self.fake.write_text("import time\ntime.sleep(30)", encoding="utf-8")
+        self.settings["providers"]["gemini"].update(timeout_seconds=.05, termination_grace_seconds=0)
+        captured = []
+        def fail_without_stopping(process):
+            captured.append(process)
+            raise OSError("cleanup failed")
+        try:
+            with mock.patch.object(runner, "stop_process", side_effect=fail_without_stopping):
+                result, code = self.run_provider()
+        finally:
+            for process in captured:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=1)
+        self.assertEqual((result["status"], code), ("timeout", 1))
+        self.assertEqual(result["cleanup"]["error"], "cleanup failed")
+        self.assertTrue(result["cleanup"]["process_alive_after_cleanup"])
+        self.assertFalse(result["cleanup"]["local_process_stopped"])
+        self.assertIn("cessation is unconfirmed", result["error"])
+        self.assertNotIn("tree stopped", result["error"])
+
+    def test_windows_taskkill_failure_records_descendant_risk_without_claiming_tree_stop(self):
+        process = mock.Mock(pid=123)
+        process.poll.side_effect = [None, None, None]
+        with mock.patch.object(runner.os, "name", "nt"), mock.patch.object(runner.subprocess, "run", side_effect=OSError("taskkill denied")):
+            evidence = runner.stop_process(process)
+        self.assertTrue(evidence["tree_termination_attempted"])
+        self.assertIn("taskkill_error", evidence["tree_termination_outcome"])
+        self.assertFalse(evidence["tree_cessation_verified"])
+        self.assertFalse(evidence["direct_process_stopped"])
+
+    def test_cli_heartbeat_keeps_stdout_single_json(self):
+        self.fake.write_text("import time\ntime.sleep(.12)\nprint('{\\\"status\\\":\\\"SUCCESS\\\",\\\"response\\\":\\\"Done\\\"}')", encoding="utf-8")
+        self.settings["providers"]["gemini"].update(timeout_seconds=1, heartbeat_seconds=.02)
+        runner.write_json(self.config, self.settings)
+        command = [sys.executable, str(Path(runner.__file__).resolve()), "implement", "--workspace", str(self.root),
+                   "--task-file", str(self.task), "--config", str(self.config), "--state-dir", str(self.root / "state")]
+        run = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(json.loads(run.stdout)["status"], "completed")
+        self.assertIn("local_process_alive=", run.stderr)
+        self.assertNotIn("adapter heartbeat", run.stdout)
+
     def test_post_launch_state_failure_stops_child_and_blocks_retry(self):
         self.fake.write_text("import time\ntime.sleep(30)", encoding="utf-8")
+        self.settings["providers"]["gemini"]["termination_grace_seconds"] = 0
         spawned = []
         real_popen, real_write = runner.subprocess.Popen, runner.write_json
 
@@ -384,11 +493,47 @@ class ProviderTests(unittest.TestCase):
         with mock.patch.object(runner.subprocess, "Popen", side_effect=track_spawn), mock.patch.object(runner, "write_json", side_effect=fail_running_write):
             result, code = self.run_provider()
         self.assertEqual((result["status"], code), ("setup_error", 1))
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
         self.assertEqual(len(spawned), 1)
         self.assertIsNotNone(spawned[0].poll())
         self.assertEqual(runner.read_json(self.pending_path)["status"], "launching")
         result, code = self.run_provider()
         self.assertEqual(result["status"], "blocked_pending_run")
+
+    def test_post_exit_log_read_failure_keeps_fallback_blocked(self):
+        real_read_text = Path.read_text
+
+        def fail_stdout_read(path, *args, **kwargs):
+            if Path(path).name == "stdout.log":
+                raise OSError("Injected stdout read failure")
+            return real_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", new=fail_stdout_read):
+            result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("setup_error", 1))
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
+        self.assertEqual(runner.read_json(self.pending_path)["status"], "running")
+        retry, _ = self.run_provider()
+        self.assertEqual(retry["status"], "blocked_pending_run")
+
+    def test_pending_resolution_write_failure_keeps_fallback_blocked(self):
+        real_write_json = runner.write_json
+
+        def fail_resolved_write(path, data):
+            if Path(path).parent.name == "gemini-pending" and data.get("status") == "resolved":
+                raise PermissionError("Injected pending resolution failure")
+            return real_write_json(path, data)
+
+        with mock.patch.object(runner, "write_json", side_effect=fail_resolved_write):
+            result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("setup_error", 1))
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
+        self.assertEqual(runner.read_json(self.pending_path)["status"], "running")
+        retry, _ = self.run_provider()
+        self.assertEqual(retry["status"], "blocked_pending_run")
 
     def test_launch_failure_resolves_pending(self):
         self.settings["providers"]["gemini"]["executable"] = "not-a-real-program"
@@ -399,9 +544,10 @@ class ProviderTests(unittest.TestCase):
     def test_malformed_success_rejected(self):
         self.fake.write_text("print('')", encoding="utf-8")
         result, code = self.run_provider()
-        self.assertEqual((result["status"], code), ("provider_error", 1))
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+        self.assertTrue(result["fallback_blocked_by_pending"])
         result, code = self.run_provider()
-        self.assertEqual(result["status"], "provider_error")
+        self.assertEqual(result["status"], "blocked_pending_run")
 
     def test_long_prompt_written_to_file(self):
         task = runner.read_json(self.task)
@@ -900,9 +1046,34 @@ class ProviderTests(unittest.TestCase):
         output = self.root / "timeout-output"
         output.mkdir()
         (output / "stderr.log").write_text(secret, encoding="utf-8")
+        (output / "provider.log").write_text(secret, encoding="utf-8")
         result, _ = runner.finish({"status": "timeout", "error": secret}, output, self.root, 1, secrets=[secret])
         self.assertNotIn(secret, json.dumps(result))
         self.assertNotIn(secret, (output / "stderr.log").read_text(encoding="utf-8"))
+        self.assertNotIn(secret, (output / "provider.log").read_text(encoding="utf-8"))
+
+    def test_finish_redacts_provider_log_on_success(self):
+        secret = "provider-log-secret-" + uuid.uuid4().hex
+        output = self.root / "success-output"
+        output.mkdir()
+        (output / "provider.log").write_text(secret, encoding="utf-8")
+        result, _ = runner.finish({"status": "completed"}, output, self.root, 0, secrets=[secret])
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertNotIn(secret, (output / "provider.log").read_text(encoding="utf-8"))
+
+    def test_finish_artifact_failures_preserve_timeout_result(self):
+        output = self.root / "artifact-failure-output"
+        output.mkdir()
+        real_write = runner.write_json
+        def fail_result(path, data):
+            if Path(path).name == "result.json":
+                raise OSError("result write failed")
+            return real_write(path, data)
+        with mock.patch.object(runner, "git_evidence", side_effect=OSError("git failed")), mock.patch.object(runner, "write_json", side_effect=fail_result):
+            result, code = runner.finish({"status": "timeout"}, output, self.root, 1)
+        self.assertEqual((result["status"], code), ("timeout", 1))
+        self.assertIn("git evidence: git failed", result["artifact_errors"])
+        self.assertIn("result persistence: result write failed", result["artifact_errors"])
 
     def test_git_evidence_strips_deepseek_credentials_and_external_helpers(self):
         first_secret = "evidence-secret-" + uuid.uuid4().hex
@@ -1058,8 +1229,8 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(balance_data["is_available"], True)
         self.assertEqual(balance_data["total_balance"], "7.98")
 
-    def test_deepseek_normal_invalid_output_resolves_pending(self):
-        # A local Codex exit is certain even when it does not produce a valid final.
+    def test_deepseek_normal_invalid_output_blocks_pending(self):
+        # A direct local exit alone does not establish provider terminality.
         self.fake.write_text("import sys\nprint('starting work...')\nsys.exit(0)\n", encoding="utf-8")
         self.settings["providers"]["deepseek"] = {
             "executable": [sys.executable, str(self.fake)],
@@ -1077,13 +1248,14 @@ class ProviderTests(unittest.TestCase):
                 result, code = self.run_provider()
 
         self.assertEqual(code, 1)
-        self.assertEqual(result["status"], "provider_error")
+        self.assertEqual(result["status"], "uncertain_exit")
+        self.assertFalse(result["fallback_authorized"])
         self.assertIn("malformed", result["error"])
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertNotIn("fallback", result)
 
-        # Pending ownership is released after a normal local process exit.
+        # Missing terminal output leaves ownership conservatively unresolved.
         pending_record = runner.read_json(self.pending_path)
-        self.assertEqual(pending_record.get("status"), "resolved")
+        self.assertEqual(pending_record.get("status"), "uncertain_exit")
 
     def test_deepseek_preflight_fail_closed_zero_balance(self):
         sentinel = self.root / "codex_spawned.txt"
@@ -1151,8 +1323,8 @@ class ProviderTests(unittest.TestCase):
         self.assertIn("HTTP 500", result["error"])
         self.assertFalse(sentinel.exists(), "CLI process must NOT be spawned when balance query returns HTTP 500")
 
-    def test_deepseek_runtime_402_triggers_luna_fallback(self):
-        # Fake codex fails with HTTP 402 Insufficient Balance
+    def test_deepseek_plain_402_without_terminal_event_stays_uncertain(self):
+        # A plain local diagnostic is not a terminal Codex event.
         self.fake.write_text(
             "import sys\n"
             "sys.stderr.write('Error: 402 Payment Required: Insufficient balance in account\\n')\n"
@@ -1173,15 +1345,40 @@ class ProviderTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
             with mock.patch.object(runner, "query_deepseek_balance", return_value=(valid_payload, None)):
                 result, code = self.run_provider()
+                retry, _ = self.run_provider()
 
-        self.assertEqual(code, 20)
-        self.assertEqual(result["status"], "fallback_required")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["status"], "uncertain_exit")
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
+        self.assertTrue(runner.read_json(runner.balance_path(Path(self.args.state_dir)))["is_available"])
+        self.assertEqual(retry["status"], "blocked_pending_run")
+
+    def test_deepseek_terminal_turn_failed_402_records_depletion(self):
+        event = {"type": "turn.failed", "error": {"code": 402, "message": "Insufficient balance"}}
+        self.fake.write_text(
+            f"import json, sys\nprint(json.dumps({event!r}))\nsys.exit(1)\n",
+            encoding="utf-8",
+        )
+        self.settings["providers"]["deepseek"] = {
+            "executable": [sys.executable, str(self.fake)],
+            "profile": "deepseek",
+            "model": "deepseek-flash",
+            "api_key_env": "TEST_DS_KEY",
+        }
+        self.args.provider = "deepseek"
+        available = {
+            "is_available": True,
+            "balance_infos": [{"currency": "USD", "total_balance": "0.50", "granted_balance": "0.00", "topped_up_balance": "0.50"}],
+        }
+        with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
+            with mock.patch.object(runner, "query_deepseek_balance", return_value=(available, None)):
+                result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("fallback_required", 20))
         self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
-        self.assertIn("402", result["error"])
-
-        # Snapshot is marked unavailable
-        balance_data = runner.read_json(runner.balance_path(Path(self.args.state_dir)))
-        self.assertEqual(balance_data["is_available"], False)
+        self.assertNotIn("fallback_blocked_by_pending", result)
+        self.assertEqual(runner.read_json(self.pending_path)["status"], "resolved")
+        self.assertFalse(runner.read_json(runner.balance_path(Path(self.args.state_dir)))["is_available"])
 
     def test_deepseek_runtime_429_is_not_treated_as_balance_exhaustion(self):
         # Fake codex fails with 429 Rate Limit (NOT 402 balance exhaustion)
@@ -1207,7 +1404,7 @@ class ProviderTests(unittest.TestCase):
                 result, code = self.run_provider()
 
         self.assertEqual(code, 1)
-        self.assertEqual(result["status"], "provider_error")
+        self.assertEqual(result["status"], "uncertain_exit")
         # Ensure 429 rate limit did NOT trigger code 20 or mark balance depleted
         self.assertNotEqual(code, 20)
 
@@ -1236,10 +1433,12 @@ class ProviderTests(unittest.TestCase):
                 result, code = self.run_provider()
 
         self.assertEqual(code, 1)
-        self.assertEqual(result["status"], "provider_error")
+        self.assertEqual(result["status"], "uncertain_exit")
         self.assertEqual(result["error"], detail + "[REDACTED]")
         self.assertNotIn(secret, json.dumps(result))
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertNotIn("fallback", result)
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
 
     def test_gemini_quota_exhaustion_points_to_deepseek_when_configured(self):
         self.settings["providers"]["deepseek"] = {
@@ -1252,7 +1451,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(code, 20)
         self.assertEqual(result["fallback"], {"provider": "deepseek", "model": "deepseek-flash"})
 
-    def test_gemini_non_quota_error_routes_to_luna(self):
+    def test_gemini_non_quota_error_without_terminal_envelope_stays_uncertain(self):
         self.settings["providers"]["deepseek"] = {
             "executable": "codex",
             "profile": "deepseek",
@@ -1262,8 +1461,21 @@ class ProviderTests(unittest.TestCase):
         self.fake.write_text("import sys\nsys.stderr.write('SyntaxError in workspace code\\n')\nsys.exit(1)\n", encoding="utf-8")
         result, code = self.run_provider()
         self.assertEqual(code, 1)
-        self.assertEqual(result["status"], "provider_error")
+        self.assertEqual(result["status"], "uncertain_exit")
+        self.assertTrue(result["fallback_blocked_by_pending"])
+        self.assertNotIn("fallback", result)
+
+    def test_gemini_complete_stderr_failure_resolves_and_routes_to_luna(self):
+        payload = json.dumps({"status": "ERROR", "response": "terminal provider failure"})
+        self.fake.write_text(
+            f"import sys\nprint({payload!r}, file=sys.stderr)\nsys.exit(1)\n",
+            encoding="utf-8",
+        )
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("provider_error", 1))
         self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertNotIn("fallback_blocked_by_pending", result)
+        self.assertEqual(runner.read_json(self.pending_path)["status"], "resolved")
 
     def test_shared_ownership_gemini_and_deepseek(self):
         # Pending claim created by Gemini blocks DeepSeek on same path
@@ -1476,8 +1688,8 @@ class ProviderTests(unittest.TestCase):
         schema_path = Path(cmd[cmd.index("--output-schema") + 1])
         self.assertFalse(schema_path.exists())
 
-    def test_deepseek_rejection_of_arbitrary_non_empty_output_resolves_pending(self):
-        """A local normal exit with malformed output is rejected but resolves its ownership claim."""
+    def test_deepseek_rejection_of_arbitrary_non_empty_output_blocks_pending(self):
+        """A local normal exit with malformed output keeps ownership unresolved."""
         self.fake.write_text(
             "import sys, pathlib\n"
             "for flag in ('--output-last-message', '-o'):\n"
@@ -1504,12 +1716,13 @@ class ProviderTests(unittest.TestCase):
                 result, code = self.run_provider()
 
         self.assertEqual(code, 1)
-        self.assertEqual(result["status"], "provider_error")
+        self.assertEqual(result["status"], "uncertain_exit")
+        self.assertFalse(result["fallback_authorized"])
         self.assertIn("malformed", result["error"])
 
-        # The local process has exited, so it cannot retain ownership.
+        # A local exit alone does not establish provider terminality.
         pending_record = runner.read_json(self.pending_path)
-        self.assertEqual(pending_record.get("status"), "resolved")
+        self.assertEqual(pending_record.get("status"), "uncertain_exit")
 
     def test_deepseek_rejection_of_progress_event(self):
         """Progress JSONL events (e.g. turn.completed) must not count as completion."""
@@ -1539,9 +1752,10 @@ class ProviderTests(unittest.TestCase):
                 result, code = self.run_provider()
 
         self.assertEqual(code, 1)
-        self.assertEqual(result["status"], "provider_error")
+        self.assertEqual(result["status"], "uncertain_exit")
+        self.assertFalse(result["fallback_authorized"])
         pending_record = runner.read_json(self.pending_path)
-        self.assertEqual(pending_record.get("status"), "resolved")
+        self.assertEqual(pending_record.get("status"), "uncertain_exit")
 
     def test_deepseek_rejection_of_malformed_final_output(self):
         """Malformed JSON (missing required response field) is rejected as non-success and leaves pending unresolved."""
@@ -1570,9 +1784,38 @@ class ProviderTests(unittest.TestCase):
                 result, code = self.run_provider()
 
         self.assertEqual(code, 1)
-        self.assertEqual(result["status"], "provider_error")
+        self.assertEqual(result["status"], "uncertain_exit")
+        self.assertFalse(result["fallback_authorized"])
         pending_record = runner.read_json(self.pending_path)
-        self.assertEqual(pending_record.get("status"), "resolved")
+        self.assertEqual(pending_record.get("status"), "uncertain_exit")
+
+    def test_deepseek_invalid_final_status_stays_uncertain_and_blocks_retry(self):
+        self.fake.write_text(
+            "import json, pathlib, sys\n"
+            "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+            "pathlib.Path(out).write_text(json.dumps({'status':'MAYBE','response':'not terminal'}), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        self.settings["providers"]["deepseek"] = {
+            "executable": [sys.executable, str(self.fake)],
+            "profile": "deepseek",
+            "model": "deepseek-flash",
+            "api_key_env": "TEST_DS_KEY",
+        }
+        self.args.provider = "deepseek"
+        available = {
+            "is_available": True,
+            "balance_infos": [{"currency": "USD", "total_balance": "10.00", "granted_balance": "0.00", "topped_up_balance": "10.00"}],
+        }
+        with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
+            with mock.patch.object(runner, "query_deepseek_balance", return_value=(available, None)):
+                result, code = self.run_provider()
+                retry, _ = self.run_provider()
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
+        self.assertEqual(runner.read_json(self.pending_path)["status"], "uncertain_exit")
+        self.assertEqual(retry["status"], "blocked_pending_run")
 
     def test_deepseek_explicit_blocked_or_error_status_is_terminal_but_unsuccessful(self):
         """Explicit terminal status (BLOCKED or ERROR) is unsuccessful, but safely resolves pending ownership."""

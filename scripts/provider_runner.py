@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -96,17 +97,42 @@ def pending_records(workspace_state):
     """Read both the old workspace marker and the per-run record directory."""
     paths = [workspace_state / "gemini-pending.json"]
     directory = workspace_state / "gemini-pending"
-    if directory.is_dir():
-        paths.extend(sorted(directory.glob("*.json")))
+    try:
+        directory_mode = directory.stat().st_mode
+    except FileNotFoundError:
+        directory_mode = None
+    except OSError as exc:
+        return [(directory, pending_inspection_error(directory, exc))]
+    if directory_mode is not None:
+        if not stat.S_ISDIR(directory_mode):
+            return [(directory, pending_inspection_error(directory, ValueError("expected a directory")))]
+        try:
+            paths.extend(sorted(directory.glob("*.json")))
+        except OSError as exc:
+            return [(directory, pending_inspection_error(directory, exc))]
     records = []
     for path in paths:
-        if path.exists():
-            try:
-                records.append((path, read_json(path)))
-            except (OSError, ValueError, json.JSONDecodeError):
-                # An unreadable record is uncertain and must block this workspace.
-                records.append((path, {}))
+        try:
+            path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            records.append((path, pending_inspection_error(path, exc)))
+            continue
+        try:
+            records.append((path, read_json(path)))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            # An unreadable record is uncertain and must block this workspace.
+            records.append((path, pending_inspection_error(path, exc)))
     return records
+
+
+def pending_inspection_error(path, exc):
+    """Represent unreadable ownership evidence as an unresolved, blocking record."""
+    return {
+        "status": "unreadable",
+        "state_error": f"Pending ownership state could not be read at {path}: {type(exc).__name__}: {exc}",
+    }
 
 
 def pending_claims(pending):
@@ -129,11 +155,26 @@ def pending_claims(pending):
 def all_pending_records(state_dir):
     """Find per-workspace records so nested workspace aliases share claims."""
     root = state_dir / "workspaces"
-    if not root.is_dir():
+    try:
+        root_mode = root.stat().st_mode
+    except FileNotFoundError:
         return []
+    except OSError as exc:
+        return [(root, pending_inspection_error(root, exc))]
+    if not stat.S_ISDIR(root_mode):
+        return [(root, pending_inspection_error(root, ValueError("expected a directory")))]
+    try:
+        workspace_states = list(root.iterdir())
+    except OSError as exc:
+        return [(root, pending_inspection_error(root, exc))]
     records = []
-    for workspace_state in root.iterdir():
-        if workspace_state.is_dir():
+    for workspace_state in workspace_states:
+        try:
+            workspace_mode = workspace_state.stat().st_mode
+        except OSError as exc:
+            records.append((workspace_state, pending_inspection_error(workspace_state, exc)))
+            continue
+        if stat.S_ISDIR(workspace_mode):
             records.extend(pending_records(workspace_state))
     return records
 
@@ -141,9 +182,16 @@ def all_pending_records(state_dir):
 def legacy_pending_for(state_dir, workspace):
     """Preserve old evidence, but scope identifiable legacy runs to their workspace."""
     path = state_dir / "gemini-pending.json"
-    if not path.exists():
+    try:
+        path.stat()
+    except FileNotFoundError:
         return None
-    pending = read_json(path)
+    except OSError as exc:
+        return pending_inspection_error(path, exc)
+    try:
+        pending = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return pending_inspection_error(path, exc)
     if not isinstance(pending, dict):
         return {}
     if pending.get("status") == "resolved":
@@ -287,8 +335,10 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
             expected = "gemini-3.8-flash-medium"
             if model != expected:
                 raise ValueError(f"{role} requires pinned model {expected}; got {model}")
+            log_file = output_dir / "provider.log" if output_dir else Path(workspace) / ".llm-output" / "provider.log"
             return command + ["--print", prompt, "--model", model, "--mode", "accept-edits",
-                              "--dangerously-skip-permissions", "--add-dir", str(workspace), "--output-format", "json", "--print-timeout", f"{timeout}s"]
+                              "--dangerously-skip-permissions", "--add-dir", str(workspace), "--output-format", "json",
+                              "--print-timeout", f"{timeout}s", "--log-file", str(log_file)]
         elif provider_name == "deepseek":
             expected = "deepseek-flash"
             if model != expected:
@@ -392,6 +442,8 @@ def parse_deepseek_final_output(output_dir, stdout_text):
         return None, False, False
 
     status_upper = status.strip().upper()
+    if status_upper not in ("SUCCESS", "FAILED", "BLOCKED", "ERROR"):
+        return None, False, False
     is_terminal = True
     is_success = (status_upper == "SUCCESS")
     return obj, is_terminal, is_success
@@ -460,6 +512,18 @@ def permission_denials(text):
     if not isinstance(value, dict):
         return []
     return value.get("denied_actions") or value.get("permission_denials") or []
+
+
+def complete_terminal_failure(text):
+    """Recognize one complete provider failure envelope, never JSONL diagnostics."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return False
+    if not isinstance(value, dict):
+        return False
+    status = str(value.get("status", "")).upper()
+    return status in ("ERROR", "FAILED", "FAILURE") or value.get("is_error") is True or value.get("type") == "error" or isinstance(value.get("error"), (dict, str))
 
 
 def plain_terminal_error(stderr, exit_code):
@@ -725,7 +789,7 @@ def sanitize_run_artifacts(output, secrets):
     if not secrets or not Path(output).exists():
         return
     for name in ("prompt.txt", "stdout.log", "stderr.log", "last_message.txt",
-                 "status.txt", "diff.txt", "head.txt"):
+                 "provider.log", "status.txt", "diff.txt", "head.txt"):
         path = Path(output) / name
         try:
             if not path.is_file() or path.is_symlink():
@@ -1010,16 +1074,88 @@ def quota_record(provider, error, state_dir, logs, config):
 
 
 def stop_process(process):
+    evidence = {"tree_termination_attempted": True, "tree_termination_outcome": "unknown",
+                "tree_cessation_verified": False}
     if os.name == "nt":
         try:
-            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                           capture_output=True, timeout=30, check=False)
-        finally:
-            if process.poll() is None:
+            run = subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                 capture_output=True, timeout=30, check=False)
+            evidence["tree_termination_outcome"] = "taskkill_exit_" + str(run.returncode)
+        except Exception as exc:
+            evidence["tree_termination_outcome"] = "taskkill_error: " + str(exc)
+        if process.poll() is None:
+            try:
                 process.kill()
+                evidence["direct_kill_attempted"] = True
+            except Exception as exc:
+                evidence["direct_kill_error"] = str(exc)
     else:
-        os.killpg(process.pid, signal.SIGKILL)
-    process.wait(timeout=10)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            evidence["tree_termination_outcome"] = "signal_sent"
+        except Exception as exc:
+            evidence["tree_termination_outcome"] = "signal_error: " + str(exc)
+    try:
+        process.wait(timeout=10)
+    except Exception as exc:
+        evidence["direct_wait_error"] = str(exc)
+    evidence["direct_process_stopped"] = process.poll() is not None
+    return evidence
+
+
+def provider_timing(config, provider_name):
+    """Resolve a provider soft timeout and its adapter-owned termination grace."""
+    provider = config["providers"][provider_name]
+    timeout = provider.get("timeout_seconds", config.get("timeout_seconds", 1800))
+    grace_default = 120 if provider_name == "gemini" else 0
+    grace = provider.get("termination_grace_seconds", grace_default)
+    heartbeat_default = 60 if provider_name == "gemini" else 0
+    heartbeat = provider.get("heartbeat_seconds", heartbeat_default)
+    try:
+        timeout, grace, heartbeat = float(timeout), float(grace), float(heartbeat)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("provider timeout, termination grace, and heartbeat values must be numbers") from exc
+    if (not all(math.isfinite(value) for value in (timeout, grace, heartbeat)) or
+            not math.isfinite(timeout + grace) or timeout <= 0 or grace < 0 or heartbeat < 0):
+        raise ValueError("provider timeout must be positive; termination grace and heartbeat must be non-negative")
+    return timeout, grace, heartbeat
+
+
+def heartbeat(output, provider_name, provider, process, state, started_wall, started_monotonic):
+    """Write diagnostic liveness only; process/log activity is not task progress."""
+    now = time.time()
+    data = {"provider": provider_name, "model": provider["model"], "pid": process.pid,
+            "state": state, "started_at": dt.datetime.fromtimestamp(started_wall, UTC).isoformat().replace("+00:00", "Z"),
+            "updated_at": dt.datetime.fromtimestamp(now, UTC).isoformat().replace("+00:00", "Z"),
+            "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+            "process_alive": process.poll() is None}
+    log_file = Path(output) / "provider.log"
+    try:
+        stat = log_file.stat()
+        data["provider_log_last_activity_at"] = dt.datetime.fromtimestamp(stat.st_mtime, UTC).isoformat().replace("+00:00", "Z")
+        data["provider_log_size_bytes"] = stat.st_size
+    except OSError:
+        pass
+    write_json(Path(output) / "heartbeat.json", data)
+    return data
+
+
+def emit_heartbeat(data):
+    """Keep stdout reserved for the adapter's single structured result."""
+    activity = data.get("provider_log_last_activity_at", "unobserved")
+    print(f"adapter heartbeat: {data['provider']} local_process_alive={data['process_alive']}; "
+          f"provider_log_last_activity={activity}; diagnostic only, not task progress", file=sys.stderr, flush=True)
+
+
+def safe_heartbeat(result, *args):
+    """Diagnostic evidence must never replace the provider's primary outcome."""
+    try:
+        data = heartbeat(*args)
+        emit_heartbeat(data)
+        return data
+    except Exception as exc:
+        result["heartbeat_error"] = str(exc)
+        return None
 
 
 def git_evidence(workspace, output, secrets=None):
@@ -1059,9 +1195,7 @@ def execute(args):
     if provider_name not in config.get("providers", {}):
         raise ValueError(f"Provider '{provider_name}' is missing from config")
     provider = config["providers"][provider_name]
-    timeout = float(config.get("timeout_seconds", 1800))
-    if timeout <= 0:
-        raise ValueError("timeout_seconds must be positive")
+    timeout, termination_grace, heartbeat_seconds = provider_timing(config, provider_name)
     review_effort_arg = getattr(args, "review_effort", None)
     review_reason_arg = getattr(args, "review_reason", None)
     if args.role == "implement":
@@ -1093,7 +1227,9 @@ def execute(args):
     if args.dry_run:
         command = command_for(args.role, provider, prompt, timeout, workspace, review_effort or "medium", provider_name=provider_name)
         dry_run_meta = {"status": "dry_run", "provider": provider_name, "model": provider["model"],
-                        "cwd": str(workspace), "command": command, "state_dir": str(state_dir)}
+                        "cwd": str(workspace), "command": command, "state_dir": str(state_dir),
+                        "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace,
+                        "outer_timeout_seconds": timeout + termination_grace}
         if args.role == "review":
             dry_run_meta["review_effort"] = review_effort
             dry_run_meta["review_reason"] = review_reason
@@ -1174,7 +1310,9 @@ def execute(args):
         )
     command = command_for(args.role, provider, run_prompt,
                           timeout, workspace, review_effort or "medium", provider_name=provider_name, output_dir=output)
-    result = {"provider": provider_name, "model": provider["model"], "logs": str(output)}
+    result = {"provider": provider_name, "model": provider["model"], "logs": str(output),
+              "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace,
+              "outer_timeout_seconds": timeout + termination_grace}
     if args.role == "review":
         result["review_effort"] = review_effort
         result["review_reason"] = review_reason
@@ -1227,24 +1365,86 @@ def execute(args):
             with (output / "stdout.log").open("wb") as stdout, (output / "stderr.log").open("wb") as stderr:
                 if args.role == "implement":
                     write_json(pending_path, {"status": "launching", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "provider": provider_name})
+                    result["_claim_unresolved"] = True
                 process = None
+                started_wall = None
+                started_monotonic = None
                 try:
                     process = subprocess.Popen(command, cwd=workspace, shell=False, stdout=stdout, stderr=stderr,
                                                env=child_environment(config, provider_name, checked_deepseek_key),
                                                start_new_session=os.name != "nt")
+                    started_wall, started_monotonic = time.time(), time.monotonic()
                     if args.role == "implement":
-                        write_json(pending_path, {"status": "running", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "pid": process.pid, "provider": provider_name})
+                        write_json(pending_path, {"status": "running", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "pid": process.pid, "provider": provider_name,
+                                                  "started_at": started_wall, "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace})
                         release_claim_lock()
-                    code = process.wait(timeout=timeout)
+                    if heartbeat_seconds:
+                        safe_heartbeat(result, output, provider_name, provider, process, "running", started_wall, started_monotonic)
+                    deadline = started_monotonic + timeout + termination_grace
+                    next_heartbeat = started_monotonic + heartbeat_seconds if heartbeat_seconds else None
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            # A slow heartbeat/write can cross the boundary after the child exited.
+                            if process.poll() is not None:
+                                code = process.wait(timeout=0)
+                                break
+                            raise subprocess.TimeoutExpired(command, timeout + termination_grace)
+                        wait_for = remaining if next_heartbeat is None else min(remaining, max(0.01, next_heartbeat - time.monotonic()))
+                        try:
+                            code = process.wait(timeout=wait_for)
+                            break
+                        except subprocess.TimeoutExpired:
+                            if next_heartbeat is not None and time.monotonic() >= next_heartbeat:
+                                safe_heartbeat(result, output, provider_name, provider, process, "running", started_wall, started_monotonic)
+                                next_heartbeat = time.monotonic() + heartbeat_seconds
                 except BaseException as exc:
                     if process is not None:
-                        stop_process(process)
+                        cleanup_error = None
+                        cleanup_evidence = {"tree_termination_attempted": True, "tree_termination_outcome": "unknown", "tree_cessation_verified": False}
+                        try:
+                            cleanup_evidence = stop_process(process)
+                        except BaseException as cleanup_exc:
+                            cleanup_error = str(cleanup_exc)
+                        if started_wall is not None:
+                            result["started_at"] = dt.datetime.fromtimestamp(started_wall, UTC).isoformat().replace("+00:00", "Z")
+                            result["duration_seconds"] = round(time.monotonic() - started_monotonic, 3)
+                        try:
+                            alive_after_cleanup = process.poll() is None
+                        except BaseException as poll_exc:
+                            alive_after_cleanup = None
+                            cleanup_error = cleanup_error or f"could not observe local process state: {poll_exc}"
+                        result["cleanup"] = {**cleanup_evidence, "attempted": True, "error": cleanup_error,
+                                             "process_alive_after_cleanup": alive_after_cleanup,
+                                             "local_process_stopped": alive_after_cleanup is False,
+                                             "direct_process_stopped": alive_after_cleanup is False}
+                        if heartbeat_seconds and started_wall is not None:
+                            safe_heartbeat(result, output, provider_name, provider, process,
+                                           "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "interrupted", started_wall, started_monotonic)
+                        if args.role == "implement" and isinstance(exc, (subprocess.TimeoutExpired, KeyboardInterrupt)):
+                            try:
+                                write_json(pending_path, {"status": "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "interrupted",
+                                                          "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "pid": process.pid,
+                                                          "provider": provider_name, "started_at": started_wall,
+                                                          "duration_seconds": round(time.monotonic() - started_monotonic, 3) if started_monotonic else None,
+                                                          "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace,
+                                                          "cleanup": result["cleanup"], "fallback_authorized": False,
+                                                          "fallback_blocked_by_pending": True, "pending_path": str(pending_path)})
+                            except Exception as pending_exc:
+                                result["pending_write_error"] = str(pending_exc)
                     elif args.role == "implement" and isinstance(exc, OSError):
                         # Popen raised before returning a process: no writer was launched.
                         write_json(pending_path, {"status": "resolved", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "launch_error": str(exc), "provider": provider_name})
+                        result.pop("_claim_unresolved", None)
                     raise
 
             stdout_file = output / "stdout.log"
+            if started_wall is not None:
+                result["started_at"] = dt.datetime.fromtimestamp(started_wall, UTC).isoformat().replace("+00:00", "Z")
+                result["finished_at"] = dt.datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                result["duration_seconds"] = round(time.monotonic() - started_monotonic, 3)
+                if heartbeat_seconds:
+                    safe_heartbeat(result, output, provider_name, provider, process, "finished", started_wall, started_monotonic)
             stderr_file = output / "stderr.log"
             raw_stdout = stdout_file.read_text(encoding="utf-8", errors="replace")
             raw_stderr = stderr_file.read_text(encoding="utf-8", errors="replace")
@@ -1266,13 +1466,27 @@ def execute(args):
             ds_output = None
             if provider_name == "deepseek":
                 ds_output, is_terminal, valid_success = parse_deepseek_final_output(output, stdout_text)
+                terminal_turn, terminal_event, has_terminal_402, _ = parse_codex_events(stdout_text)
             else:
                 valid_success = successful_response(stdout_text, args.role)
+                terminal_turn, has_terminal_402 = None, False
             denied = permission_denials(stdout_text)
-            # A local child that returned from wait has definitely stopped, even
-            # when its output is denied, malformed, or otherwise unsuccessful.
+            complete_failure = complete_terminal_failure(stdout_text)
+            if not stdout_text.strip():
+                complete_failure = complete_failure or complete_terminal_failure(stderr_text)
+            terminal_established = (denied or valid_success or plain_error is not None or
+                                    (provider_name in ("gemini", "claude") and complete_failure) or
+                                    (provider_name == "deepseek" and (is_terminal or terminal_turn == "failed")))
             if args.role == "implement":
-                write_json(pending_path, {"status": "resolved", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "exit_code": code, "provider": provider_name})
+                pending_data = {"status": "resolved" if terminal_established else "uncertain_exit", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "exit_code": code, "provider": provider_name,
+                                "started_at": started_wall, "finished_at": time.time(), "duration_seconds": result.get("duration_seconds"),
+                                "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace}
+                if not terminal_established:
+                    pending_data.update(fallback_authorized=False, fallback_blocked_by_pending=True, pending_path=str(pending_path))
+                    result.update(pending_path=str(pending_path), fallback_authorized=False, fallback_blocked_by_pending=True)
+                write_json(pending_path, pending_data)
+                if terminal_established:
+                    result.pop("_claim_unresolved", None)
             if denied:
                 result.update(status="permission_denied", exit_code=code, denied_actions=denied)
                 if args.role == "implement":
@@ -1283,8 +1497,6 @@ def execute(args):
                 return finish(result, output, workspace, 1, secrets=secrets)
 
             if provider_name == "deepseek":
-                terminal_turn, terminal_event, has_terminal_402, _ = parse_codex_events(stdout_text)
-
                 if valid_success and code == 0 and terminal_turn != "failed":
                     result.update(status="completed", exit_code=code)
                     refresh_balance_safe(state_dir, config)
@@ -1297,14 +1509,16 @@ def execute(args):
                 else:
                     insufficient_balance = deepseek_insufficient_balance_error(errors, stderr_text)
 
-                if insufficient_balance:
+                if insufficient_balance and terminal_established:
                     record_balance_snapshot(state_dir, {"is_available": False, "balance_infos": []},
                                             error=insufficient_balance.get("message", "HTTP 402: Insufficient balance"), config=config)
                     result.update(status="fallback_required", fallback=luna_fallback(),
                                   error=insufficient_balance.get("message", "HTTP 402: Insufficient balance"), exit_code=code)
                     return finish(result, output, workspace, 20, secrets=secrets)
 
-                result.update(status="provider_error", exit_code=code if code != 0 else 1, fallback=luna_fallback())
+                result.update(status="uncertain_exit" if not terminal_established else "provider_error", exit_code=code if code != 0 else 1)
+                if terminal_established:
+                    result["fallback"] = luna_fallback()
                 if errors and not is_terminal:
                     result["error"] = (structured_error_message(errors)
                                        or "DeepSeek provider reported an error without details.")
@@ -1316,7 +1530,7 @@ def execute(args):
                                        else f"DeepSeek returned terminal non-success status: {ds_output.get('status') if ds_output else 'UNKNOWN'}")
                 return finish(result, output, workspace, 1, secrets=secrets)
 
-            quota = quota_error(errors, provider_name) if not valid_success else None
+            quota = quota_error(errors, provider_name) if terminal_established and not valid_success else None
             if quota:
                 with provider_lock(state_dir, float(config.get("lock_timeout_seconds", 30)), "quota.lock"):
                     state = quota_record(provider_name, quota, state_dir, output, config)
@@ -1324,34 +1538,55 @@ def execute(args):
                 return finish(result, output, workspace, 20, secrets=secrets)
             result.update(status="completed" if code == 0 and not errors and valid_success else "provider_error", exit_code=code)
             if args.role == "implement" and not valid_success:
-                result["fallback"] = luna_fallback()
+                if not terminal_established:
+                    result.update(status="uncertain_exit", fallback_authorized=False, fallback_blocked_by_pending=True)
+                else:
+                    result["fallback"] = luna_fallback()
                 if not errors:
                     result["error"] = "No structured terminal result; backend completion uncertain. Pending state blocks new implementation until confirmed stopped."
             return finish(result, output, workspace, 0 if result["status"] == "completed" else 1, secrets=secrets)
     except subprocess.TimeoutExpired:
+        result["finished_at"] = dt.datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        cleanup = result.get("cleanup", {})
+        local_stopped = cleanup.get("local_process_stopped") is True
+        termination = "Local CLI termination was attempted and observed stopped; provider backend completion remains unverified." if local_stopped else "Local CLI termination was attempted, but local cessation is unconfirmed; provider backend completion remains unverified."
         if args.role == "implement":
-            result.update(status="timeout", fallback=luna_fallback(),
-                          error="CLI process tree stopped after timeout; provider backend completion remains unverified. Confirm provider session stopped before resolving pending state or continuing with Luna fallback.")
+            result.update(status="timeout", fallback=luna_fallback(), fallback_authorized=False, fallback_blocked_by_pending=True,
+                          error=termination + " Confirm provider session stopped before resolving pending state or continuing with Luna fallback.")
         else:
             result.update(status="timeout",
-                          error="CLI process tree stopped after timeout; provider backend completion remains unverified. Confirm provider session stopped.")
+                          error=termination + " Confirm provider session stopped.")
     except (OSError, ValueError, TimeoutError) as exc:
         result.update(status="setup_error", error=str(exc))
         if args.role == "implement":
             result["fallback"] = luna_fallback()
     except KeyboardInterrupt:
+        result["finished_at"] = dt.datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        cleanup = result.get("cleanup", {})
+        local_stopped = cleanup.get("local_process_stopped") is True
+        termination = "Local CLI termination was attempted and observed stopped; provider backend completion remains unverified." if local_stopped else "Local CLI termination was attempted, but local cessation is unconfirmed; provider backend completion remains unverified."
         if args.role == "implement":
-            result.update(status="cancelled", fallback=luna_fallback(),
-                          error="CLI process tree stopped on interruption; provider backend completion remains unverified. Confirm provider session stopped before resolving pending state or continuing with Luna fallback.")
+            result.update(status="cancelled", fallback=luna_fallback(), fallback_authorized=False, fallback_blocked_by_pending=True,
+                          error=termination + " Confirm provider session stopped before resolving pending state or continuing with Luna fallback.")
         else:
             result.update(status="cancelled",
-                          error="CLI process tree stopped on interruption; provider backend completion remains unverified. Confirm provider session stopped.")
+                          error=termination + " Confirm provider session stopped.")
     return finish(result, output, workspace, 1, secrets=secrets)
 
 
 def finish(result, output, workspace, code, secrets=None):
-    result["evidence"] = git_evidence(workspace, output, secrets)
-    sanitize_run_artifacts(output, secrets)
+    if result.pop("_claim_unresolved", False) or result.get("status") == "blocked_pending_run":
+        result["fallback_authorized"] = False
+        result["fallback_blocked_by_pending"] = True
+    artifact_errors = []
+    try:
+        result["evidence"] = git_evidence(workspace, output, secrets)
+    except Exception as exc:
+        artifact_errors.append("git evidence: " + str(exc))
+    try:
+        sanitize_run_artifacts(output, secrets)
+    except Exception as exc:
+        artifact_errors.append("artifact sanitization: " + str(exc))
     if secrets:
         def clean(value):
             if isinstance(value, str):
@@ -1362,7 +1597,12 @@ def finish(result, output, workspace, code, secrets=None):
                 return [clean(item) for item in value]
             return value
         result = clean(result)
-    write_json(output / "result.json", result)
+    if artifact_errors:
+        result["artifact_errors"] = artifact_errors
+    try:
+        write_json(output / "result.json", result)
+    except Exception as exc:
+        result.setdefault("artifact_errors", []).append("result persistence: " + str(exc))
     return result, code
 
 

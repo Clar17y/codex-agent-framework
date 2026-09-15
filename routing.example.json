@@ -1,9 +1,12 @@
 {
-  "version": 5,
+  "version": 6,
   "providers": {
     "gemini": {
       "executable": "agy",
-      "model": "gemini-3.8-flash-medium"
+      "model": "gemini-3.8-flash-medium",
+      "timeout_seconds": 1800,
+      "termination_grace_seconds": 120,
+      "heartbeat_seconds": 60
     },
     "deepseek": {
       "executable": "codex",

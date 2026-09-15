@@ -181,3 +181,5 @@ This repository contains the reviewed framework source, twelve role definitions,
 The provider runner and its offline tests are maintained in `scripts/`. Historical benchmark notes are retained in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) as supplied historical evidence, not new performance measurements. No third-party provider executables are bundled. The repository remains private; no open-source license has been selected.
 
 The roles include their own simplification self-check; they do not require invoking the full simplify skill. Use the installed `simplify` skill explicitly for its coordinated review-and-repair workflow. Its provider dependencies are included in this package.
+
+Gemini can be legitimately silent for extended work. Keep waiting on the same adapter command session; its heartbeat output and per-run `heartbeat.json` are liveness diagnostics, not proof of productive work or provider-backend completion. Do not add detached `Start-Sleep` polling loops. Native subagents rely on completion notifications, not recurring prose progress files.

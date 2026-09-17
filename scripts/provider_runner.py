@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
+import mmap
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,18 @@ import urllib.request
 import uuid
 
 UTC = dt.timezone.utc
+STREAM_POLL_SECONDS = 1.0
+STREAM_PROGRESS_EMIT_SECONDS = 15.0
+MAX_STREAM_LINE_BYTES = 1024 * 1024
+STREAM_READ_CHUNK_BYTES = 64 * 1024
+MIN_HEARTBEAT_SECONDS = 5.0
+FINAL_OUTPUT_TAIL_BYTES = (2 * MAX_STREAM_LINE_BYTES) + STREAM_READ_CHUNK_BYTES
+ARTIFACT_COPY_CHUNK_BYTES = 64 * 1024
+CODEX_TOOL_ITEM_TYPES = frozenset(("command_execution", "file_change", "mcp_tool_call", "web_search"))
+# Compatibility aliases for callers/tests written against the original
+# Gemini-only telemetry implementation.
+GEMINI_STREAM_POLL_SECONDS = STREAM_POLL_SECONDS
+GEMINI_PROGRESS_EMIT_SECONDS = STREAM_PROGRESS_EMIT_SECONDS
 
 DEEPSEEK_OUTPUT_SCHEMA = {
     "type": "object",
@@ -46,16 +59,46 @@ def write_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / (str(uuid.uuid4()) + ".tmp")
-    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def write_bytes(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / (str(uuid.uuid4()) + ".tmp")
-    temporary.write_bytes(data)
-    os.replace(temporary, path)
+    try:
+        temporary.write_bytes(data)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def read_text_tail(path, limit=FINAL_OUTPUT_TAIL_BYTES):
+    """Read a bounded suffix containing only complete newline-delimited records."""
+    if limit <= 0:
+        raise ValueError("Tail read limit must be positive")
+    path = Path(path)
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        start = max(0, size - limit)
+        handle.seek(start)
+        raw = handle.read(limit)
+    truncated = start > 0
+    if truncated:
+        newline = raw.find(b"\n")
+        raw = raw[newline + 1:] if newline >= 0 else b""
+    return raw.decode("utf-8", errors="replace"), truncated
 
 
 def workspace_state_dir(state_dir, workspace):
@@ -326,7 +369,8 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
         if effort not in ("medium", "high"):
             raise ValueError(f"Claude review effort must be 'medium' or 'high'; got {effort}")
         return command + ["-p", "Read-only independent review. Do not change files.\n" + prompt,
-                          "--model", model, "--effort", effort, "--output-format", "json", "--no-session-persistence",
+                          "--model", model, "--effort", effort, "--output-format", "stream-json", "--verbose",
+                          "--no-session-persistence",
                           "--dangerously-skip-permissions", "--safe-mode", "--tools", "Read,Glob,Grep", "--strict-mcp-config",
                           "--disable-slash-commands"]
 
@@ -337,7 +381,7 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
                 raise ValueError(f"{role} requires pinned model {expected}; got {model}")
             log_file = output_dir / "provider.log" if output_dir else Path(workspace) / ".llm-output" / "provider.log"
             return command + ["--print", prompt, "--model", model, "--mode", "accept-edits",
-                              "--dangerously-skip-permissions", "--add-dir", str(workspace), "--output-format", "json",
+                              "--dangerously-skip-permissions", "--add-dir", str(workspace), "--output-format", "stream-json",
                               "--print-timeout", f"{timeout}s", "--log-file", str(log_file)]
         elif provider_name == "deepseek":
             expected = "deepseek-flash"
@@ -363,12 +407,12 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
 def error_objects(text):
     try:
         values = [json.loads(text)]
-    except ValueError:
+    except (ValueError, RecursionError):
         values = []
         for line in text.splitlines():
             try:
                 values.append(json.loads(line))
-            except ValueError:
+            except (ValueError, RecursionError):
                 pass
     errors = []
     for value in values:
@@ -379,7 +423,7 @@ def error_objects(text):
             errors.append(error if isinstance(error, dict) else {"message": str(error)})
         if value.get("is_error") is True or value.get("type") == "error":
             errors.append(value)
-        elif str(value.get("status", "")).upper() in ("ERROR", "FAILED", "FAILURE"):
+        elif str(value.get("status", "")).upper() in ("ERROR", "FAILED", "FAILURE", "BLOCKED"):
             errors.append({**value, "message": value.get("message", value.get("response", "Provider reported failure"))})
     return errors
 
@@ -394,7 +438,7 @@ def structured_error_message(errors):
     return None
 
 
-def parse_deepseek_final_output(output_dir, stdout_text):
+def parse_deepseek_final_output(output_dir, stdout_text, stdout_truncated=False):
     """Parse and validate final JSON output object from DeepSeek.
     Success requires explicit success status plus a string response.
     Arbitrary messages, progress events, malformed output, or blocked/error status are not success."""
@@ -402,7 +446,10 @@ def parse_deepseek_final_output(output_dir, stdout_text):
     if output_dir:
         last_msg_file = output_dir / "last_message.txt"
         if last_msg_file.exists():
-            raw_content = last_msg_file.read_text(encoding="utf-8", errors="replace").strip()
+            raw_content, truncated = read_text_tail(last_msg_file)
+            if truncated:
+                return None, False, False
+            raw_content = raw_content.strip()
 
     obj = None
     if raw_content:
@@ -410,14 +457,14 @@ def parse_deepseek_final_output(output_dir, stdout_text):
             parsed = json.loads(raw_content)
             if isinstance(parsed, dict):
                 obj = parsed
-        except ValueError:
+        except (ValueError, RecursionError):
             return None, False, False
-    elif stdout_text:
+    elif stdout_text and not stdout_truncated:
         try:
             parsed = json.loads(stdout_text.strip())
             if isinstance(parsed, dict):
                 obj = parsed
-        except ValueError:
+        except (ValueError, RecursionError):
             for line in reversed(stdout_text.splitlines()):
                 line = line.strip()
                 if not line:
@@ -427,7 +474,7 @@ def parse_deepseek_final_output(output_dir, stdout_text):
                     if isinstance(parsed, dict) and "status" in parsed and "response" in parsed and "type" not in parsed:
                         obj = parsed
                         break
-                except ValueError:
+                except (ValueError, RecursionError):
                     pass
 
     if not isinstance(obj, dict):
@@ -462,7 +509,7 @@ def parse_codex_events(stdout_text):
             continue
         try:
             obj = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(obj, dict):
             continue
@@ -486,6 +533,118 @@ def parse_codex_events(stdout_text):
     return terminal_turn, terminal_event, has_terminal_402, intermediate_errors
 
 
+def parse_gemini_final_output(stdout_text, stdout_truncated=False):
+    """Return Gemini's terminal payload from stream-json or legacy JSON output.
+
+    Stream progress is deliberately not treated as a terminal result.  A missing
+    or malformed final ``event=result`` therefore retains pending ownership.
+    """
+    terminal = None
+    saw_result_event = False
+    stream_errors = []
+
+    def inspect(value, allow_legacy=False):
+        nonlocal terminal, saw_result_event
+        if not isinstance(value, dict):
+            return
+        event = value.get("event")
+        if event == "result":
+            saw_result_event = True
+            candidate = value.get("result")
+            if isinstance(candidate, dict):
+                terminal = candidate
+        elif event == "error":
+            error = value.get("error")
+            if isinstance(error, dict):
+                stream_errors.append(error)
+            elif isinstance(error, str) and error.strip():
+                stream_errors.append({"message": error.strip()})
+            else:
+                stream_errors.append(value)
+        elif event is None and allow_legacy:
+            status_envelope = (
+                isinstance(value.get("status"), str) and
+                str(value.get("status")).upper() in ("SUCCESS", "ERROR", "FAILED", "FAILURE", "BLOCKED") and
+                isinstance(value.get("response"), str)
+            )
+            error_envelope = (
+                value.get("is_error") is True or
+                isinstance(value.get("error"), (dict, str))
+            )
+            if status_envelope or error_envelope:
+                # Retain compatibility with older/fake CLIs that emit one
+                # explicit terminal envelope even when stream-json was
+                # requested. Arbitrary one-line JSON diagnostics remain
+                # non-terminal, and bare errors within JSONL remain progress.
+                terminal = value
+
+    stripped = stdout_text.strip()
+    if not stripped:
+        return None, False, []
+    if not stdout_truncated:
+        try:
+            inspect(json.loads(stripped), allow_legacy=True)
+            return terminal, saw_result_event, stream_errors
+        except (ValueError, RecursionError):
+            pass
+    if stdout_truncated or terminal is None:
+        for line in stdout_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                inspect(json.loads(line), allow_legacy=False)
+            except (ValueError, RecursionError):
+                continue
+    return terminal, saw_result_event, stream_errors
+
+
+def parse_claude_final_output(stdout_text):
+    """Return Claude's terminal payload from stream-json or legacy JSON output.
+
+    Stream progress is deliberately not treated as a terminal result. A missing
+    or malformed final result event therefore retains uncertain status.
+    """
+    terminal = None
+    saw_result_event = False
+    stream_errors = []
+
+    def inspect(value, allow_legacy=False):
+        nonlocal terminal, saw_result_event
+        if not isinstance(value, dict):
+            return
+        msg_type = value.get("type")
+        if msg_type == "result":
+            saw_result_event = True
+            terminal = value
+        elif msg_type == "error":
+            err = value.get("error")
+            if isinstance(err, dict):
+                stream_errors.append(err)
+            elif isinstance(err, str) and err.strip():
+                stream_errors.append({"message": err.strip()})
+            else:
+                stream_errors.append(value)
+        # Claude's legacy single-object format still carries type=result and
+        # is handled above. Bare JSON diagnostics are never terminal.
+
+    stripped = stdout_text.strip()
+    if not stripped:
+        return None, False, []
+    try:
+        inspect(json.loads(stripped), allow_legacy=True)
+    except (ValueError, RecursionError):
+        for line in stdout_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                inspect(json.loads(line), allow_legacy=False)
+            except (ValueError, RecursionError):
+                continue
+    return terminal, saw_result_event, stream_errors
+
+
 def successful_response(text, role, provider="gemini", output_dir=None):
     if provider == "deepseek":
         _, _, is_success = parse_deepseek_final_output(output_dir, text)
@@ -493,7 +652,7 @@ def successful_response(text, role, provider="gemini", output_dir=None):
 
     try:
         value = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
     if not isinstance(value, dict):
         return False
@@ -507,7 +666,7 @@ def successful_response(text, role, provider="gemini", output_dir=None):
 def permission_denials(text):
     try:
         value = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return []
     if not isinstance(value, dict):
         return []
@@ -518,12 +677,12 @@ def complete_terminal_failure(text):
     """Recognize one complete provider failure envelope, never JSONL diagnostics."""
     try:
         value = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
     if not isinstance(value, dict):
         return False
     status = str(value.get("status", "")).upper()
-    return status in ("ERROR", "FAILED", "FAILURE") or value.get("is_error") is True or value.get("type") == "error" or isinstance(value.get("error"), (dict, str))
+    return status in ("ERROR", "FAILED", "FAILURE", "BLOCKED") or value.get("is_error") is True or value.get("type") == "error" or isinstance(value.get("error"), (dict, str))
 
 
 def plain_terminal_error(stderr, exit_code):
@@ -786,21 +945,110 @@ def child_environment(config, provider_name, checked_deepseek_key=None):
 
 
 def sanitize_run_artifacts(output, secrets):
-    if not secrets or not Path(output).exists():
-        return
+    if not Path(output).exists():
+        return []
+    errors = []
+    exact = set()
+    for secret in secrets or ():
+        if secret and isinstance(secret, str):
+            stripped = secret.strip()
+            if len(stripped) >= 4:
+                exact.add(secret.encode("utf-8"))
+                exact.add(stripped.encode("utf-8"))
+    exact_pattern = None
+    if exact:
+        exact_pattern = re.compile(
+            b"|".join(re.escape(value) for value in sorted(exact, key=len, reverse=True)))
+    # Match Python text-regex whitespace without decoding the complete file.
+    # The multi-byte alternatives cover Unicode whitespace encoded as UTF-8.
+    whitespace = (
+        b"(?:[\\x09-\\x0d\\x1c-\\x20]|\\xc2\\x85|\\xc2\\xa0|\\xe1\\x9a\\x80|"
+        b"\\xe2\\x80[\\x80-\\x8a]|\\xe2\\x80[\\xa8-\\xa9]|\\xe2\\x80\\xaf|"
+        b"\\xe2\\x81\\x9f|\\xe3\\x80\\x80)"
+    )
+    generic_pattern = re.compile(
+        b"(?P<bearer>(?P<bearer_prefix>(?i:Bearer)" + whitespace +
+        b"+)(?:(?!" + whitespace + b")[^,'\"])+)|"
+        b"(?P<sk>\\bsk-[A-Za-z0-9_-]{16,}\\b)")
+
+    def copy_range(source, destination, start, end):
+        while start < end:
+            stop = min(start + ARTIFACT_COPY_CHUNK_BYTES, end)
+            destination.write(source[start:stop])
+            start = stop
+
+    def rewrite(source_path, destination_path, pattern, preserve_bearer_prefix=False):
+        with source_path.open("rb") as source_handle:
+            with mmap.mmap(source_handle.fileno(), 0, access=mmap.ACCESS_READ) as source:
+                match = pattern.search(source)
+                if match is None:
+                    return False
+                with destination_path.open("wb") as destination:
+                    position = 0
+                    while match is not None:
+                        copy_range(source, destination, position, match.start())
+                        if preserve_bearer_prefix and match.start("bearer") >= 0:
+                            copy_range(source, destination, match.start("bearer_prefix"),
+                                       match.end("bearer_prefix"))
+                        destination.write(b"[REDACTED]")
+                        position = match.end()
+                        match = pattern.search(source, position)
+                    copy_range(source, destination, position, len(source))
+        return True
+
+    def copy_in_place(source_path, target_path):
+        """Bounded Windows fallback when an inherited handle blocks replacement."""
+        with source_path.open("rb") as source, target_path.open("r+b") as target:
+            opened = os.fstat(target.fileno())
+            current = os.stat(target_path, follow_symlinks=False)
+            if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(current.st_mode) or
+                    opened.st_nlink != 1 or not os.path.samestat(opened, current)):
+                raise PermissionError("refusing in-place redaction of a linked or replaced artifact")
+            target.seek(0)
+            while True:
+                chunk = source.read(ARTIFACT_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                target.write(chunk)
+            target.truncate()
+
     for name in ("prompt.txt", "stdout.log", "stderr.log", "last_message.txt",
-                 "provider.log", "status.txt", "diff.txt", "head.txt"):
+                 "provider.log", "progress.json", "heartbeat.json",
+                 "status.txt", "diff.txt", "head.txt"):
         path = Path(output) / name
+        exact_temporary = path.parent / (str(uuid.uuid4()) + ".tmp")
+        generic_temporary = path.parent / (str(uuid.uuid4()) + ".tmp")
         try:
-            if not path.is_file() or path.is_symlink():
+            if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
                 continue
-            raw = path.read_text(encoding="utf-8", errors="replace")
-            clean = _sanitize_all_secrets(raw, secrets)
-            if clean != raw:
+            source_path = path
+            changed = False
+            if exact_pattern is not None and rewrite(path, exact_temporary, exact_pattern):
+                source_path = exact_temporary
+                changed = True
+            if rewrite(source_path, generic_temporary, generic_pattern,
+                       preserve_bearer_prefix=True):
+                source_path = generic_temporary
+                changed = True
+            if changed:
                 # Atomic replacement avoids following a hard link while writing.
-                write_bytes(path, clean.encode("utf-8"))
-        except OSError:
+                try:
+                    os.replace(source_path, path)
+                except PermissionError:
+                    # Windows can deny replacement while an exited provider's
+                    # descendant still holds the inherited log handle. Preserve
+                    # the old in-place behavior without following hard links.
+                    copy_in_place(source_path, path)
+        except (OSError, ValueError) as exc:
+            errors.append(f"{name}: {exc}")
             continue
+        finally:
+            for temporary in (exact_temporary, generic_temporary):
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    return errors
 
 
 class BalanceError(str):
@@ -1103,14 +1351,528 @@ def stop_process(process):
     return evidence
 
 
+def new_progress_state(provider_name="gemini"):
+    """Mutable incremental parser state; private fields never reach artifacts."""
+    return {
+        "provider": provider_name,
+        "offset": 0,
+        "remainder": b"",
+        "event_count": 0,
+        "malformed_event_count": 0,
+        "completed_steps": set(),
+        "active_step": None,
+        "last_event": None,
+        "last_event_at": None,
+        "terminal": None,
+        "usage": None,
+        "conversation_id": None,
+        "last_error": None,
+        "discarding_oversize_line": False,
+        "last_emitted_monotonic": None,
+    }
+
+
+def new_gemini_progress_state():
+    return new_progress_state("gemini")
+
+
+def compact_usage(value):
+    if not isinstance(value, dict):
+        return None
+    allowed = (
+        "input_tokens",
+        "output_tokens",
+        "thinking_tokens",
+        "cache_read_tokens",
+        "cache_creation_input_tokens",
+        "total_tokens",
+    )
+    data = dict(value)
+    if "cache_read_tokens" not in data and "cache_read_input_tokens" in data:
+        data["cache_read_tokens"] = data["cache_read_input_tokens"]
+    if "total_tokens" not in data:
+        inp = data.get("input_tokens")
+        out = data.get("output_tokens")
+        if (isinstance(inp, (int, float)) and not isinstance(inp, bool) and
+                isinstance(out, (int, float)) and not isinstance(out, bool)):
+            data["total_tokens"] = inp + out
+    usage = {key: data[key] for key in allowed
+             if (isinstance(data.get(key), (int, float)) and
+                 not isinstance(data.get(key), bool) and
+                 math.isfinite(data[key]) and data[key] >= 0)}
+    return usage or None
+
+
+def compact_label(value, default="unknown", limit=80):
+    """Keep diagnostic labels identifier-like so content cannot leak through typed fields."""
+    if not isinstance(value, str):
+        return default
+    value = value.strip()
+    if not value or len(value) > limit or not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+        return default
+    if _sanitize_all_secrets(value) != value:
+        return default
+    return value
+
+
+def compact_gemini_label(value, default="unknown", limit=80):
+    return compact_label(value, default=default, limit=limit)
+
+
+def compact_gemini_event(value):
+    """Summarize one stream event without copying prompts, text, parameters, or tool output."""
+    event = compact_label(value.get("event"))
+    if event == "init":
+        init = value.get("init") if isinstance(value.get("init"), dict) else {}
+        summary = {"event": "init", "summary": "initialized"}
+        model = compact_label(init.get("model"), default=None, limit=120)
+        if model:
+            summary["model"] = model
+        return summary
+    if event == "step_update":
+        step = value.get("step_update") if isinstance(value.get("step_update"), dict) else {}
+        step_type = compact_label(step.get("step_type"))
+        step_state = compact_label(step.get("state"), limit=40)
+        tool_name = compact_label(step.get("tool_name"), default=None, limit=120)
+        label = f"{step_type} {step_state}"
+        summary = {"event": "step_update", "summary": label,
+                   "step_type": step_type, "step_state": step_state}
+        if isinstance(step.get("step_index"), int) and not isinstance(step.get("step_index"), bool):
+            summary["step_index"] = step["step_index"]
+        if tool_name:
+            summary["tool_name"] = tool_name
+            summary["summary"] = f"tool {tool_name} {step_state}"
+        if (isinstance(step.get("duration_seconds"), (int, float)) and
+                not isinstance(step.get("duration_seconds"), bool) and
+                math.isfinite(step["duration_seconds"]) and step["duration_seconds"] >= 0):
+            summary["duration_seconds"] = step["duration_seconds"]
+        usage = compact_usage(step.get("usage"))
+        if usage:
+            summary["usage"] = usage
+        return summary
+    if event == "result":
+        terminal = value.get("result") if isinstance(value.get("result"), dict) else {}
+        status = compact_label(terminal.get("status"), limit=40)
+        summary = {"event": "result", "summary": f"terminal {status}", "status": status}
+        if (isinstance(terminal.get("duration_seconds"), (int, float)) and
+                not isinstance(terminal.get("duration_seconds"), bool) and
+                math.isfinite(terminal["duration_seconds"]) and terminal["duration_seconds"] >= 0):
+            summary["duration_seconds"] = terminal["duration_seconds"]
+        usage = compact_usage(terminal.get("usage"))
+        if usage:
+            summary["usage"] = usage
+        return summary
+    return {"event": event, "summary": event}
+
+
+def update_gemini_progress(state, value, observed_at):
+    if not isinstance(value, dict):
+        return
+    state["event_count"] += 1
+    summary = compact_gemini_event(value)
+    state["last_event"] = summary
+    state["last_event_at"] = observed_at
+    conversation_id = value.get("conversation_id")
+    if not conversation_id and isinstance(value.get("step_update"), dict):
+        conversation_id = value["step_update"].get("conversation_id")
+    if not conversation_id and isinstance(value.get("result"), dict):
+        conversation_id = value["result"].get("conversation_id")
+    conversation_id = compact_label(conversation_id, default=None, limit=200)
+    if conversation_id:
+        state["conversation_id"] = conversation_id
+
+    if summary["event"] == "step_update":
+        step_identity = summary.get("step_index")
+        if step_identity is None:
+            step_identity = state["event_count"]
+        key = (step_identity, summary.get("step_type"))
+        if summary.get("step_state") == "ACTIVE":
+            state["active_step"] = {key: summary[key] for key in
+                                    ("step_index", "step_type", "step_state", "tool_name", "summary") if key in summary}
+        elif summary.get("step_state") == "DONE":
+            state["completed_steps"].add(key)
+            if (state.get("active_step") or {}).get("step_index") == summary.get("step_index"):
+                state["active_step"] = None
+        if summary.get("usage"):
+            state["usage"] = summary["usage"]
+    elif summary["event"] == "result":
+        state["terminal"] = {key: summary[key] for key in
+                             ("status", "duration_seconds", "summary") if key in summary}
+        state["active_step"] = None
+        if summary.get("usage"):
+            state["usage"] = summary["usage"]
+    elif summary["event"] == "error":
+        state["last_error"] = {"summary": "error", "observed_at": observed_at}
+
+
+def compact_claude_event(value):
+    """Summarize one Claude stream-json event without copying prompts, text, parameters, or tool output."""
+    event_type = compact_label(value.get("type") or value.get("event"))
+    if event_type == "system":
+        subtype = compact_label(value.get("subtype"), default=None, limit=40)
+        label = f"system {subtype}" if subtype else "initialized"
+        summary = {"event": "system", "summary": label}
+        if subtype:
+            summary["subtype"] = subtype
+        return summary
+    if event_type == "assistant":
+        msg = value.get("message") if isinstance(value.get("message"), dict) else value
+        content = msg.get("content") if isinstance(msg.get("content"), list) else []
+        tool_name = None
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "tool_use":
+                candidate = compact_label(item.get("name"), default=None, limit=120)
+                if candidate:
+                    tool_name = candidate
+                    break
+        summary = {"event": "assistant"}
+        if tool_name:
+            summary["tool_name"] = tool_name
+            summary["step_type"] = "tool"
+            summary["step_state"] = "ACTIVE"
+            summary["summary"] = f"tool {tool_name} ACTIVE"
+        else:
+            summary["summary"] = "assistant turn"
+        usage = compact_usage(msg.get("usage") or value.get("usage"))
+        if usage:
+            summary["usage"] = usage
+        return summary
+    if event_type == "user":
+        msg = value.get("message") if isinstance(value.get("message"), dict) else value
+        content = msg.get("content") if isinstance(msg.get("content"), list) else []
+        has_tool_result = any(isinstance(item, dict) and item.get("type") == "tool_result" for item in content)
+        summary = {"event": "user"}
+        if has_tool_result:
+            summary["step_type"] = "tool"
+            summary["step_state"] = "DONE"
+            summary["summary"] = "tool DONE"
+        else:
+            summary["summary"] = "user turn"
+        return summary
+    if event_type == "result":
+        subtype = compact_label(value.get("subtype"), default="unknown", limit=40)
+        is_error = value.get("is_error") is True
+        status = "SUCCESS" if (subtype == "success" and not is_error) else ("ERROR" if is_error else (subtype.upper() if subtype != "unknown" else "UNKNOWN"))
+        summary = {"event": "result", "status": status, "summary": f"terminal {status}"}
+        if (isinstance(value.get("duration_seconds"), (int, float)) and
+                not isinstance(value.get("duration_seconds"), bool) and
+                math.isfinite(value["duration_seconds"]) and value["duration_seconds"] >= 0):
+            summary["duration_seconds"] = value["duration_seconds"]
+        elif (isinstance(value.get("duration_ms"), (int, float)) and
+              not isinstance(value.get("duration_ms"), bool) and
+              math.isfinite(value["duration_ms"]) and value["duration_ms"] >= 0):
+            summary["duration_seconds"] = value["duration_ms"] / 1000
+        usage = compact_usage(value.get("usage"))
+        if usage:
+            summary["usage"] = usage
+        return summary
+    if event_type == "error":
+        return {"event": "error", "summary": "error"}
+    return {"event": event_type, "summary": event_type}
+
+
+def update_claude_progress(state, value, observed_at):
+    if not isinstance(value, dict):
+        return
+    state["event_count"] += 1
+    summary = compact_claude_event(value)
+    state["last_event"] = summary
+    state["last_event_at"] = observed_at
+    session_id = compact_label(value.get("session_id") or value.get("conversation_id"), default=None, limit=200)
+    if session_id:
+        state["conversation_id"] = session_id
+
+    if summary.get("step_state") == "ACTIVE":
+        state["active_step"] = {k: summary[k] for k in
+                                ("step_type", "step_state", "tool_name", "summary") if k in summary}
+    elif summary.get("step_state") == "DONE":
+        tool_name = (state.get("active_step") or {}).get("tool_name") or summary.get("tool_name") or "tool"
+        state["completed_steps"].add(("tool", tool_name, state["event_count"]))
+        state["active_step"] = None
+        if tool_name and summary.get("summary") == "tool DONE":
+            summary["tool_name"] = tool_name
+            summary["summary"] = f"tool {tool_name} DONE"
+            state["last_event"] = summary
+    elif summary.get("event") == "result":
+        state["terminal"] = {k: summary[k] for k in
+                             ("status", "duration_seconds", "summary") if k in summary}
+        state["active_step"] = None
+    elif summary.get("event") == "error":
+        state["last_error"] = {"summary": "error", "observed_at": observed_at}
+    if summary.get("usage"):
+        state["usage"] = summary["usage"]
+
+
+def compact_deepseek_event(value):
+    """Summarize one Codex JSONL event without copying prompts, text, parameters, or tool output."""
+    event_type = compact_label(value.get("type") or value.get("event"))
+    if event_type == "thread.started":
+        return {"event": "thread.started", "summary": "thread started"}
+    if event_type == "turn.started":
+        return {"event": "turn.started", "summary": "turn started"}
+    if event_type == "turn.completed":
+        summary = {"event": "turn.completed", "summary": "turn completed"}
+        usage = compact_usage(value.get("usage"))
+        if usage:
+            summary["usage"] = usage
+        return summary
+    if event_type == "turn.failed":
+        return {"event": "turn.failed", "status": "FAILED", "summary": "terminal FAILED"}
+    if event_type == "item.started":
+        item = value.get("item") if isinstance(value.get("item"), dict) else {}
+        item_type = compact_label(item.get("type"), default="item", limit=60)
+        if item_type in CODEX_TOOL_ITEM_TYPES:
+            candidate = ((item.get("tool") or item.get("name"))
+                         if item_type == "mcp_tool_call" else item_type)
+            tool_name = compact_label(candidate, default=item_type, limit=120)
+            return {"event": "item.started", "step_type": "item", "tool_name": tool_name,
+                    "step_state": "ACTIVE", "summary": f"tool {tool_name} ACTIVE"}
+        return {"event": "item.started", "summary": f"{item_type} started"}
+    if event_type == "item.completed":
+        item = value.get("item") if isinstance(value.get("item"), dict) else {}
+        item_type = compact_label(item.get("type"), default="item", limit=60)
+        if item_type in CODEX_TOOL_ITEM_TYPES:
+            candidate = ((item.get("tool") or item.get("name"))
+                         if item_type == "mcp_tool_call" else item_type)
+            tool_name = compact_label(candidate, default=item_type, limit=120)
+            return {"event": "item.completed", "step_type": "item", "tool_name": tool_name,
+                    "step_state": "DONE", "summary": f"tool {tool_name} DONE"}
+        return {"event": "item.completed", "summary": f"{item_type} completed"}
+    if event_type == "error":
+        return {"event": "error", "summary": "error"}
+    # DeepSeek final response schema line emitted in stdout
+    if isinstance(value.get("status"), str) and "response" in value and event_type == "unknown":
+        status = compact_label(value.get("status"), default="unknown", limit=40)
+        return {"event": "result", "status": status, "summary": f"terminal {status}"}
+    return {"event": event_type, "summary": event_type}
+
+
+def update_deepseek_progress(state, value, observed_at):
+    if not isinstance(value, dict):
+        return
+    state["event_count"] += 1
+    summary = compact_deepseek_event(value)
+    state["last_event"] = summary
+    state["last_event_at"] = observed_at
+    thread_id = compact_label(value.get("thread_id") or value.get("conversation_id"), default=None, limit=200)
+    if thread_id:
+        state["conversation_id"] = thread_id
+
+    if summary.get("step_state") == "ACTIVE":
+        state["active_step"] = {k: summary[k] for k in
+                                ("step_type", "step_state", "tool_name", "summary") if k in summary}
+    elif summary.get("step_state") == "DONE":
+        tool_name = summary.get("tool_name") or (state.get("active_step") or {}).get("tool_name") or "item"
+        item_id = (value.get("item") or {}).get("id") if isinstance(value.get("item"), dict) else None
+        item_key = compact_label(item_id, default=None, limit=100) if isinstance(item_id, str) else None
+        key = item_key or ("item", tool_name, state["event_count"])
+        state["completed_steps"].add(key)
+        if (state.get("active_step") or {}).get("tool_name") == tool_name:
+            state["active_step"] = None
+    elif summary.get("event") == "turn.completed":
+        state["completed_steps"].add(("turn", state["event_count"]))
+        state["active_step"] = None
+    elif summary.get("event") in ("turn.failed", "result"):
+        state["terminal"] = {k: summary[k] for k in
+                             ("status", "summary") if k in summary}
+        state["active_step"] = None
+    elif summary.get("event") == "error":
+        state["last_error"] = {"summary": "error", "observed_at": observed_at}
+    if summary.get("usage"):
+        state["usage"] = summary["usage"]
+
+
+def update_progress(state, value, observed_at):
+    provider = state.get("provider", "gemini")
+    if provider == "claude":
+        update_claude_progress(state, value, observed_at)
+    elif provider == "deepseek":
+        update_deepseek_progress(state, value, observed_at)
+    else:
+        update_gemini_progress(state, value, observed_at)
+
+
+def progress_snapshot(state, started_wall, started_monotonic, adapter_state):
+    now = time.time()
+    snapshot = {
+        "provider": state.get("provider", "unknown"),
+        "adapter_state": adapter_state,
+        "started_at": dt.datetime.fromtimestamp(started_wall, UTC).isoformat().replace("+00:00", "Z"),
+        "updated_at": dt.datetime.fromtimestamp(now, UTC).isoformat().replace("+00:00", "Z"),
+        "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+        "stream_offset_bytes": state["offset"],
+        "stream_event_count": state["event_count"],
+        "malformed_event_count": state["malformed_event_count"],
+        "completed_step_count": len(state["completed_steps"]),
+        "last_event_at": state["last_event_at"],
+        "last_event": state["last_event"],
+        "active_step": state["active_step"],
+        "terminal": state["terminal"],
+        "last_error": state.get("last_error"),
+        "usage": state["usage"],
+        "conversation_id": state["conversation_id"],
+    }
+    return snapshot
+
+
+def gemini_progress_snapshot(state, started_wall, started_monotonic, adapter_state):
+    return progress_snapshot(state, started_wall, started_monotonic, adapter_state)
+
+
+def _consume_progress_chunk(state, chunk, observed_at, final=False):
+    """Consume one bounded stream chunk and retain at most one capped partial line."""
+    if state.get("discarding_oversize_line"):
+        newline = chunk.find(b"\n")
+        if newline < 0:
+            if final:
+                state["discarding_oversize_line"] = False
+            return 0
+        else:
+            chunk = chunk[newline + 1:]
+            state["discarding_oversize_line"] = False
+
+    data = state["remainder"] + chunk
+    lines = data.split(b"\n")
+    if final:
+        state["remainder"] = b""
+    else:
+        state["remainder"] = lines.pop() if lines else data
+        if len(state["remainder"]) > MAX_STREAM_LINE_BYTES:
+            state["malformed_event_count"] += 1
+            state["remainder"] = b""
+            state["discarding_oversize_line"] = True
+
+    new_events = 0
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        if len(raw) > MAX_STREAM_LINE_BYTES:
+            state["malformed_event_count"] += 1
+            continue
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError, RecursionError):
+            state["malformed_event_count"] += 1
+            continue
+        if not isinstance(value, dict):
+            state["malformed_event_count"] += 1
+            continue
+        update_progress(state, value, observed_at)
+        new_events += 1
+    return new_events
+
+
+def refresh_progress(output, state, started_wall, started_monotonic,
+                     adapter_state="running", final=False):
+    """Incrementally consume provider JSONL/NDJSON and atomically persist a compact snapshot."""
+    path = Path(output) / "stdout.log"
+    observed_at = dt.datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    new_events = 0
+    malformed_before = state["malformed_event_count"]
+    try:
+        # Read from the saved offset every time. In particular, do not depend
+        # on concurrently reported file-size metadata being fresh on Windows.
+        # Bound each allocation even when a provider emits a huge line. During
+        # a live run, cap work per poll; at process exit, drain to EOF in the
+        # same bounded chunks so a terminal event cannot remain unread.
+        with path.open("rb") as stream:
+            stream.seek(state["offset"])
+            budget = None if final else MAX_STREAM_LINE_BYTES + STREAM_READ_CHUNK_BYTES
+            consumed = 0
+            while budget is None or consumed < budget:
+                read_size = STREAM_READ_CHUNK_BYTES
+                if budget is not None:
+                    read_size = min(read_size, budget - consumed)
+                chunk = stream.read(read_size)
+                if not chunk:
+                    break
+                state["offset"] += len(chunk)
+                consumed += len(chunk)
+                new_events += _consume_progress_chunk(state, chunk, observed_at)
+    except FileNotFoundError:
+        pass
+
+    if final:
+        new_events += _consume_progress_chunk(state, b"", observed_at, final=True)
+
+    snapshot = progress_snapshot(state, started_wall, started_monotonic, adapter_state)
+    if new_events or final or state["malformed_event_count"] != malformed_before:
+        write_json(Path(output) / "progress.json", snapshot)
+    return snapshot, new_events
+
+
+def refresh_gemini_progress(*args, **kwargs):
+    return refresh_progress(*args, **kwargs)
+
+
+def safe_refresh_progress(result, *args, **kwargs):
+    try:
+        return refresh_progress(*args, **kwargs)
+    except Exception as exc:
+        result["progress_error"] = str(exc)
+        return None, 0
+
+
+def safe_refresh_gemini_progress(result, *args, **kwargs):
+    return safe_refresh_progress(result, *args, **kwargs)
+
+
+def emit_progress(snapshot):
+    if not snapshot or not snapshot.get("last_event"):
+        return
+    last = snapshot["last_event"].get("summary", "unknown")
+    provider = snapshot.get("provider", "provider")
+    print(f"{provider} progress: events={snapshot['stream_event_count']}; last={last}; "
+          f"completed_steps={snapshot['completed_step_count']}; no response text relayed",
+          file=sys.stderr, flush=True)
+
+
+def emit_gemini_progress(snapshot):
+    emit_progress(snapshot)
+
+
+def maybe_emit_progress(result, state, snapshot, force=False):
+    """Relay bounded state changes without allowing diagnostic I/O to affect the run."""
+    if not snapshot or not snapshot.get("last_event"):
+        return
+    last_event = snapshot["last_event"]
+    terminal = last_event.get("event") in ("result", "turn.failed")
+    step_transition = (
+        (last_event.get("event") == "step_update" and last_event.get("step_state") in ("ACTIVE", "DONE")) or
+        (last_event.get("event") in ("item.started", "item.completed", "assistant", "user") and
+         last_event.get("step_state") in ("ACTIVE", "DONE")) or
+        (last_event.get("event") in ("turn.started", "turn.completed"))
+    )
+    if not (force or terminal or step_transition):
+        return
+    now = time.monotonic()
+    last_emitted = state.get("last_emitted_monotonic")
+    if not (force or terminal) and last_emitted is not None and now - last_emitted < STREAM_PROGRESS_EMIT_SECONDS:
+        return
+    try:
+        if state.get("provider") == "gemini" or snapshot.get("provider") in ("gemini", None):
+            emit_gemini_progress(snapshot)
+        else:
+            emit_progress(snapshot)
+        state["last_emitted_monotonic"] = now
+    except Exception as exc:
+        result["progress_error"] = str(exc)
+
+
+def maybe_emit_gemini_progress(result, state, snapshot, force=False):
+    maybe_emit_progress(result, state, snapshot, force=force)
+
+
 def provider_timing(config, provider_name):
     """Resolve a provider soft timeout and its adapter-owned termination grace."""
     provider = config["providers"][provider_name]
-    timeout = provider.get("timeout_seconds", config.get("timeout_seconds", 1800))
+    default_timeout = 3600 if provider_name == "gemini" else 1800
+    timeout = provider.get("timeout_seconds", config.get("timeout_seconds", default_timeout))
     grace_default = 120 if provider_name == "gemini" else 0
     grace = provider.get("termination_grace_seconds", grace_default)
-    heartbeat_default = 60 if provider_name == "gemini" else 0
-    heartbeat = provider.get("heartbeat_seconds", heartbeat_default)
+    heartbeat_default = 60
+    heartbeat = provider.get("heartbeat_seconds", config.get("heartbeat_seconds", heartbeat_default))
     try:
         timeout, grace, heartbeat = float(timeout), float(grace), float(heartbeat)
     except (TypeError, ValueError) as exc:
@@ -1118,10 +1880,13 @@ def provider_timing(config, provider_name):
     if (not all(math.isfinite(value) for value in (timeout, grace, heartbeat)) or
             not math.isfinite(timeout + grace) or timeout <= 0 or grace < 0 or heartbeat < 0):
         raise ValueError("provider timeout must be positive; termination grace and heartbeat must be non-negative")
+    if 0 < heartbeat < MIN_HEARTBEAT_SECONDS:
+        heartbeat = MIN_HEARTBEAT_SECONDS
     return timeout, grace, heartbeat
 
 
-def heartbeat(output, provider_name, provider, process, state, started_wall, started_monotonic):
+def heartbeat(output, provider_name, provider, process, state, started_wall, started_monotonic,
+              progress=None):
     """Write diagnostic liveness only; process/log activity is not task progress."""
     now = time.time()
     data = {"provider": provider_name, "model": provider["model"], "pid": process.pid,
@@ -1129,22 +1894,40 @@ def heartbeat(output, provider_name, provider, process, state, started_wall, sta
             "updated_at": dt.datetime.fromtimestamp(now, UTC).isoformat().replace("+00:00", "Z"),
             "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
             "process_alive": process.poll() is None}
-    log_file = Path(output) / "provider.log"
-    try:
-        stat = log_file.stat()
-        data["provider_log_last_activity_at"] = dt.datetime.fromtimestamp(stat.st_mtime, UTC).isoformat().replace("+00:00", "Z")
-        data["provider_log_size_bytes"] = stat.st_size
-    except OSError:
-        pass
+    activity = []
+    for kind, name in (("provider", "provider.log"), ("stdout", "stdout.log")):
+        try:
+            stat = (Path(output) / name).stat()
+        except OSError:
+            continue
+        observed = dt.datetime.fromtimestamp(stat.st_mtime, UTC).isoformat().replace("+00:00", "Z")
+        data[f"{kind}_log_last_activity_at"] = observed
+        data[f"{kind}_log_size_bytes"] = stat.st_size
+        activity.append((stat.st_mtime, kind, observed))
+    if activity:
+        _, kind, observed = max(activity)
+        data["activity_log_kind"] = kind
+        data["activity_log_last_activity_at"] = observed
+    if progress:
+        data["progress"] = {
+            key: progress.get(key) for key in
+            ("stream_event_count", "completed_step_count", "last_event_at", "last_event",
+             "active_step", "terminal", "last_error", "usage")
+        }
     write_json(Path(output) / "heartbeat.json", data)
     return data
 
 
 def emit_heartbeat(data):
     """Keep stdout reserved for the adapter's single structured result."""
-    activity = data.get("provider_log_last_activity_at", "unobserved")
+    activity = data.get("activity_log_last_activity_at",
+                        data.get("provider_log_last_activity_at", "unobserved"))
+    progress = data.get("progress") or {}
+    last = (progress.get("last_event") or {}).get("summary", "unobserved")
     print(f"adapter heartbeat: {data['provider']} local_process_alive={data['process_alive']}; "
-          f"provider_log_last_activity={activity}; diagnostic only, not task progress", file=sys.stderr, flush=True)
+          f"stream_events={progress.get('stream_event_count', 0)}; last_stream_event={last}; "
+          f"output_activity={activity}; diagnostic only, not task completion",
+          file=sys.stderr, flush=True)
 
 
 def safe_heartbeat(result, *args):
@@ -1229,7 +2012,8 @@ def execute(args):
         dry_run_meta = {"status": "dry_run", "provider": provider_name, "model": provider["model"],
                         "cwd": str(workspace), "command": command, "state_dir": str(state_dir),
                         "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace,
-                        "outer_timeout_seconds": timeout + termination_grace}
+                        "outer_timeout_seconds": timeout + termination_grace,
+                        "heartbeat_seconds": heartbeat_seconds}
         if args.role == "review":
             dry_run_meta["review_effort"] = review_effort
             dry_run_meta["review_reason"] = review_reason
@@ -1312,7 +2096,9 @@ def execute(args):
                           timeout, workspace, review_effort or "medium", provider_name=provider_name, output_dir=output)
     result = {"provider": provider_name, "model": provider["model"], "logs": str(output),
               "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace,
-              "outer_timeout_seconds": timeout + termination_grace}
+              "outer_timeout_seconds": timeout + termination_grace,
+              "heartbeat_seconds": heartbeat_seconds,
+              "progress_path": str(output / "progress.json")}
     if args.role == "review":
         result["review_effort"] = review_effort
         result["review_reason"] = review_reason
@@ -1369,6 +2155,8 @@ def execute(args):
                 process = None
                 started_wall = None
                 started_monotonic = None
+                stream_state = new_progress_state(provider_name)
+                progress_snapshot = None
                 try:
                     process = subprocess.Popen(command, cwd=workspace, shell=False, stdout=stdout, stderr=stderr,
                                                env=child_environment(config, provider_name, checked_deepseek_key),
@@ -1378,26 +2166,51 @@ def execute(args):
                         write_json(pending_path, {"status": "running", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "pid": process.pid, "provider": provider_name,
                                                   "started_at": started_wall, "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace})
                         release_claim_lock()
+                    progress_snapshot, _ = safe_refresh_progress(
+                        result, output, stream_state, started_wall, started_monotonic)
                     if heartbeat_seconds:
-                        safe_heartbeat(result, output, provider_name, provider, process, "running", started_wall, started_monotonic)
+                        safe_heartbeat(result, output, provider_name, provider, process, "running",
+                                       started_wall, started_monotonic, progress_snapshot)
                     deadline = started_monotonic + timeout + termination_grace
                     next_heartbeat = started_monotonic + heartbeat_seconds if heartbeat_seconds else None
+                    stream_poll_interval = (max(0.01, min(STREAM_POLL_SECONDS, heartbeat_seconds))
+                                            if heartbeat_seconds else STREAM_POLL_SECONDS)
+                    next_stream_poll = started_monotonic + stream_poll_interval
                     while True:
-                        remaining = deadline - time.monotonic()
+                        now_monotonic = time.monotonic()
+                        remaining = deadline - now_monotonic
                         if remaining <= 0:
                             # A slow heartbeat/write can cross the boundary after the child exited.
                             if process.poll() is not None:
                                 code = process.wait(timeout=0)
                                 break
                             raise subprocess.TimeoutExpired(command, timeout + termination_grace)
-                        wait_for = remaining if next_heartbeat is None else min(remaining, max(0.01, next_heartbeat - time.monotonic()))
+                        wake_times = [deadline]
+                        if next_heartbeat is not None:
+                            wake_times.append(next_heartbeat)
+                        if next_stream_poll is not None:
+                            wake_times.append(next_stream_poll)
+                        wait_for = max(0.01, min(wake_times) - now_monotonic)
                         try:
                             code = process.wait(timeout=wait_for)
                             break
                         except subprocess.TimeoutExpired:
-                            if next_heartbeat is not None and time.monotonic() >= next_heartbeat:
-                                safe_heartbeat(result, output, provider_name, provider, process, "running", started_wall, started_monotonic)
-                                next_heartbeat = time.monotonic() + heartbeat_seconds
+                            now_monotonic = time.monotonic()
+                            if next_stream_poll is not None and now_monotonic >= next_stream_poll:
+                                progress_snapshot, new_events = safe_refresh_progress(
+                                    result, output, stream_state, started_wall, started_monotonic)
+                                if new_events:
+                                    maybe_emit_progress(result, stream_state, progress_snapshot)
+                                next_stream_poll = now_monotonic + stream_poll_interval
+                            if next_heartbeat is not None and now_monotonic >= next_heartbeat:
+                                safe_heartbeat(result, output, provider_name, provider, process, "running",
+                                               started_wall, started_monotonic, progress_snapshot)
+                                next_heartbeat = now_monotonic + heartbeat_seconds
+                    progress_snapshot, new_events = safe_refresh_progress(
+                        result, output, stream_state, started_wall, started_monotonic,
+                        adapter_state="finished", final=True)
+                    if new_events:
+                        maybe_emit_progress(result, stream_state, progress_snapshot, force=True)
                 except BaseException as exc:
                     if process is not None:
                         cleanup_error = None
@@ -1418,9 +2231,17 @@ def execute(args):
                                              "process_alive_after_cleanup": alive_after_cleanup,
                                              "local_process_stopped": alive_after_cleanup is False,
                                              "direct_process_stopped": alive_after_cleanup is False}
+                        if stream_state is not None and started_wall is not None:
+                            adapter_state = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "interrupted"
+                            progress_snapshot, new_events = safe_refresh_progress(
+                                result, output, stream_state, started_wall, started_monotonic,
+                                adapter_state=adapter_state, final=True)
+                            if new_events:
+                                maybe_emit_progress(result, stream_state, progress_snapshot, force=True)
                         if heartbeat_seconds and started_wall is not None:
                             safe_heartbeat(result, output, provider_name, provider, process,
-                                           "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "interrupted", started_wall, started_monotonic)
+                                           "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "interrupted",
+                                           started_wall, started_monotonic, progress_snapshot)
                         if args.role == "implement" and isinstance(exc, (subprocess.TimeoutExpired, KeyboardInterrupt)):
                             try:
                                 write_json(pending_path, {"status": "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "interrupted",
@@ -1444,39 +2265,77 @@ def execute(args):
                 result["finished_at"] = dt.datetime.now(UTC).isoformat().replace("+00:00", "Z")
                 result["duration_seconds"] = round(time.monotonic() - started_monotonic, 3)
                 if heartbeat_seconds:
-                    safe_heartbeat(result, output, provider_name, provider, process, "finished", started_wall, started_monotonic)
+                    safe_heartbeat(result, output, provider_name, provider, process, "finished",
+                                   started_wall, started_monotonic, progress_snapshot)
             stderr_file = output / "stderr.log"
-            raw_stdout = stdout_file.read_text(encoding="utf-8", errors="replace")
-            raw_stderr = stderr_file.read_text(encoding="utf-8", errors="replace")
-            clean_stdout = _sanitize_all_secrets(raw_stdout, secrets)
-            clean_stderr = _sanitize_all_secrets(raw_stderr, secrets)
-            if clean_stdout != raw_stdout:
-                stdout_file.write_text(clean_stdout, encoding="utf-8")
-            if clean_stderr != raw_stderr:
-                stderr_file.write_text(clean_stderr, encoding="utf-8")
-            stdout_text = clean_stdout
-            stderr_text = clean_stderr
+            stdout_text, stdout_truncated = read_text_tail(stdout_file)
+            stderr_text, stderr_truncated = read_text_tail(stderr_file)
+            stdout_text = _sanitize_all_secrets(stdout_text, secrets)
+            stderr_text = _sanitize_all_secrets(stderr_text, secrets)
 
-            errors = error_objects(stdout_text)
-            errors += error_objects(stderr_text)
-            plain_error = plain_terminal_error(stderr_text, code)
-            if plain_error and not stdout_text.strip():
-                errors.append(plain_error)
             is_terminal = False
             ds_output = None
+            gemini_output = None
+            claude_output = None
+            gemini_result_event = False
+            claude_result_event = False
+            stream_errors = []
+            provider_output_text = stdout_text
             if provider_name == "deepseek":
-                ds_output, is_terminal, valid_success = parse_deepseek_final_output(output, stdout_text)
+                ds_output, is_terminal, valid_success = parse_deepseek_final_output(
+                    output, stdout_text, stdout_truncated=stdout_truncated)
                 terminal_turn, terminal_event, has_terminal_402, _ = parse_codex_events(stdout_text)
+            elif provider_name == "gemini":
+                gemini_output, gemini_result_event, stream_errors = parse_gemini_final_output(
+                    stdout_text, stdout_truncated=stdout_truncated)
+                provider_output_text = json.dumps(gemini_output) if gemini_output is not None else ""
+                valid_success = successful_response(provider_output_text, args.role)
+                terminal_turn, has_terminal_402 = None, False
+            elif provider_name == "claude":
+                claude_output, claude_result_event, stream_errors = parse_claude_final_output(stdout_text)
+                provider_output_text = json.dumps(claude_output) if claude_output is not None else ""
+                valid_success = successful_response(provider_output_text, args.role)
+                terminal_turn, has_terminal_402 = None, False
             else:
                 valid_success = successful_response(stdout_text, args.role)
                 terminal_turn, has_terminal_402 = None, False
-            denied = permission_denials(stdout_text)
-            complete_failure = complete_terminal_failure(stdout_text)
-            if not stdout_text.strip():
+
+            errors = error_objects(provider_output_text)
+            errors += error_objects(stderr_text)
+            if provider_name in ("gemini", "claude") and (gemini_output is None if provider_name == "gemini" else claude_output is None):
+                errors.extend(error for error in stream_errors if isinstance(error, dict))
+            # A truncated stderr suffix cannot prove that its remaining line
+            # was the CLI's only diagnostic. Truncated stdout may hide a real
+            # terminal event. Either case prevents stderr from establishing a
+            # standalone terminal failure.
+            plain_error = None if stderr_truncated or stdout_truncated else plain_terminal_error(stderr_text, code)
+            provider_without_terminal = (
+                (provider_name == "gemini" and gemini_output is None and not gemini_result_event) or
+                (provider_name == "claude" and claude_output is None and not claude_result_event)
+            )
+            plain_error_applies = plain_error
+            if provider_name in ("gemini", "claude") and stdout_text.strip() and not provider_without_terminal:
+                # A malformed event=result is not repaired by unrelated stderr;
+                # keep ownership unresolved instead of authorizing a fallback.
+                plain_error_applies = None
+            if plain_error_applies and (not stdout_text.strip() or provider_without_terminal):
+                errors.append(plain_error_applies)
+            raw_stdout_is_partial = provider_name == "deepseek" and stdout_truncated
+            denied = [] if raw_stdout_is_partial else permission_denials(provider_output_text)
+            complete_failure = False if raw_stdout_is_partial else complete_terminal_failure(provider_output_text)
+            if ((not stdout_text.strip() or provider_without_terminal) and
+                    not stderr_truncated and not stdout_truncated):
                 complete_failure = complete_failure or complete_terminal_failure(stderr_text)
-            terminal_established = (denied or valid_success or plain_error is not None or
+            terminal_established = (denied or valid_success or plain_error_applies is not None or
                                     (provider_name in ("gemini", "claude") and complete_failure) or
                                     (provider_name == "deepseek" and (is_terminal or terminal_turn == "failed")))
+            if provider_name in ("gemini", "claude"):
+                result["stream_terminal_seen"] = gemini_result_event if provider_name == "gemini" else claude_result_event
+            elif provider_name == "deepseek":
+                # turn.completed alone does not validate the required final
+                # schema in last_message.txt, so it cannot claim a usable
+                # terminal result.
+                result["stream_terminal_seen"] = is_terminal or terminal_turn == "failed"
             if args.role == "implement":
                 pending_data = {"status": "resolved" if terminal_established else "uncertain_exit", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "exit_code": code, "provider": provider_name,
                                 "started_at": started_wall, "finished_at": time.time(), "duration_seconds": result.get("duration_seconds"),
@@ -1507,7 +2366,19 @@ def execute(args):
                 if has_terminal_402:
                     insufficient_balance = {"code": "INSUFFICIENT_BALANCE", "message": "HTTP 402: Insufficient balance", "source": "codex_event"}
                 else:
-                    insufficient_balance = deepseek_insufficient_balance_error(errors, stderr_text)
+                    # Balance depletion must come from terminal evidence. An
+                    # intermediate error event may be followed by a different
+                    # terminal failure and must not permanently poison routing.
+                    terminal_balance_errors = []
+                    if terminal_turn == "failed" and isinstance(terminal_event, dict):
+                        terminal_error = terminal_event.get("error")
+                        if isinstance(terminal_error, dict):
+                            terminal_balance_errors.append(terminal_error)
+                        elif isinstance(terminal_error, str):
+                            terminal_balance_errors.append({"message": terminal_error})
+                    if is_terminal and isinstance(ds_output, dict):
+                        terminal_balance_errors.extend(error_objects(json.dumps(ds_output)))
+                    insufficient_balance = deepseek_insufficient_balance_error(terminal_balance_errors)
 
                 if insufficient_balance and terminal_established:
                     record_balance_snapshot(state_dir, {"is_available": False, "balance_infos": []},
@@ -1544,6 +2415,11 @@ def execute(args):
                     result["fallback"] = luna_fallback()
                 if not errors:
                     result["error"] = "No structured terminal result; backend completion uncertain. Pending state blocks new implementation until confirmed stopped."
+            elif args.role == "review" and not valid_success:
+                if not terminal_established:
+                    result.update(status="uncertain_exit")
+                    if not errors:
+                        result["error"] = "No structured terminal result; backend completion uncertain."
             return finish(result, output, workspace, 0 if result["status"] == "completed" else 1, secrets=secrets)
     except subprocess.TimeoutExpired:
         result["finished_at"] = dt.datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -1584,7 +2460,8 @@ def finish(result, output, workspace, code, secrets=None):
     except Exception as exc:
         artifact_errors.append("git evidence: " + str(exc))
     try:
-        sanitize_run_artifacts(output, secrets)
+        for error in sanitize_run_artifacts(output, secrets):
+            artifact_errors.append("artifact sanitization: " + error)
     except Exception as exc:
         artifact_errors.append("artifact sanitization: " + str(exc))
     if secrets:

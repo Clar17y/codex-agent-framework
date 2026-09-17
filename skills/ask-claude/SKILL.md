@@ -20,3 +20,7 @@ Use this skill when independent review adds meaningful confidence or is explicit
 ## Concurrent reviews
 
 Independent Claude reviews may run concurrently, including in the same workspace. The adapter does not impose the Gemini ownership gates on read-only reviews. Provide a stable candidate and distinct task contracts so each review has clear scope.
+
+## Lifecycle telemetry
+
+Claude uses `stream-json` telemetry (`--output-format stream-json --verbose`): the adapter incrementally reads NDJSON events from stdout, emits throttled compact step/tool transitions on stderr, and atomically writes `progress.json`. `heartbeat.json` serves as the quiet-period liveness fallback (default 60s). This adds no Claude turns, extra summaries, or Claude-token cost; compact stderr summaries add a small, bounded amount to the parent agent's context. The snapshot records bounded metadata (events, tool name, step state, normalized usage counters) but strictly excludes prompts, model text, tool parameters, and tool outputs. Keep the adapter command session open instead of using detached polling loops. A live heartbeat or recent stream event is diagnostic evidence, never proof of task correctness or eventual completion. Native subagents continue to use completion notifications and do not need periodic prose-progress files.

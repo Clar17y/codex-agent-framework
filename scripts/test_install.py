@@ -118,11 +118,12 @@ class TestInstallFramework(unittest.TestCase):
 
         # Check routing.json
         routing = json.loads((af_dir / "routing.json").read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 6)
+        self.assertEqual(routing.get("version"), 7)
         self.assertIn("providers", routing)
         self.assertIn("gemini", routing["providers"])
         self.assertIn("deepseek", routing["providers"])
         self.assertIn("claude", routing["providers"])
+        self.assertEqual(routing["providers"]["gemini"]["timeout_seconds"], 3600)
         self.assertEqual(routing["providers"]["deepseek"]["model"], "deepseek-flash")
         self.assertEqual(routing["providers"]["deepseek"]["profile"], "deepseek")
 
@@ -265,7 +266,7 @@ class TestInstallFramework(unittest.TestCase):
 
         refreshed_data = json.loads(routing_path.read_text(encoding="utf-8"))
         self.assertEqual(refreshed_data["timeout_seconds"], 900)
-        self.assertEqual(refreshed_data["providers"]["gemini"]["timeout_seconds"], 1800)
+        self.assertEqual(refreshed_data["providers"]["gemini"]["timeout_seconds"], 3600)
 
     def test_v5_global_900_migrates_gemini_lifecycle_defaults_only(self):
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
@@ -279,9 +280,48 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(data), encoding="utf-8")
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         migrated = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 6)
-        self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 1800)
+        self.assertEqual(migrated["version"], 7)
+        self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 3600)
         self.assertEqual(migrated["providers"]["gemini"]["termination_grace_seconds"], 120)
+
+    def test_v6_default_gemini_timeout_migrates_to_one_hour(self):
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework" / "routing.json"
+        data = json.loads(routing_path.read_text(encoding="utf-8"))
+        data["version"] = 6
+        data["providers"]["gemini"]["timeout_seconds"] = 1800
+        routing_path.write_text(json.dumps(data), encoding="utf-8")
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        migrated = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["version"], 7)
+        self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 3600)
+
+    def test_v6_custom_gemini_timeout_is_preserved(self):
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework" / "routing.json"
+        data = json.loads(routing_path.read_text(encoding="utf-8"))
+        data["version"] = 6
+        data["providers"]["gemini"]["timeout_seconds"] = 2700
+        routing_path.write_text(json.dumps(data), encoding="utf-8")
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        migrated = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["version"], 7)
+        self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 2700)
+
+    def test_preserved_routing_fills_missing_universal_heartbeats_only(self):
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework" / "routing.json"
+        data = json.loads(routing_path.read_text(encoding="utf-8"))
+        data["providers"]["gemini"]["heartbeat_seconds"] = 0
+        data["providers"]["deepseek"].pop("heartbeat_seconds")
+        data["providers"]["claude"].pop("heartbeat_seconds")
+        routing_path.write_text(json.dumps(data), encoding="utf-8")
+
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        migrated = json.loads(routing_path.read_text(encoding="utf-8"))["providers"]
+        self.assertEqual(migrated["gemini"]["heartbeat_seconds"], 0)
+        self.assertEqual(migrated["deepseek"]["heartbeat_seconds"], 60)
+        self.assertEqual(migrated["claude"]["heartbeat_seconds"], 60)
 
     def test_v5_custom_timeout_is_preserved(self):
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))

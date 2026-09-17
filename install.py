@@ -122,7 +122,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
             raise PreflightError(f'Source routing file {source_example_path} must contain a providers object.')
         source_defaults = source_example['providers']
 
-    target_version = config.get('version', 1) if preserving else 6
+    target_version = config.get('version', 1) if preserving else 7
     if isinstance(target_version, bool) or not isinstance(target_version, int):
         raise PreflightError('Routing configuration version must be an integer.')
 
@@ -182,19 +182,34 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
             if not discovered:
                 print(f'Warning: {command} not found on PATH; retaining command name.')
 
-    # v6 separates Gemini's provider soft timeout from the historical global
-    # 900-second default.  Only migrate the known untouched v5 shape: custom
-    # global/provider timing remains authoritative and is never overwritten.
-    if preserving and target_version < 6:
+    if preserving:
+        # Stream telemetry is universal in v7. Make the effective default
+        # visible in preserved routing files while retaining every explicit
+        # operator value, including zero (disabled).
+        for provider_name in ('gemini', 'deepseek', 'claude'):
+            entry = config['providers'].get(provider_name)
+            provider_defaults = source_defaults.get(provider_name, {})
+            if (isinstance(entry, dict) and 'heartbeat_seconds' not in entry and
+                    'heartbeat_seconds' in provider_defaults):
+                entry['heartbeat_seconds'] = provider_defaults['heartbeat_seconds']
         gemini = config['providers'].get('gemini')
-        if isinstance(gemini, dict) and config.get('timeout_seconds') == 900:
-            defaults = source_defaults.get('gemini', {})
+        defaults = source_defaults.get('gemini', {})
+        # v6 separated Gemini's provider soft timeout from the historical
+        # global 900-second default.  Only fill missing fields in that legacy
+        # shape; explicitly configured values remain authoritative.
+        if target_version < 6 and isinstance(gemini, dict) and config.get('timeout_seconds') == 900:
             for key in ('timeout_seconds', 'termination_grace_seconds', 'heartbeat_seconds'):
                 if key in defaults and key not in gemini:
                     gemini[key] = defaults[key]
-        config['version'] = 6
-    elif not preserving:
-        config['version'] = 6
+        # v7 moves the packaged Gemini timeout away from the observed
+        # 30-minute cliff.  The exact v6 default migrates; every other value is
+        # treated as an operator override and preserved.
+        elif target_version == 6 and isinstance(gemini, dict) and gemini.get('timeout_seconds') == 1800:
+            gemini['timeout_seconds'] = defaults.get('timeout_seconds', 3600)
+        if target_version < 7:
+            config['version'] = 7
+    else:
+        config['version'] = 7
     return config
 
 

@@ -33,7 +33,8 @@ class ProviderTests(unittest.TestCase):
         self.settings = {"providers": {
             "gemini": {"executable": [sys.executable, str(self.fake)], "model": "gemini-3.8-flash-medium", "heartbeat_seconds": 0},
             "claude": {"executable": [sys.executable, str(self.fake)], "model": "claude-opus-5"}},
-            "timeout_seconds": 5}
+            "timeout_seconds": 5,
+            "heartbeat_seconds": 0}
         self.args = argparse.Namespace(role="implement", workspace=str(self.root), task_file=str(self.task),
                                        config=str(self.config), state_dir=str(self.root / "state"), dry_run=False)
 
@@ -306,6 +307,230 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual((result["status"], code), ("completed", 0))
         self.assertTrue(Path(result["evidence"]["status"]).exists())
 
+    def test_gemini_stream_progress_is_compact_and_terminal_result_completes(self):
+        events = [
+            {"event": "init", "conversation_id": "conversation-1",
+             "init": {"model": "gemini-3.8-flash-medium", "tools": ["view_file"]}},
+            {"event": "step_update", "step_update": {"conversation_id": "conversation-1",
+             "step_index": 1, "state": "ACTIVE", "step_type": "tool", "tool_name": "view_file",
+             "tool_info": {"parameters": {"AbsolutePath": "secret-path"}}}},
+            {"event": "step_update", "step_update": {"conversation_id": "conversation-1",
+             "step_index": 1, "state": "DONE", "step_type": "tool", "tool_name": "view_file",
+             "duration_seconds": .01, "tool_info": {"output": "secret-output"}}},
+            {"event": "result", "result": {"conversation_id": "conversation-1", "status": "SUCCESS",
+             "response": "Done", "duration_seconds": .1,
+             "usage": {"input_tokens": 10, "output_tokens": 2, "thinking_tokens": 1,
+                       "cache_read_tokens": 0, "total_tokens": 13}}},
+        ]
+        self.fake.write_text(
+            "import json, time\n"
+            f"events = {events!r}\n"
+            "for event in events:\n"
+            "    print(json.dumps(event), flush=True)\n"
+            "    time.sleep(.025)\n",
+            encoding="utf-8")
+        self.settings["providers"]["gemini"]["heartbeat_seconds"] = .01
+
+        result, code = self.run_provider()
+
+        self.assertEqual((result["status"], code), ("completed", 0))
+        self.assertTrue(result["stream_terminal_seen"])
+        progress = runner.read_json(result["progress_path"])
+        self.assertEqual(progress["adapter_state"], "finished")
+        self.assertEqual(progress["stream_event_count"], 4)
+        self.assertEqual(progress["completed_step_count"], 1)
+        self.assertEqual(progress["terminal"]["status"], "SUCCESS")
+        self.assertEqual(progress["usage"]["total_tokens"], 13)
+        compact = json.dumps(progress)
+        self.assertNotIn("secret-path", compact)
+        self.assertNotIn("secret-output", compact)
+        self.assertNotIn('"response"', compact)
+        heartbeat = runner.read_json(Path(result["logs"]) / "heartbeat.json")
+        self.assertEqual(heartbeat["progress"]["stream_event_count"], 4)
+
+    def test_gemini_stream_intermediate_error_does_not_override_terminal_success(self):
+        events = [
+            {"event": "error", "error": {"code": "TRANSIENT", "message": "recovered"}},
+            {"event": "result", "result": {"status": "SUCCESS", "response": "Done"}},
+        ]
+        self.fake.write_text(
+            "import json\n"
+            f"events = {events!r}\n"
+            "for event in events: print(json.dumps(event), flush=True)\n",
+            encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("completed", 0))
+
+    def test_gemini_stream_intermediate_quota_does_not_override_other_terminal_error(self):
+        events = [
+            {"event": "error", "error": {"code": "QUOTA_EXHAUSTED", "message": "Daily quota exhausted"}},
+            {"event": "result", "result": {"status": "ERROR", "response": "Invalid model"}},
+        ]
+        self.fake.write_text(
+            "import json\n"
+            f"events = {events!r}\n"
+            "for event in events: print(json.dumps(event), flush=True)\n",
+            encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("provider_error", 1))
+        self.assertFalse((self.root / "state" / "gemini-quota.json").exists())
+
+    def test_gemini_stream_without_terminal_result_stays_uncertain(self):
+        event = {"event": "step_update", "step_update": {
+            "step_index": 1, "state": "DONE", "step_type": "tool", "tool_name": "view_file"}}
+        self.fake.write_text(f"import json\nprint(json.dumps({event!r}), flush=True)\n", encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
+        self.assertEqual(runner.read_json(self.pending_path)["status"], "uncertain_exit")
+
+    def test_gemini_stream_non_event_json_is_not_terminal(self):
+        lines = [
+            {"event": "init", "conversation_id": "conversation-1", "init": {"model": "gemini-3.8-flash-medium"}},
+            {"error": {"code": "TRANSIENT", "message": "not a terminal event"}},
+        ]
+        self.fake.write_text(
+            "import json\n"
+            f"lines = {lines!r}\n"
+            "for line in lines: print(json.dumps(line), flush=True)\n",
+            encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+        self.assertFalse(result["fallback_authorized"])
+
+    def test_gemini_stream_non_event_json_after_result_cannot_replace_terminal(self):
+        lines = [
+            {"event": "result", "result": {"status": "SUCCESS", "response": "Done"}},
+            {"status": "ERROR", "response": "late diagnostic"},
+        ]
+        self.fake.write_text(
+            "import json\n"
+            f"lines = {lines!r}\n"
+            "for line in lines: print(json.dumps(line), flush=True)\n",
+            encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("completed", 0))
+        progress = runner.read_json(result["progress_path"])
+        self.assertEqual(progress["last_event"]["event"], "unknown")
+        self.assertEqual(progress["terminal"]["status"], "SUCCESS")
+
+    def test_gemini_stream_malformed_result_with_stderr_stays_uncertain(self):
+        event = {"event": "result", "result": None}
+        self.fake.write_text(
+            "import json, sys\n"
+            f"print(json.dumps({event!r}), flush=True)\n"
+            "print('Error: Daily quota exhausted', file=sys.stderr, flush=True)\n"
+            "sys.exit(1)\n",
+            encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+        self.assertTrue(result["stream_terminal_seen"])
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
+        self.assertEqual(runner.read_json(self.pending_path)["status"], "uncertain_exit")
+        self.assertFalse((self.root / "state" / "gemini-quota.json").exists())
+
+    def test_gemini_progress_rejects_untyped_or_content_like_labels(self):
+        state = runner.new_gemini_progress_state()
+        event = {"event": "step_update", "conversation_id": {"secret": "conversation-secret"},
+                 "step_update": {"step_index": 2, "step_type": {"secret": "type-secret"},
+                                 "state": ["state-secret"],
+                                 "tool_name": "tool name containing output-secret"}}
+        runner.update_gemini_progress(state, event, "2026-09-16T00:00:00Z")
+        compact = json.dumps(runner.gemini_progress_snapshot(
+            state, time.time(), time.monotonic(), "running"))
+        self.assertNotIn("secret", compact)
+        self.assertNotIn("tool_name", compact)
+        self.assertEqual(state["last_event"]["step_type"], "unknown")
+        self.assertEqual(state["last_event"]["step_state"], "unknown")
+        unknown_event = runner.compact_gemini_event({"event": {"secret": "event-secret"}})
+        unknown_status = runner.compact_gemini_event(
+            {"event": "result", "result": {"status": {"secret": "status-secret"}}})
+        self.assertEqual(unknown_event, {"event": "unknown", "summary": "unknown"})
+        self.assertEqual(unknown_status["status"], "unknown")
+        self.assertNotIn("secret", json.dumps([unknown_event, unknown_status]))
+
+    def test_gemini_stream_init_then_plain_stderr_quota_is_cached(self):
+        init = {"event": "init", "conversation_id": "conversation-1", "init": {"model": "gemini-3.8-flash-medium"}}
+        self.fake.write_text(
+            "import json, sys\n"
+            f"print(json.dumps({init!r}), flush=True)\n"
+            "print('Error: Daily quota exhausted', file=sys.stderr, flush=True)\n"
+            "sys.exit(1)\n",
+            encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("fallback_required", 20))
+        self.assertTrue((self.root / "state" / "gemini-quota.json").exists())
+
+    def test_gemini_stream_init_then_json_stderr_failure_is_terminal(self):
+        init = {"event": "init", "conversation_id": "conversation-1", "init": {"model": "gemini-3.8-flash-medium"}}
+        failure = {"status": "ERROR", "response": "Invalid model"}
+        self.fake.write_text(
+            "import json, sys\n"
+            f"print(json.dumps({init!r}), flush=True)\n"
+            f"print(json.dumps({failure!r}), file=sys.stderr, flush=True)\n"
+            "sys.exit(1)\n",
+            encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("provider_error", 1))
+        self.assertEqual(runner.read_json(self.pending_path)["status"], "resolved")
+
+    def test_gemini_stream_terminal_quota_error_uses_existing_fallback(self):
+        event = {"event": "result", "result": {
+            "status": "ERROR", "response": "Daily quota exhausted"}}
+        self.fake.write_text(f"import json\nprint(json.dumps({event!r}), flush=True)\n", encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("fallback_required", 20))
+        self.assertTrue(result["stream_terminal_seen"])
+
+    def test_gemini_stream_blocked_is_terminal_failure(self):
+        event = {"event": "result", "result": {"status": "BLOCKED", "response": "Needs input"}}
+        self.fake.write_text(f"import json\nprint(json.dumps({event!r}), flush=True)\n", encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("provider_error", 1))
+        self.assertFalse(result.get("fallback_blocked_by_pending", False))
+        self.assertEqual(runner.read_json(self.pending_path)["status"], "resolved")
+
+    def test_progress_stderr_failure_does_not_change_provider_outcome(self):
+        event = {"event": "result", "result": {"status": "SUCCESS", "response": "Done"}}
+        self.fake.write_text(f"import json\nprint(json.dumps({event!r}), flush=True)\n", encoding="utf-8")
+        with mock.patch.object(runner, "emit_gemini_progress", side_effect=OSError("stderr closed")):
+            result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("completed", 0))
+        self.assertEqual(result["progress_error"], "stderr closed")
+
+    def test_progress_relay_is_throttled_but_terminal_is_always_emitted(self):
+        state = runner.new_gemini_progress_state()
+        active = {"stream_event_count": 1, "completed_step_count": 0,
+                  "last_event": {"event": "step_update", "step_state": "ACTIVE", "summary": "tool view_file ACTIVE"}}
+        terminal = {"stream_event_count": 2, "completed_step_count": 1,
+                    "last_event": {"event": "result", "summary": "terminal SUCCESS"}}
+        result = {}
+        with mock.patch.object(runner, "emit_gemini_progress") as emit:
+            runner.maybe_emit_gemini_progress(result, state, active)
+            runner.maybe_emit_gemini_progress(result, state, active)
+            runner.maybe_emit_gemini_progress(result, state, terminal)
+        self.assertEqual(emit.call_count, 2)
+
+    def test_incremental_progress_handles_utf8_split_across_polls(self):
+        output = self.root / "stream-output"
+        output.mkdir()
+        payload = json.dumps({"event": "result", "result": {
+            "status": "SUCCESS", "response": "café"}}, ensure_ascii=False).encode("utf-8") + b"\n"
+        split = payload.index("é".encode("utf-8")) + 1
+        (output / "stdout.log").write_bytes(payload[:split])
+        state = runner.new_gemini_progress_state()
+        started_wall, started_monotonic = time.time(), time.monotonic()
+        first, count = runner.refresh_gemini_progress(output, state, started_wall, started_monotonic)
+        self.assertEqual(count, 0)
+        with (output / "stdout.log").open("ab") as stream:
+            stream.write(payload[split:])
+        final, count = runner.refresh_gemini_progress(
+            output, state, started_wall, started_monotonic, adapter_state="finished", final=True)
+        self.assertEqual(count, 1)
+        self.assertEqual(final["terminal"]["status"], "SUCCESS")
+
     def test_actual_agy_denied_read_is_not_success(self):
         self.fake_result({"status": "SUCCESS", "response": "", "denied_actions": [{"action": "read_file", "display_name": "ViewFile"}]}, 0)
         result, code = self.run_provider()
@@ -395,16 +620,19 @@ class ProviderTests(unittest.TestCase):
         result, code = self.run_provider()
         self.assertEqual((result["status"], code), ("timeout", 1))
         self.assertEqual(runner.read_json(self.pending_path)["status"], "timeout")
+        progress = runner.read_json(Path(result["progress_path"]))
+        self.assertEqual(progress["adapter_state"], "timeout")
         self.assertTrue(result["cleanup"]["attempted"])
         result, code = self.run_provider()
         self.assertEqual(result["status"], "blocked_pending_run")
 
-    def test_gemini_command_uses_soft_timeout_and_provider_log(self):
+    def test_gemini_command_uses_stream_json_soft_timeout_and_provider_log(self):
         self.settings["providers"]["gemini"].update(timeout_seconds=7, termination_grace_seconds=3)
         self.args.dry_run = True
         result, code = self.run_provider()
         self.assertEqual(code, 0)
         command = result["command"]
+        self.assertEqual(command[command.index("--output-format") + 1], "stream-json")
         self.assertEqual(command[command.index("--print-timeout") + 1], "7.0s")
         self.assertEqual(Path(command[command.index("--log-file") + 1]).name, "provider.log")
         self.assertEqual(result["outer_timeout_seconds"], 10)
@@ -419,6 +647,37 @@ class ProviderTests(unittest.TestCase):
         self.settings["providers"]["gemini"].update(timeout_seconds=1e308, termination_grace_seconds=1e308)
         with self.assertRaises(ValueError):
             self.run_provider()
+
+    def test_provider_timing_default_is_gemini_specific(self):
+        config = {"providers": {
+            "gemini": {"model": "gemini-3.8-flash-medium"},
+            "claude": {"model": "claude-opus-5"},
+            "deepseek": {"model": "deepseek-flash"},
+        }}
+        self.assertEqual(runner.provider_timing(config, "gemini")[0], 3600)
+        self.assertEqual(runner.provider_timing(config, "claude")[0], 1800)
+        self.assertEqual(runner.provider_timing(config, "deepseek")[0], 1800)
+        self.assertEqual(runner.provider_timing(config, "gemini")[2], 60)
+        self.assertEqual(runner.provider_timing(config, "claude")[2], 60)
+        self.assertEqual(runner.provider_timing(config, "deepseek")[2], 60)
+
+    def test_packaged_global_timeout_remains_authoritative_for_claude_and_deepseek(self):
+        config = {"timeout_seconds": 900, "providers": {
+            "claude": {"model": "claude-opus-5"},
+            "deepseek": {"model": "deepseek-flash"},
+        }}
+        self.assertEqual(runner.provider_timing(config, "claude")[0], 900)
+        self.assertEqual(runner.provider_timing(config, "deepseek")[0], 900)
+
+    def test_positive_heartbeat_interval_is_clamped_to_safe_minimum(self):
+        config = {"providers": {
+            "gemini": {"model": "gemini-3.8-flash-medium", "heartbeat_seconds": 0.01},
+        }}
+        self.assertEqual(
+            runner.provider_timing(config, "gemini")[2],
+            runner.MIN_HEARTBEAT_SECONDS)
+        config["providers"]["gemini"]["heartbeat_seconds"] = 0
+        self.assertEqual(runner.provider_timing(config, "gemini")[2], 0)
 
     def test_exit_within_termination_grace_is_not_killed(self):
         self.fake.write_text("import time\ntime.sleep(.16)\nprint('{\\\"status\\\":\\\"SUCCESS\\\",\\\"response\\\":\\\"Done\\\"}')", encoding="utf-8")
@@ -1047,10 +1306,14 @@ class ProviderTests(unittest.TestCase):
         output.mkdir()
         (output / "stderr.log").write_text(secret, encoding="utf-8")
         (output / "provider.log").write_text(secret, encoding="utf-8")
+        (output / "progress.json").write_text(json.dumps({"conversation_id": secret}), encoding="utf-8")
+        (output / "heartbeat.json").write_text(json.dumps({"last_event": secret}), encoding="utf-8")
         result, _ = runner.finish({"status": "timeout", "error": secret}, output, self.root, 1, secrets=[secret])
         self.assertNotIn(secret, json.dumps(result))
         self.assertNotIn(secret, (output / "stderr.log").read_text(encoding="utf-8"))
         self.assertNotIn(secret, (output / "provider.log").read_text(encoding="utf-8"))
+        self.assertNotIn(secret, (output / "progress.json").read_text(encoding="utf-8"))
+        self.assertNotIn(secret, (output / "heartbeat.json").read_text(encoding="utf-8"))
 
     def test_finish_redacts_provider_log_on_success(self):
         secret = "provider-log-secret-" + uuid.uuid4().hex
@@ -1379,6 +1642,38 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("fallback_blocked_by_pending", result)
         self.assertEqual(runner.read_json(self.pending_path)["status"], "resolved")
         self.assertFalse(runner.read_json(runner.balance_path(Path(self.args.state_dir)))["is_available"])
+
+    def test_deepseek_transient_402_does_not_override_non_balance_terminal_failure(self):
+        events = [
+            {"type": "error", "error": {"code": 402, "message": "Transient upstream payment diagnostic"}},
+            {"type": "turn.failed", "error": {"code": 500, "message": "Tool execution failed"}},
+        ]
+        self.fake.write_text(
+            "import json, sys\n"
+            f"events = {events!r}\n"
+            "for event in events: print(json.dumps(event), flush=True)\n"
+            "sys.exit(1)\n",
+            encoding="utf-8")
+        self.settings["providers"]["deepseek"] = {
+            "executable": [sys.executable, str(self.fake)],
+            "profile": "deepseek",
+            "model": "deepseek-flash",
+            "api_key_env": "TEST_DS_KEY",
+        }
+        self.args.provider = "deepseek"
+        available = {
+            "is_available": True,
+            "balance_infos": [{"currency": "USD", "total_balance": "0.50",
+                               "granted_balance": "0.00", "topped_up_balance": "0.50"}],
+        }
+        with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
+            with mock.patch.object(runner, "query_deepseek_balance", return_value=(available, None)):
+                result, code = self.run_provider()
+
+        self.assertEqual((result["status"], code), ("provider_error", 1))
+        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertTrue(runner.read_json(runner.balance_path(Path(self.args.state_dir)))["is_available"])
+        self.assertEqual(runner.read_json(self.pending_path)["status"], "resolved")
 
     def test_deepseek_runtime_429_is_not_treated_as_balance_exhaustion(self):
         # Fake codex fails with 429 Rate Limit (NOT 402 balance exhaustion)
@@ -2042,6 +2337,744 @@ class ProviderTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "quota-set only supports subscription quota providers"):
             runner.cli_quota_set(args)
+
+
+    def test_command_format_stream_telemetry_all_providers(self):
+        """All three providers invoke correct command format and telemetry flags."""
+        self.args.dry_run = True
+
+        # Gemini
+        self.args.role = "implement"
+        self.args.provider = "gemini"
+        self.settings["providers"]["gemini"].update(timeout_seconds=10, termination_grace_seconds=5)
+        result, code = self.run_provider()
+        self.assertEqual(code, 0)
+        cmd = result["command"]
+        self.assertEqual(cmd[cmd.index("--output-format") + 1], "stream-json")
+        self.assertIn("--log-file", cmd)
+        self.assertIn("--print-timeout", cmd)
+
+        # Claude
+        self.args.role = "review"
+        self.args.provider = "claude"
+        result, code = self.run_provider()
+        self.assertEqual(code, 0)
+        cmd = result["command"]
+        self.assertEqual(cmd[cmd.index("--output-format") + 1], "stream-json")
+        self.assertIn("--verbose", cmd)
+        self.assertNotIn("--include-partial-messages", cmd)
+        self.assertNotIn("--stream-tokens", cmd)
+        self.assertEqual(cmd[cmd.index("--model") + 1], "claude-opus-5")
+        self.assertEqual(cmd[cmd.index("--effort") + 1], "medium")
+        self.assertIn("--no-session-persistence", cmd)
+        self.assertIn("--dangerously-skip-permissions", cmd)
+        self.assertIn("--safe-mode", cmd)
+        self.assertIn("--tools", cmd)
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "Read,Glob,Grep")
+
+        # DeepSeek
+        self.args.role = "implement"
+        self.args.provider = "deepseek"
+        self.settings["providers"]["deepseek"] = {
+            "executable": "codex",
+            "profile": "deepseek",
+            "model": "deepseek-flash",
+            "api_key_env": "TEST_DS_KEY",
+        }
+        result, code = self.run_provider()
+        self.assertEqual(code, 0)
+        cmd = result["command"]
+        self.assertIn("exec", cmd)
+        self.assertIn("--approve-for-me", cmd)
+        self.assertIn("--json", cmd)
+        self.assertIn("--output-schema", cmd)
+        self.assertIn("--output-last-message", cmd)
+        self.assertNotIn("--sandbox", cmd)
+
+    def test_stream_telemetry_production_intervals_are_bounded(self):
+        self.assertGreaterEqual(runner.STREAM_POLL_SECONDS, 0.5)
+        self.assertGreaterEqual(runner.STREAM_PROGRESS_EMIT_SECONDS, 10)
+        self.assertGreaterEqual(runner.MIN_HEARTBEAT_SECONDS, 5)
+        self.assertGreater(runner.STREAM_READ_CHUNK_BYTES, 0)
+        self.assertLessEqual(runner.STREAM_READ_CHUNK_BYTES, runner.MAX_STREAM_LINE_BYTES)
+
+    def test_oversized_partial_stream_line_is_discarded_once_and_reader_recovers(self):
+        output = self.root / "oversized-stream"
+        output.mkdir()
+        stream = output / "stdout.log"
+        stream.write_bytes(b"x" * 128)
+        state = runner.new_progress_state("claude")
+        started_wall, started_monotonic = time.time(), time.monotonic()
+
+        with mock.patch.object(runner, "MAX_STREAM_LINE_BYTES", 96):
+            snapshot, count = runner.refresh_progress(
+                output, state, started_wall, started_monotonic)
+            self.assertEqual(count, 0)
+            self.assertEqual(snapshot["malformed_event_count"], 1)
+            self.assertTrue(state["discarding_oversize_line"])
+            self.assertEqual(state["remainder"], b"")
+
+            # Re-reading without new bytes neither retains the oversized data
+            # nor repeatedly counts the same malformed line.
+            snapshot, count = runner.refresh_progress(
+                output, state, started_wall, started_monotonic)
+            self.assertEqual(count, 0)
+            self.assertEqual(snapshot["malformed_event_count"], 1)
+
+            with stream.open("ab") as handle:
+                handle.write(
+                    b"discarded-tail\n"
+                    b'{"type":"result","subtype":"success","is_error":false,"result":"Done"}\n'
+                )
+            snapshot, count = runner.refresh_progress(
+                output, state, started_wall, started_monotonic,
+                adapter_state="finished", final=True)
+
+        self.assertEqual(count, 1)
+        self.assertFalse(state["discarding_oversize_line"])
+        self.assertEqual(snapshot["malformed_event_count"], 1)
+        self.assertEqual(snapshot["terminal"]["status"], "SUCCESS")
+
+    def test_final_refresh_drains_complete_oversized_line_in_bounded_chunks(self):
+        output = self.root / "complete-oversized-stream"
+        output.mkdir()
+        terminal = b'{"type":"result","subtype":"success","is_error":false,"result":"Done"}\n'
+        (output / "stdout.log").write_bytes(b"x" * 200 + b"\n" + terminal)
+        state = runner.new_progress_state("claude")
+        started_wall, started_monotonic = time.time(), time.monotonic()
+
+        with mock.patch.object(runner, "MAX_STREAM_LINE_BYTES", 96), \
+                mock.patch.object(runner, "STREAM_READ_CHUNK_BYTES", 32):
+            snapshot, count = runner.refresh_progress(
+                output, state, started_wall, started_monotonic,
+                adapter_state="finished", final=True)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(snapshot["malformed_event_count"], 1)
+        self.assertEqual(snapshot["terminal"]["status"], "SUCCESS")
+        self.assertEqual(state["offset"], (output / "stdout.log").stat().st_size)
+        self.assertEqual(state["remainder"], b"")
+
+    def test_deeply_nested_json_is_malformed_and_finite_compaction_rejects_infinity(self):
+        output = self.root / "nested-stream"
+        output.mkdir()
+        (output / "stdout.log").write_text("[" * 2000 + "]" * 2000 + "\n", encoding="utf-8")
+        state = runner.new_progress_state("claude")
+        snapshot, count = runner.refresh_progress(
+            output, state, time.time(), time.monotonic(), final=True)
+        self.assertEqual(count, 0)
+        self.assertEqual(snapshot["malformed_event_count"], 1)
+
+        self.assertIsNone(runner.compact_usage({"input_tokens": float("inf")}))
+        self.assertEqual(
+            runner.compact_label("sk-1234567890abcdefghijklmnop", default=None),
+            None)
+        self.assertEqual(runner.parse_claude_final_output("[" * 2000 + "]" * 2000),
+                         (None, False, []))
+
+    def test_atomic_writers_remove_temporary_files_when_replace_fails(self):
+        for filename, writer, value in (
+                ("value.json", runner.write_json, {"value": 1}),
+                ("value.bin", runner.write_bytes, b"value")):
+            with self.subTest(filename=filename):
+                with mock.patch.object(runner.os, "replace", side_effect=OSError("replace failed")):
+                    with self.assertRaisesRegex(OSError, "replace failed"):
+                        writer(self.root / filename, value)
+                self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_claude_progress_and_heartbeat_are_visible_while_process_is_running(self):
+        self.fake.write_text(
+            "import json, time\n"
+            "print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'live-session'}), flush=True)\n"
+            "time.sleep(1.35)\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'Done'}), flush=True)\n",
+            encoding="utf-8")
+        self.args.role = "review"
+        self.args.provider = "claude"
+        self.settings["providers"]["claude"]["heartbeat_seconds"] = .05
+        holder = {}
+
+        def run():
+            holder["value"] = self.run_provider()
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        observed_running = False
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and thread.is_alive():
+            for progress_path in self.root.glob(".llm-output/agent-framework/*/progress.json"):
+                try:
+                    progress = runner.read_json(progress_path)
+                    heartbeat = runner.read_json(progress_path.with_name("heartbeat.json"))
+                except (OSError, ValueError):
+                    continue
+                if (progress.get("adapter_state") == "running" and
+                        progress.get("stream_event_count", 0) >= 1 and
+                        heartbeat.get("process_alive") is True):
+                    observed_running = True
+                    break
+            if observed_running:
+                break
+            time.sleep(.01)
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(observed_running)
+        self.assertEqual((holder["value"][0]["status"], holder["value"][1]), ("completed", 0))
+
+    def test_claude_incremental_progress_and_terminal_success(self):
+        """Claude stream-json telemetry writes atomic progress.json and completes on terminal result."""
+        events = [
+            {"type": "system", "session_id": "sess-claude-test-1", "subtype": "init"},
+            {"type": "assistant", "message": {
+                "content": [{"type": "tool_use", "name": "Read", "input": {"path": "C:\\secret\\path.py"}}],
+                "usage": {"input_tokens": 15, "output_tokens": 5}
+            }},
+            {"type": "user", "message": {
+                "content": [{"type": "tool_result", "content": "secret file content"}]
+            }},
+            {"type": "result", "subtype": "success", "is_error": False, "result": "Review summary text",
+             "usage": {"input_tokens": 50, "output_tokens": 25, "cache_read_input_tokens": 10}}
+        ]
+        self.fake.write_text(
+            "import json, time\n"
+            f"events = {events!r}\n"
+            "for e in events:\n"
+            "    print(json.dumps(e), flush=True)\n"
+            "    time.sleep(0.02)\n",
+            encoding="utf-8"
+        )
+        self.args.role = "review"
+        self.args.provider = "claude"
+        self.settings["providers"]["claude"]["heartbeat_seconds"] = 0.01
+
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("completed", 0))
+        self.assertTrue(result["stream_terminal_seen"])
+        self.assertIn("progress_path", result)
+
+        progress = runner.read_json(result["progress_path"])
+        self.assertEqual(progress["provider"], "claude")
+        self.assertEqual(progress["adapter_state"], "finished")
+        self.assertEqual(progress["stream_event_count"], 4)
+        self.assertEqual(progress["completed_step_count"], 1)
+        self.assertEqual(progress["terminal"]["status"], "SUCCESS")
+        self.assertEqual(progress["usage"]["total_tokens"], 75)
+        self.assertEqual(progress["usage"]["cache_read_tokens"], 10)
+        self.assertEqual(progress["conversation_id"], "sess-claude-test-1")
+
+        # Content exclusion check
+        compact = json.dumps(progress)
+        self.assertNotIn("secret", compact)
+        self.assertNotIn("Review summary text", compact)
+
+        heartbeat = runner.read_json(Path(result["logs"]) / "heartbeat.json")
+        self.assertEqual(heartbeat["provider"], "claude")
+        self.assertEqual(heartbeat["progress"]["stream_event_count"], 4)
+        self.assertNotIn("secret", json.dumps(heartbeat))
+
+    def test_deepseek_incremental_progress_and_terminal_success(self):
+        """DeepSeek codex JSONL stream updates progress.json incrementally without changing terminal classification."""
+        codex_lines = [
+            {"type": "thread.started", "thread_id": "thread-ds-123"},
+            {"type": "turn.started", "turn_id": "turn-1"},
+            {"type": "item.started", "item": {"id": "item-1", "type": "command_execution", "command": "rm -rf secret_dir"}},
+            {"type": "item.completed", "item": {"id": "item-1", "type": "command_execution", "output": "secret command output"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150}},
+        ]
+        self.fake.write_text(
+            "import json, sys, time, pathlib\n"
+            f"lines = {codex_lines!r}\n"
+            "for l in lines:\n"
+            "    print(json.dumps(l), flush=True)\n"
+            "    time.sleep(0.02)\n"
+            "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+            "pathlib.Path(out).write_text(json.dumps({'status': 'SUCCESS', 'response': 'Completed task secret'}), encoding='utf-8')\n",
+            encoding="utf-8"
+        )
+        self.settings["providers"]["deepseek"] = {
+            "executable": [sys.executable, str(self.fake)],
+            "profile": "deepseek",
+            "model": "deepseek-flash",
+            "api_key_env": "TEST_DS_KEY",
+            "heartbeat_seconds": 0.01,
+        }
+        self.args.role = "implement"
+        self.args.provider = "deepseek"
+        available = {
+            "is_available": True,
+            "balance_infos": [{"currency": "USD", "total_balance": "10.00", "granted_balance": "0.00", "topped_up_balance": "10.00"}],
+        }
+        with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
+            with mock.patch.object(runner, "query_deepseek_balance", return_value=(available, None)):
+                result, code = self.run_provider()
+
+        self.assertEqual((result["status"], code), ("completed", 0))
+        self.assertIn("progress_path", result)
+        progress = runner.read_json(result["progress_path"])
+        self.assertEqual(progress["provider"], "deepseek")
+        self.assertEqual(progress["adapter_state"], "finished")
+        self.assertGreaterEqual(progress["completed_step_count"], 1)
+        self.assertEqual(progress["usage"]["total_tokens"], 150)
+        self.assertEqual(progress["conversation_id"], "thread-ds-123")
+
+        # Content exclusion check
+        compact = json.dumps(progress)
+        self.assertNotIn("secret", compact)
+        heartbeat = runner.read_json(Path(result["logs"]) / "heartbeat.json")
+        self.assertEqual(heartbeat["provider"], "deepseek")
+        self.assertNotIn("secret", json.dumps(heartbeat))
+
+    def test_transient_stream_errors_do_not_become_terminal_or_override_success(self):
+        claude_events = [
+            {"type": "error", "error": {"message": "retrying transient failure"}},
+            {"type": "result", "subtype": "success", "is_error": False, "result": "Done"},
+        ]
+        self.fake.write_text(
+            "import json\n"
+            f"events = {claude_events!r}\n"
+            "for event in events: print(json.dumps(event), flush=True)\n",
+            encoding="utf-8")
+        self.args.role = "review"
+        self.args.provider = "claude"
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("completed", 0))
+        progress = runner.read_json(result["progress_path"])
+        self.assertEqual(progress["terminal"]["status"], "SUCCESS")
+        self.assertEqual(progress["last_error"]["summary"], "error")
+
+        deepseek_events = [
+            {"type": "error", "error": {"message": "retrying transient failure"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 3, "output_tokens": 2}},
+        ]
+        self.fake.write_text(
+            "import json, pathlib, sys\n"
+            f"events = {deepseek_events!r}\n"
+            "for event in events: print(json.dumps(event), flush=True)\n"
+            "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+            "pathlib.Path(out).write_text(json.dumps({'status': 'SUCCESS', 'response': 'Done'}), encoding='utf-8')\n",
+            encoding="utf-8")
+        self.settings["providers"]["deepseek"] = {
+            "executable": [sys.executable, str(self.fake)], "profile": "deepseek",
+            "model": "deepseek-flash", "api_key_env": "TEST_DS_KEY",
+        }
+        self.args.role = "implement"
+        self.args.provider = "deepseek"
+        available = {"is_available": True, "balance_infos": [
+            {"currency": "USD", "total_balance": "10.00", "granted_balance": "0.00", "topped_up_balance": "10.00"}]}
+        with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
+            with mock.patch.object(runner, "query_deepseek_balance", return_value=(available, None)):
+                result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("completed", 0))
+        progress = runner.read_json(result["progress_path"])
+        self.assertIsNone(progress["terminal"])
+        self.assertEqual(progress["last_error"]["summary"], "error")
+        self.assertTrue(result["stream_terminal_seen"])
+
+    def test_quiet_heartbeat_all_providers(self):
+        """Quiet period emits and records heartbeat for Gemini, Claude, and DeepSeek."""
+        for provider_name in ("gemini", "claude", "deepseek"):
+            with self.subTest(provider=provider_name):
+                if provider_name == "deepseek":
+                    self.fake.write_text(
+                        "import time, pathlib, json, sys\n"
+                        "time.sleep(0.12)\n"
+                        "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+                        "pathlib.Path(out).write_text(json.dumps({'status': 'SUCCESS', 'response': 'Done'}), encoding='utf-8')\n",
+                        encoding="utf-8"
+                    )
+                    self.settings["providers"]["deepseek"] = {
+                        "executable": [sys.executable, str(self.fake)],
+                        "profile": "deepseek",
+                        "model": "deepseek-flash",
+                        "api_key_env": "TEST_DS_KEY",
+                        "heartbeat_seconds": 0.02,
+                    }
+                    self.args.role = "implement"
+                    self.args.provider = "deepseek"
+                    avail = {"is_available": True, "balance_infos": [{"currency": "USD", "total_balance": "10.00", "granted_balance": "0.00", "topped_up_balance": "10.00"}]}
+                    with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
+                        with mock.patch.object(runner, "query_deepseek_balance", return_value=(avail, None)):
+                            result, code = self.run_provider()
+                elif provider_name == "claude":
+                    self.fake.write_text(
+                        "import time, json\n"
+                        "time.sleep(0.12)\n"
+                        "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'Done'}))\n",
+                        encoding="utf-8"
+                    )
+                    self.settings["providers"]["claude"]["heartbeat_seconds"] = 0.02
+                    self.args.role = "review"
+                    self.args.provider = "claude"
+                    result, code = self.run_provider()
+                else:
+                    self.fake.write_text(
+                        "import time, json\n"
+                        "time.sleep(0.12)\n"
+                        "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'response': 'Done'}}))\n",
+                        encoding="utf-8"
+                    )
+                    self.settings["providers"]["gemini"]["heartbeat_seconds"] = 0.02
+                    self.args.role = "implement"
+                    self.args.provider = "gemini"
+                    result, code = self.run_provider()
+
+                self.assertEqual((result["status"], code), ("completed", 0))
+                hb_file = Path(result["logs"]) / "heartbeat.json"
+                self.assertTrue(hb_file.exists())
+                hb = runner.read_json(hb_file)
+                self.assertEqual(hb["provider"], provider_name)
+                self.assertFalse(hb["process_alive"])
+                self.assertIn("progress", hb)
+
+    def test_success_failure_and_quota_classification_all_providers(self):
+        """Validate terminal success, failure, and quota classification across all three providers."""
+        # 1. Claude Quota Error
+        self.args.role = "review"
+        self.args.provider = "claude"
+        quota_event = {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "result": "You've hit your session limit · resets 3:00 pm (UTC)"
+        }
+        self.fake.write_text(
+            "import json\n"
+            "print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'quota-test'}))\n"
+            f"print(json.dumps({quota_event!r}))\n",
+            encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("fallback_required", 20))
+        self.assertEqual(result["fallback"]["model"], "gpt-6-astra")
+
+        # 2. Claude Terminal Failure (non-quota)
+        self.args.state_dir = str(self.root / "state-claude-err")
+        err_event = {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "error": {"type": "invalid_request", "message": "Prompt too long"}
+        }
+        self.fake.write_text(f"import json\nprint(json.dumps({err_event!r}))\n", encoding="utf-8")
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("provider_error", 1))
+
+        # 3. DeepSeek Terminal Failure
+        self.args.role = "implement"
+        self.args.provider = "deepseek"
+        self.args.state_dir = str(self.root / "state-ds-err")
+        self.settings["providers"]["deepseek"] = {
+            "executable": [sys.executable, str(self.fake)],
+            "profile": "deepseek",
+            "model": "deepseek-flash",
+            "api_key_env": "TEST_DS_KEY",
+        }
+        self.fake.write_text(
+            "import json, sys, pathlib\n"
+            "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+            "pathlib.Path(out).write_text(json.dumps({'status': 'ERROR', 'response': 'Internal tool failure'}), encoding='utf-8')\n",
+            encoding="utf-8"
+        )
+        avail = {"is_available": True, "balance_infos": [{"currency": "USD", "total_balance": "10.00", "granted_balance": "0.00", "topped_up_balance": "10.00"}]}
+        with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
+            with mock.patch.object(runner, "query_deepseek_balance", return_value=(avail, None)):
+                result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("provider_error", 1))
+        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+
+        # 4. DeepSeek Runtime 402 Insufficient Balance
+        self.args.state_dir = str(self.root / "state-ds-402")
+        self.fake.write_text(
+            "import json, sys\n"
+            "print(json.dumps({'type': 'turn.failed', 'error': {'code': 402, 'message': 'Insufficient balance'}}))\n"
+            "sys.exit(1)\n",
+            encoding="utf-8"
+        )
+        with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
+            with mock.patch.object(runner, "query_deepseek_balance", return_value=(avail, None)):
+                result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("fallback_required", 20))
+        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+
+    def test_timeout_state_all_providers(self):
+        """Timeout marks adapter state as timeout in progress.json and heartbeat.json for all providers."""
+        for provider_name in ("gemini", "claude", "deepseek"):
+            with self.subTest(provider=provider_name):
+                workspace = self.root / f"timeout-{provider_name}"
+                workspace.mkdir(parents=True, exist_ok=True)
+                task_file = self.task_for(f"timeout-{provider_name}", [])
+                args = argparse.Namespace(
+                    role="review" if provider_name == "claude" else "implement",
+                    workspace=str(workspace),
+                    task_file=str(task_file),
+                    config=str(self.config),
+                    state_dir=str(self.root / f"state-{provider_name}"),
+                    dry_run=False,
+                    provider=provider_name,
+                )
+                self.fake.write_text("import time\ntime.sleep(2.0)\n", encoding="utf-8")
+                if provider_name == "claude":
+                    self.settings["providers"]["claude"].update(
+                        timeout_seconds=0.05, termination_grace_seconds=0.05, heartbeat_seconds=0.02
+                    )
+                    runner.write_json(self.config, self.settings)
+                    result, code = runner.execute(args)
+                elif provider_name == "deepseek":
+                    self.settings["providers"]["deepseek"] = {
+                        "executable": [sys.executable, str(self.fake)],
+                        "profile": "deepseek",
+                        "model": "deepseek-flash",
+                        "api_key_env": "TEST_DS_KEY",
+                        "timeout_seconds": 0.05,
+                        "termination_grace_seconds": 0.05,
+                        "heartbeat_seconds": 0.02,
+                    }
+                    avail = {"is_available": True, "balance_infos": [{"currency": "USD", "total_balance": "10.00", "granted_balance": "0.00", "topped_up_balance": "10.00"}]}
+                    runner.write_json(self.config, self.settings)
+                    with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
+                        with mock.patch.object(runner, "query_deepseek_balance", return_value=(avail, None)):
+                            result, code = runner.execute(args)
+                else:
+                    self.settings["providers"]["gemini"].update(
+                        timeout_seconds=0.05, termination_grace_seconds=0.05, heartbeat_seconds=0.02
+                    )
+                    runner.write_json(self.config, self.settings)
+                    result, code = runner.execute(args)
+
+                self.assertEqual((result["status"], code), ("timeout", 1))
+                self.assertTrue(result["cleanup"]["attempted"])
+                progress = runner.read_json(result["progress_path"])
+                self.assertEqual(progress["adapter_state"], "timeout")
+                hb = runner.read_json(Path(result["logs"]) / "heartbeat.json")
+                self.assertEqual(hb["state"], "timeout")
+
+    def test_malformed_and_missing_terminal_data_all_providers(self):
+        """Missing or malformed terminal envelopes must remain uncertain and fail closed."""
+        # Claude missing terminal result
+        self.args.role = "review"
+        self.args.provider = "claude"
+        self.fake.write_text(
+            "import json\n"
+            "print(json.dumps({'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'thinking...'}]}}))\n",
+            encoding="utf-8"
+        )
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+        self.assertFalse(result["stream_terminal_seen"])
+
+        # Claude malformed result (non-dict or missing subtype)
+        self.fake.write_text(
+            "import json\n"
+            "print(json.dumps({'type': 'result', 'subtype': None, 'is_error': 'not_a_bool'}))\n",
+            encoding="utf-8"
+        )
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+
+        # A Codex turn.completed event is useful progress, but without the
+        # required last-message schema it is not a usable DeepSeek terminal.
+        self.args.role = "implement"
+        self.args.provider = "deepseek"
+        self.settings["providers"]["deepseek"] = {
+            "executable": [sys.executable, str(self.fake)],
+            "profile": "deepseek",
+            "model": "deepseek-flash",
+            "api_key_env": "TEST_DS_KEY",
+        }
+        self.fake.write_text(
+            "import json\n"
+            "print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 2, 'output_tokens': 1}}))\n",
+            encoding="utf-8"
+        )
+        avail = {"is_available": True, "balance_infos": [{"currency": "USD", "total_balance": "10.00", "granted_balance": "0.00", "topped_up_balance": "10.00"}]}
+        with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
+            with mock.patch.object(runner, "query_deepseek_balance", return_value=(avail, None)):
+                result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+        self.assertFalse(result["stream_terminal_seen"])
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
+
+    def test_mixed_stderr_all_providers(self):
+        """Stderr noise does not corrupt valid terminal stdout; missing terminal is not repaired by stderr."""
+        # Case 1: Valid stdout with noisy stderr completes successfully
+        for provider_name in ("gemini", "claude", "deepseek"):
+            with self.subTest(case="noisy_stderr_success", provider=provider_name):
+                if provider_name == "claude":
+                    self.args.role = "review"
+                    self.args.provider = "claude"
+                    self.fake.write_text(
+                        "import json, sys\n"
+                        "sys.stderr.write('Warning: plugin deprecation notice\\n[debug] loaded configs\\n')\n"
+                        "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'Approved'}))\n",
+                        encoding="utf-8"
+                    )
+                    result, code = self.run_provider()
+                elif provider_name == "deepseek":
+                    self.args.role = "implement"
+                    self.args.provider = "deepseek"
+                    self.settings["providers"]["deepseek"] = {
+                        "executable": [sys.executable, str(self.fake)],
+                        "profile": "deepseek",
+                        "model": "deepseek-flash",
+                        "api_key_env": "TEST_DS_KEY",
+                    }
+                    self.fake.write_text(
+                        "import json, sys, pathlib\n"
+                        "sys.stderr.write('Warning: non-critical environment warning\\n')\n"
+                        "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+                        "pathlib.Path(out).write_text(json.dumps({'status': 'SUCCESS', 'response': 'Done'}), encoding='utf-8')\n",
+                        encoding="utf-8"
+                    )
+                    avail = {"is_available": True, "balance_infos": [{"currency": "USD", "total_balance": "10.00", "granted_balance": "0.00", "topped_up_balance": "10.00"}]}
+                    with mock.patch.dict(os.environ, {"TEST_DS_KEY": "token-123"}):
+                        with mock.patch.object(runner, "query_deepseek_balance", return_value=(avail, None)):
+                            result, code = self.run_provider()
+                else:
+                    self.args.role = "implement"
+                    self.args.provider = "gemini"
+                    self.fake.write_text(
+                        "import json, sys\n"
+                        "sys.stderr.write('Warning: experimental feature flag enabled\\n')\n"
+                        "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'response': 'Done'}}))\n",
+                        encoding="utf-8"
+                    )
+                    result, code = self.run_provider()
+
+                self.assertEqual((result["status"], code), ("completed", 0))
+
+        # Case 2: Incomplete stdout with arbitrary stderr stays uncertain
+        self.args.role = "implement"
+        self.args.provider = "gemini"
+        self.fake.write_text(
+            "import json, sys\n"
+            "print(json.dumps({'event': 'step_update', 'step_update': {'step_state': 'ACTIVE', 'step_type': 'tool'}}))\n"
+            "sys.stderr.write('Error: syntax error occurred during execution\\n')\n"
+            "sys.exit(1)\n",
+            encoding="utf-8"
+        )
+        result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+        self.assertTrue(result["fallback_blocked_by_pending"])
+
+    def test_split_utf8_incremental_reader_comprehensive(self):
+        """Shared incremental reader correctly handles 2-byte, 3-byte, and 4-byte UTF-8 split across chunks."""
+        output = self.root / "split-utf8-test"
+        output.mkdir()
+        log = output / "stdout.log"
+
+        # Events containing café (2-byte é), euro € (3-byte), and rocket 🚀 (4-byte)
+        events = [
+            {"event": "step_update", "step_update": {"step_type": "tool", "state": "ACTIVE", "tool_name": "café_tool"}},
+            {"event": "step_update", "step_update": {"step_type": "tool", "state": "DONE", "tool_name": "café_tool"}},
+            {"event": "result", "result": {"status": "SUCCESS", "response": "Cost: 100€ 🚀"}},
+        ]
+        raw_bytes = b"".join(json.dumps(e, ensure_ascii=False).encode("utf-8") + b"\n" for e in events)
+
+        # Intentionally split in the middle of UTF-8 multibyte characters
+        split1 = raw_bytes.index("é".encode("utf-8")) + 1
+        split2 = raw_bytes.index("€".encode("utf-8")) + 1
+        split3 = raw_bytes.index("🚀".encode("utf-8")) + 2
+
+        splits = [0, split1, split2, split3, len(raw_bytes)]
+        state = runner.new_progress_state("gemini")
+        started_wall, started_monotonic = time.time(), time.monotonic()
+
+        log.touch()
+        for i in range(len(splits) - 1):
+            chunk = raw_bytes[splits[i]:splits[i+1]]
+            with log.open("ab") as stream:
+                stream.write(chunk)
+            final = (i == len(splits) - 2)
+            snap, count = runner.refresh_progress(output, state, started_wall, started_monotonic,
+                                                  adapter_state="running" if not final else "finished", final=final)
+
+        self.assertEqual(state["malformed_event_count"], 0)
+        self.assertEqual(state["event_count"], 3)
+        self.assertEqual(state["terminal"]["status"], "SUCCESS")
+
+        # Now test invalid UTF-8 bytes at EOF
+        with log.open("ab") as stream:
+            stream.write(b"\xff\xfe\n")
+        snap, count = runner.refresh_progress(output, state, started_wall, started_monotonic, adapter_state="finished", final=True)
+        self.assertEqual(state["malformed_event_count"], 1)
+
+    def test_content_exclusion_rigorous_all_providers(self):
+        """Guarantees that prompts, model output, tool parameters, shell commands, file contents, and tool outputs never appear in progress or heartbeat."""
+        markers = [
+            "SECRET_PROMPT_PAYLOAD",
+            "SECRET_MODEL_RESPONSE_TEXT",
+            "SECRET_REASONING_AND_THOUGHTS",
+            "SECRET_TOOL_PARAMETERS_AND_ARGS",
+            "SECRET_SHELL_COMMAND_LINE",
+            "SECRET_FILE_CONTENTS_PAYLOAD",
+            "SECRET_TOOL_OUTPUT_PAYLOAD",
+        ]
+        # Gemini loaded with markers
+        gemini_events = [
+            {"event": "init", "prompt": markers[0], "init": {"model": "gemini-3.8-flash-medium"}},
+            {"event": "step_update", "step_update": {
+                "step_index": 1, "state": "ACTIVE", "step_type": "tool", "tool_name": "run_command",
+                "tool_info": {"parameters": {"command": markers[4], "args": [markers[3]]}},
+                "thinking": markers[2]
+            }},
+            {"event": "step_update", "step_update": {
+                "step_index": 1, "state": "DONE", "step_type": "tool", "tool_name": "run_command",
+                "tool_info": {"output": markers[6], "file_content": markers[5]}
+            }},
+            {"event": "result", "result": {"status": "SUCCESS", "response": markers[1]}}
+        ]
+        state_gemini = runner.new_progress_state("gemini")
+        for e in gemini_events:
+            runner.update_progress(state_gemini, e, "2026-09-16T12:00:00Z")
+        gemini_snap = runner.progress_snapshot(state_gemini, time.time(), time.monotonic(), "finished")
+        gemini_str = json.dumps(gemini_snap)
+        for m in markers:
+            self.assertNotIn(m, gemini_str, f"Gemini progress leaked {m}")
+
+        # Claude loaded with markers
+        claude_events = [
+            {"type": "system", "prompt": markers[0], "session_id": "clean-session-1"},
+            {"type": "assistant", "message": {
+                "content": [
+                    {"type": "text", "text": markers[1]},
+                    {"type": "tool_use", "name": "Read", "input": {"path": markers[3], "file_contents": markers[5]}}
+                ],
+                "thinking": markers[2]
+            }},
+            {"type": "user", "message": {
+                "content": [{"type": "tool_result", "content": markers[6]}]
+            }},
+            {"type": "result", "subtype": "success", "is_error": False, "result": markers[1]}
+        ]
+        state_claude = runner.new_progress_state("claude")
+        for e in claude_events:
+            runner.update_progress(state_claude, e, "2026-09-16T12:00:00Z")
+        claude_snap = runner.progress_snapshot(state_claude, time.time(), time.monotonic(), "finished")
+        claude_str = json.dumps(claude_snap)
+        for m in markers:
+            self.assertNotIn(m, claude_str, f"Claude progress leaked {m}")
+
+        # DeepSeek loaded with markers
+        deepseek_events = [
+            {"type": "thread.started", "thread_id": "clean-thread-1", "prompt": markers[0]},
+            {"type": "turn.started", "turn_id": "turn-1"},
+            {"type": "item.started", "item": {
+                "id": "it-1", "type": "command_execution", "command": markers[4], "args": [markers[3]],
+                "thinking": markers[2]
+            }},
+            {"type": "item.completed", "item": {
+                "id": "it-1", "type": "command_execution", "output": markers[6], "file_content": markers[5]
+            }},
+            {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 10}},
+            {"status": "SUCCESS", "response": markers[1]}
+        ]
+        state_ds = runner.new_progress_state("deepseek")
+        for e in deepseek_events:
+            runner.update_progress(state_ds, e, "2026-09-16T12:00:00Z")
+        ds_snap = runner.progress_snapshot(state_ds, time.time(), time.monotonic(), "finished")
+        ds_str = json.dumps(ds_snap)
+        for m in markers:
+            self.assertNotIn(m, ds_str, f"DeepSeek progress leaked {m}")
 
 
 if __name__ == "__main__":

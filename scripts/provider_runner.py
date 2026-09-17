@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
+import mmap
 import os
 from pathlib import Path
 import re
@@ -26,6 +27,8 @@ STREAM_PROGRESS_EMIT_SECONDS = 15.0
 MAX_STREAM_LINE_BYTES = 1024 * 1024
 STREAM_READ_CHUNK_BYTES = 64 * 1024
 MIN_HEARTBEAT_SECONDS = 5.0
+FINAL_OUTPUT_TAIL_BYTES = (2 * MAX_STREAM_LINE_BYTES) + STREAM_READ_CHUNK_BYTES
+ARTIFACT_COPY_CHUNK_BYTES = 64 * 1024
 CODEX_TOOL_ITEM_TYPES = frozenset(("command_execution", "file_change", "mcp_tool_call", "web_search"))
 # Compatibility aliases for callers/tests written against the original
 # Gemini-only telemetry implementation.
@@ -78,6 +81,24 @@ def write_bytes(path, data):
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def read_text_tail(path, limit=FINAL_OUTPUT_TAIL_BYTES):
+    """Read a bounded suffix containing only complete newline-delimited records."""
+    if limit <= 0:
+        raise ValueError("Tail read limit must be positive")
+    path = Path(path)
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        start = max(0, size - limit)
+        handle.seek(start)
+        raw = handle.read(limit)
+    truncated = start > 0
+    if truncated:
+        newline = raw.find(b"\n")
+        raw = raw[newline + 1:] if newline >= 0 else b""
+    return raw.decode("utf-8", errors="replace"), truncated
 
 
 def workspace_state_dir(state_dir, workspace):
@@ -417,7 +438,7 @@ def structured_error_message(errors):
     return None
 
 
-def parse_deepseek_final_output(output_dir, stdout_text):
+def parse_deepseek_final_output(output_dir, stdout_text, stdout_truncated=False):
     """Parse and validate final JSON output object from DeepSeek.
     Success requires explicit success status plus a string response.
     Arbitrary messages, progress events, malformed output, or blocked/error status are not success."""
@@ -425,7 +446,10 @@ def parse_deepseek_final_output(output_dir, stdout_text):
     if output_dir:
         last_msg_file = output_dir / "last_message.txt"
         if last_msg_file.exists():
-            raw_content = last_msg_file.read_text(encoding="utf-8", errors="replace").strip()
+            raw_content, truncated = read_text_tail(last_msg_file)
+            if truncated:
+                return None, False, False
+            raw_content = raw_content.strip()
 
     obj = None
     if raw_content:
@@ -435,7 +459,7 @@ def parse_deepseek_final_output(output_dir, stdout_text):
                 obj = parsed
         except (ValueError, RecursionError):
             return None, False, False
-    elif stdout_text:
+    elif stdout_text and not stdout_truncated:
         try:
             parsed = json.loads(stdout_text.strip())
             if isinstance(parsed, dict):
@@ -509,7 +533,7 @@ def parse_codex_events(stdout_text):
     return terminal_turn, terminal_event, has_terminal_402, intermediate_errors
 
 
-def parse_gemini_final_output(stdout_text):
+def parse_gemini_final_output(stdout_text, stdout_truncated=False):
     """Return Gemini's terminal payload from stream-json or legacy JSON output.
 
     Stream progress is deliberately not treated as a terminal result.  A missing
@@ -557,9 +581,13 @@ def parse_gemini_final_output(stdout_text):
     stripped = stdout_text.strip()
     if not stripped:
         return None, False, []
-    try:
-        inspect(json.loads(stripped), allow_legacy=True)
-    except (ValueError, RecursionError):
+    if not stdout_truncated:
+        try:
+            inspect(json.loads(stripped), allow_legacy=True)
+            return terminal, saw_result_event, stream_errors
+        except (ValueError, RecursionError):
+            pass
+    if stdout_truncated or terminal is None:
         for line in stdout_text.splitlines():
             line = line.strip()
             if not line:
@@ -917,22 +945,110 @@ def child_environment(config, provider_name, checked_deepseek_key=None):
 
 
 def sanitize_run_artifacts(output, secrets):
-    if not secrets or not Path(output).exists():
-        return
+    if not Path(output).exists():
+        return []
+    errors = []
+    exact = set()
+    for secret in secrets or ():
+        if secret and isinstance(secret, str):
+            stripped = secret.strip()
+            if len(stripped) >= 4:
+                exact.add(secret.encode("utf-8"))
+                exact.add(stripped.encode("utf-8"))
+    exact_pattern = None
+    if exact:
+        exact_pattern = re.compile(
+            b"|".join(re.escape(value) for value in sorted(exact, key=len, reverse=True)))
+    # Match Python text-regex whitespace without decoding the complete file.
+    # The multi-byte alternatives cover Unicode whitespace encoded as UTF-8.
+    whitespace = (
+        b"(?:[\\x09-\\x0d\\x1c-\\x20]|\\xc2\\x85|\\xc2\\xa0|\\xe1\\x9a\\x80|"
+        b"\\xe2\\x80[\\x80-\\x8a]|\\xe2\\x80[\\xa8-\\xa9]|\\xe2\\x80\\xaf|"
+        b"\\xe2\\x81\\x9f|\\xe3\\x80\\x80)"
+    )
+    generic_pattern = re.compile(
+        b"(?P<bearer>(?P<bearer_prefix>(?i:Bearer)" + whitespace +
+        b"+)(?:(?!" + whitespace + b")[^,'\"])+)|"
+        b"(?P<sk>\\bsk-[A-Za-z0-9_-]{16,}\\b)")
+
+    def copy_range(source, destination, start, end):
+        while start < end:
+            stop = min(start + ARTIFACT_COPY_CHUNK_BYTES, end)
+            destination.write(source[start:stop])
+            start = stop
+
+    def rewrite(source_path, destination_path, pattern, preserve_bearer_prefix=False):
+        with source_path.open("rb") as source_handle:
+            with mmap.mmap(source_handle.fileno(), 0, access=mmap.ACCESS_READ) as source:
+                match = pattern.search(source)
+                if match is None:
+                    return False
+                with destination_path.open("wb") as destination:
+                    position = 0
+                    while match is not None:
+                        copy_range(source, destination, position, match.start())
+                        if preserve_bearer_prefix and match.start("bearer") >= 0:
+                            copy_range(source, destination, match.start("bearer_prefix"),
+                                       match.end("bearer_prefix"))
+                        destination.write(b"[REDACTED]")
+                        position = match.end()
+                        match = pattern.search(source, position)
+                    copy_range(source, destination, position, len(source))
+        return True
+
+    def copy_in_place(source_path, target_path):
+        """Bounded Windows fallback when an inherited handle blocks replacement."""
+        with source_path.open("rb") as source, target_path.open("r+b") as target:
+            opened = os.fstat(target.fileno())
+            current = os.stat(target_path, follow_symlinks=False)
+            if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(current.st_mode) or
+                    opened.st_nlink != 1 or not os.path.samestat(opened, current)):
+                raise PermissionError("refusing in-place redaction of a linked or replaced artifact")
+            target.seek(0)
+            while True:
+                chunk = source.read(ARTIFACT_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                target.write(chunk)
+            target.truncate()
+
     for name in ("prompt.txt", "stdout.log", "stderr.log", "last_message.txt",
                  "provider.log", "progress.json", "heartbeat.json",
                  "status.txt", "diff.txt", "head.txt"):
         path = Path(output) / name
+        exact_temporary = path.parent / (str(uuid.uuid4()) + ".tmp")
+        generic_temporary = path.parent / (str(uuid.uuid4()) + ".tmp")
         try:
-            if not path.is_file() or path.is_symlink():
+            if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
                 continue
-            raw = path.read_text(encoding="utf-8", errors="replace")
-            clean = _sanitize_all_secrets(raw, secrets)
-            if clean != raw:
+            source_path = path
+            changed = False
+            if exact_pattern is not None and rewrite(path, exact_temporary, exact_pattern):
+                source_path = exact_temporary
+                changed = True
+            if rewrite(source_path, generic_temporary, generic_pattern,
+                       preserve_bearer_prefix=True):
+                source_path = generic_temporary
+                changed = True
+            if changed:
                 # Atomic replacement avoids following a hard link while writing.
-                write_bytes(path, clean.encode("utf-8"))
-        except OSError:
+                try:
+                    os.replace(source_path, path)
+                except PermissionError:
+                    # Windows can deny replacement while an exited provider's
+                    # descendant still holds the inherited log handle. Preserve
+                    # the old in-place behavior without following hard links.
+                    copy_in_place(source_path, path)
+        except (OSError, ValueError) as exc:
+            errors.append(f"{name}: {exc}")
             continue
+        finally:
+            for temporary in (exact_temporary, generic_temporary):
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    return errors
 
 
 class BalanceError(str):
@@ -2152,16 +2268,10 @@ def execute(args):
                     safe_heartbeat(result, output, provider_name, provider, process, "finished",
                                    started_wall, started_monotonic, progress_snapshot)
             stderr_file = output / "stderr.log"
-            raw_stdout = stdout_file.read_text(encoding="utf-8", errors="replace")
-            raw_stderr = stderr_file.read_text(encoding="utf-8", errors="replace")
-            clean_stdout = _sanitize_all_secrets(raw_stdout, secrets)
-            clean_stderr = _sanitize_all_secrets(raw_stderr, secrets)
-            if clean_stdout != raw_stdout:
-                stdout_file.write_text(clean_stdout, encoding="utf-8")
-            if clean_stderr != raw_stderr:
-                stderr_file.write_text(clean_stderr, encoding="utf-8")
-            stdout_text = clean_stdout
-            stderr_text = clean_stderr
+            stdout_text, stdout_truncated = read_text_tail(stdout_file)
+            stderr_text, stderr_truncated = read_text_tail(stderr_file)
+            stdout_text = _sanitize_all_secrets(stdout_text, secrets)
+            stderr_text = _sanitize_all_secrets(stderr_text, secrets)
 
             is_terminal = False
             ds_output = None
@@ -2172,10 +2282,12 @@ def execute(args):
             stream_errors = []
             provider_output_text = stdout_text
             if provider_name == "deepseek":
-                ds_output, is_terminal, valid_success = parse_deepseek_final_output(output, stdout_text)
+                ds_output, is_terminal, valid_success = parse_deepseek_final_output(
+                    output, stdout_text, stdout_truncated=stdout_truncated)
                 terminal_turn, terminal_event, has_terminal_402, _ = parse_codex_events(stdout_text)
             elif provider_name == "gemini":
-                gemini_output, gemini_result_event, stream_errors = parse_gemini_final_output(stdout_text)
+                gemini_output, gemini_result_event, stream_errors = parse_gemini_final_output(
+                    stdout_text, stdout_truncated=stdout_truncated)
                 provider_output_text = json.dumps(gemini_output) if gemini_output is not None else ""
                 valid_success = successful_response(provider_output_text, args.role)
                 terminal_turn, has_terminal_402 = None, False
@@ -2192,7 +2304,11 @@ def execute(args):
             errors += error_objects(stderr_text)
             if provider_name in ("gemini", "claude") and (gemini_output is None if provider_name == "gemini" else claude_output is None):
                 errors.extend(error for error in stream_errors if isinstance(error, dict))
-            plain_error = plain_terminal_error(stderr_text, code)
+            # A truncated stderr suffix cannot prove that its remaining line
+            # was the CLI's only diagnostic. Truncated stdout may hide a real
+            # terminal event. Either case prevents stderr from establishing a
+            # standalone terminal failure.
+            plain_error = None if stderr_truncated or stdout_truncated else plain_terminal_error(stderr_text, code)
             provider_without_terminal = (
                 (provider_name == "gemini" and gemini_output is None and not gemini_result_event) or
                 (provider_name == "claude" and claude_output is None and not claude_result_event)
@@ -2204,9 +2320,11 @@ def execute(args):
                 plain_error_applies = None
             if plain_error_applies and (not stdout_text.strip() or provider_without_terminal):
                 errors.append(plain_error_applies)
-            denied = permission_denials(provider_output_text)
-            complete_failure = complete_terminal_failure(provider_output_text)
-            if not stdout_text.strip() or provider_without_terminal:
+            raw_stdout_is_partial = provider_name == "deepseek" and stdout_truncated
+            denied = [] if raw_stdout_is_partial else permission_denials(provider_output_text)
+            complete_failure = False if raw_stdout_is_partial else complete_terminal_failure(provider_output_text)
+            if ((not stdout_text.strip() or provider_without_terminal) and
+                    not stderr_truncated and not stdout_truncated):
                 complete_failure = complete_failure or complete_terminal_failure(stderr_text)
             terminal_established = (denied or valid_success or plain_error_applies is not None or
                                     (provider_name in ("gemini", "claude") and complete_failure) or
@@ -2342,7 +2460,8 @@ def finish(result, output, workspace, code, secrets=None):
     except Exception as exc:
         artifact_errors.append("git evidence: " + str(exc))
     try:
-        sanitize_run_artifacts(output, secrets)
+        for error in sanitize_run_artifacts(output, secrets):
+            artifact_errors.append("artifact sanitization: " + error)
     except Exception as exc:
         artifact_errors.append("artifact sanitization: " + str(exc))
     if secrets:

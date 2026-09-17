@@ -761,14 +761,14 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked_pending_run")
 
     def test_post_exit_log_read_failure_keeps_fallback_blocked(self):
-        real_read_text = Path.read_text
+        real_read_tail = runner.read_text_tail
 
         def fail_stdout_read(path, *args, **kwargs):
             if Path(path).name == "stdout.log":
                 raise OSError("Injected stdout read failure")
-            return real_read_text(path, *args, **kwargs)
+            return real_read_tail(path, *args, **kwargs)
 
-        with mock.patch.object(Path, "read_text", new=fail_stdout_read):
+        with mock.patch.object(runner, "read_text_tail", new=fail_stdout_read):
             result, code = self.run_provider()
         self.assertEqual((result["status"], code), ("setup_error", 1))
         self.assertFalse(result["fallback_authorized"])
@@ -1324,6 +1324,100 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(result))
         self.assertNotIn(secret, (output / "provider.log").read_text(encoding="utf-8"))
 
+    def test_artifact_redaction_streams_large_files_and_crosses_copy_boundaries(self):
+        secret = "boundary-secret-" + uuid.uuid4().hex
+        bearer = "Bearer bearer-token-" + uuid.uuid4().hex
+        sk_token = "sk-" + uuid.uuid4().hex
+        output = self.root / "streaming-redaction-output"
+        output.mkdir()
+        prefix = b"x" * (runner.ARTIFACT_COPY_CHUNK_BYTES - 3)
+        artifact = output / "stdout.log"
+        artifact.write_bytes(prefix + secret.encode("utf-8") + b" " + bearer.encode("utf-8") +
+                             b" " + sk_token.encode("utf-8") + b" suffix")
+
+        with mock.patch.object(Path, "read_text", side_effect=AssertionError("full text read")):
+            runner.sanitize_run_artifacts(output, [secret])
+
+        redacted = artifact.read_bytes()
+        self.assertTrue(redacted.startswith(prefix))
+        self.assertNotIn(secret.encode("utf-8"), redacted)
+        self.assertNotIn(bearer.encode("utf-8"), redacted)
+        self.assertNotIn(sk_token.encode("utf-8"), redacted)
+        self.assertEqual(redacted.count(b"[REDACTED]"), 3)
+
+    def test_artifact_redaction_without_configured_secrets_covers_generic_tokens(self):
+        bearer_token = "bearer-token-" + uuid.uuid4().hex
+        sk_token = "sk-" + uuid.uuid4().hex
+        output = self.root / "generic-redaction-output"
+        output.mkdir()
+        artifact = output / "stdout.log"
+        artifact.write_text(
+            "Bearer " + bearer_token + "\nBearer\N{NO-BREAK SPACE}" +
+            bearer_token + "\n" + sk_token,
+            encoding="utf-8")
+
+        runner.sanitize_run_artifacts(output, [])
+
+        redacted = artifact.read_text(encoding="utf-8")
+        self.assertNotIn(bearer_token, redacted)
+        self.assertNotIn(sk_token, redacted)
+        self.assertEqual(redacted.count("[REDACTED]"), 3)
+
+    def test_artifact_redaction_prioritizes_complete_configured_secret(self):
+        secret = "custom-part,private-" + uuid.uuid4().hex
+        output = self.root / "overlapping-redaction-output"
+        output.mkdir()
+        artifact = output / "stdout.log"
+        artifact.write_text("Bearer " + secret, encoding="utf-8")
+
+        runner.sanitize_run_artifacts(output, [secret])
+
+        redacted = artifact.read_text(encoding="utf-8")
+        self.assertEqual(redacted, "Bearer [REDACTED]")
+        self.assertNotIn("private-", redacted)
+
+    def test_artifact_redaction_uses_bounded_fallback_when_replace_is_denied(self):
+        secret = "windows-handle-secret-" + uuid.uuid4().hex
+        output = self.root / "replace-denied-redaction-output"
+        output.mkdir()
+        artifact = output / "stdout.log"
+        artifact.write_bytes(b"x" * runner.ARTIFACT_COPY_CHUNK_BYTES + secret.encode("utf-8"))
+        real_replace = runner.os.replace
+
+        def deny_artifact_replace(source, destination):
+            if Path(destination) == artifact:
+                raise PermissionError("inherited handle denies replacement")
+            return real_replace(source, destination)
+
+        with mock.patch.object(runner.os, "replace", side_effect=deny_artifact_replace):
+            errors = runner.sanitize_run_artifacts(output, [secret])
+
+        self.assertEqual(errors, [])
+        self.assertNotIn(secret.encode("utf-8"), artifact.read_bytes())
+        self.assertEqual(list(output.glob("*.tmp")), [])
+
+    def test_artifact_redaction_reports_failed_safe_fallback(self):
+        secret = "reported-redaction-secret-" + uuid.uuid4().hex
+        output = self.root / "replace-and-fallback-denied-output"
+        output.mkdir()
+        artifact = output / "stdout.log"
+        artifact.write_text(secret, encoding="utf-8")
+        real_open = Path.open
+
+        def deny_in_place_open(path, mode="r", *args, **kwargs):
+            if Path(path) == artifact and mode == "r+b":
+                raise PermissionError("in-place fallback denied")
+            return real_open(path, mode, *args, **kwargs)
+
+        with mock.patch.object(runner.os, "replace", side_effect=PermissionError("replace denied")), \
+                mock.patch.object(Path, "open", new=deny_in_place_open):
+            errors = runner.sanitize_run_artifacts(output, [secret])
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("stdout.log", errors[0])
+        self.assertIn("in-place fallback denied", errors[0])
+        self.assertEqual(list(output.glob("*.tmp")), [])
+
     def test_finish_artifact_failures_preserve_timeout_result(self):
         output = self.root / "artifact-failure-output"
         output.mkdir()
@@ -1337,6 +1431,19 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual((result["status"], code), ("timeout", 1))
         self.assertIn("git evidence: git failed", result["artifact_errors"])
         self.assertIn("result persistence: result write failed", result["artifact_errors"])
+
+    def test_finish_reports_per_file_redaction_failure(self):
+        output = self.root / "reported-artifact-failure-output"
+        output.mkdir()
+        with mock.patch.object(
+                runner, "sanitize_run_artifacts",
+                return_value=["stdout.log: in-place fallback denied"]):
+            result, code = runner.finish({"status": "completed"}, output, self.root, 0)
+
+        self.assertEqual((result["status"], code), ("completed", 0))
+        self.assertIn(
+            "artifact sanitization: stdout.log: in-place fallback denied",
+            result["artifact_errors"])
 
     def test_git_evidence_strips_deepseek_credentials_and_external_helpers(self):
         first_secret = "evidence-secret-" + uuid.uuid4().hex
@@ -2397,6 +2504,91 @@ class ProviderTests(unittest.TestCase):
         self.assertGreaterEqual(runner.MIN_HEARTBEAT_SECONDS, 5)
         self.assertGreater(runner.STREAM_READ_CHUNK_BYTES, 0)
         self.assertLessEqual(runner.STREAM_READ_CHUNK_BYTES, runner.MAX_STREAM_LINE_BYTES)
+        self.assertGreater(runner.FINAL_OUTPUT_TAIL_BYTES, runner.MAX_STREAM_LINE_BYTES)
+
+    def test_text_tail_discards_partial_leading_record(self):
+        stream = self.root / "tail.log"
+        terminal = b'{"event":"result","result":{"status":"SUCCESS","response":"Done"}}'
+        stream.write_bytes(b"x" * 32 + b"\n" + terminal)
+
+        text, truncated = runner.read_text_tail(stream, limit=len(terminal) + 8)
+
+        self.assertTrue(truncated)
+        self.assertEqual(text.encode("utf-8"), terminal)
+
+    def test_large_gemini_transcript_completion_never_reads_whole_log(self):
+        self.fake.write_text(
+            "import json\n"
+            "payload = 'x' * (700 * 1024)\n"
+            "for index in range(4):\n"
+            "    print(json.dumps({'event': 'step_update', 'step_update': "
+            "{'index': index, 'status': 'completed', 'description': payload}}), flush=True)\n"
+            "print(json.dumps({'event': 'result', 'result': "
+            "{'status': 'SUCCESS', 'response': 'Done'}}), flush=True)\n",
+            encoding="utf-8")
+        real_read_text = Path.read_text
+
+        def reject_full_stream_read(path, *args, **kwargs):
+            if Path(path).name in ("stdout.log", "stderr.log"):
+                raise AssertionError("provider transcript was read in full")
+            return real_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", new=reject_full_stream_read):
+            result, code = self.run_provider()
+
+        self.assertEqual((result["status"], code), ("completed", 0))
+        self.assertTrue(result["stream_terminal_seen"])
+        self.assertGreater((Path(result["logs"]) / "stdout.log").stat().st_size,
+                           runner.FINAL_OUTPUT_TAIL_BYTES)
+
+    def test_truncated_gemini_tail_cannot_enable_legacy_terminal_parsing(self):
+        self.fake.write_text(
+            "import json, sys\n"
+            f"print('x' * ({runner.FINAL_OUTPUT_TAIL_BYTES} + 128), flush=True)\n"
+            "print(json.dumps({'error': {'code': 'QUOTA_EXHAUSTED', "
+            "'message': 'Daily quota exhausted'}}), flush=True)\n"
+            "sys.exit(1)\n",
+            encoding="utf-8")
+
+        result, code = self.run_provider()
+
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
+        self.assertFalse((self.root / "state" / "gemini-quota.json").exists())
+
+    def test_oversized_gemini_result_cannot_let_stderr_release_ownership(self):
+        self.fake.write_text(
+            "import json, sys\n"
+            f"response = 'x' * ({runner.FINAL_OUTPUT_TAIL_BYTES} + 128)\n"
+            "print(json.dumps({'event': 'result', 'result': "
+            "{'status': 'SUCCESS', 'response': response}}), flush=True)\n"
+            "print('Error: Daily quota exhausted', file=sys.stderr, flush=True)\n"
+            "sys.exit(1)\n",
+            encoding="utf-8")
+
+        result, code = self.run_provider()
+
+        self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+        self.assertFalse(result["fallback_authorized"])
+        self.assertTrue(result["fallback_blocked_by_pending"])
+        self.assertFalse((self.root / "state" / "gemini-quota.json").exists())
+
+    def test_oversized_deepseek_last_message_fails_closed(self):
+        output = self.root / "oversized-last-message"
+        output.mkdir()
+        (output / "last_message.txt").write_bytes(
+            b"x" * (runner.FINAL_OUTPUT_TAIL_BYTES + 1))
+
+        self.assertEqual(
+            runner.parse_deepseek_final_output(
+                output, '{"status":"SUCCESS","response":"untrusted fallback"}'),
+            (None, False, False))
+        self.assertEqual(
+            runner.parse_deepseek_final_output(
+                None, '{"status":"SUCCESS","response":"legacy"}',
+                stdout_truncated=True),
+            (None, False, False))
 
     def test_oversized_partial_stream_line_is_discarded_once_and_reader_recovers(self):
         output = self.root / "oversized-stream"

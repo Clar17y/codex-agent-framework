@@ -1,4 +1,4 @@
-# Personal agent routing
+# Multi-provider agent routing
 
 Use the installed multi-provider framework at `{{CODEX_ROOT}}/agent-framework/` for coding work. This policy adds provider routing; repository instructions still own worktrees, file ownership, CI and release gates.
 

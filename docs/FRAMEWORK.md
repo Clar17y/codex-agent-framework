@@ -1,6 +1,6 @@
-# Personal multi-provider agent framework v5
+# Multi-provider agent framework v5
 
-Relative to the configured Codex root (default `~/.codex`), the framework lives in `agent-framework/`, native role files in `agents/`, provider skills in `skills/`, and the routing entrypoint in the managed block of the personal `AGENTS.md`. Use the root selected during installation when `CODEX_HOME` or `--codex-home` overrides the default.
+Relative to the configured Codex root (default `~/.codex`), the framework lives in `agent-framework/`, native role files in `agents/`, provider skills in `skills/`, and the routing entrypoint in the managed block of your `AGENTS.md`. Use the root selected during installation when `CODEX_HOME` or `--codex-home` overrides the default.
 
 ## Routing
 

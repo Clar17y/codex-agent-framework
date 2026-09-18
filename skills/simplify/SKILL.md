@@ -29,7 +29,7 @@ Use three independent read-only passes, concurrently when capacity permits:
 
 Provide each reviewer the same complete scoped diff, relevant new-file content, baseline identity, constraints, and permission to search callers. Require concrete locations, evidence, a proposed repair, and any behavioral risk. Reviewers must not edit files or delegate further. The primary agent checks findings against the source and resolves disagreements before assigning repairs.
 
-## Apply personal provider routing
+## Apply provider routing
 
 For this installation, read `{{CODEX_ROOT}}/agent-framework/docs/FRAMEWORK.md` and the relevant provider skills when invoking their routes. Applicable AGENTS.md rules remain authoritative.
 
@@ -47,4 +47,4 @@ Finish with a concise account of applied improvements, verification results and 
 
 ## Reference
 
-Workflow inspiration: [the linked simplify.ts](https://github.com/emanuelcasco/claude-code/blob/main/src/skills/bundled/simplify.ts). This skill adapts that review-and-repair approach to Codex and the installed personal routing framework.
+Workflow inspiration: [the linked simplify.ts](https://github.com/emanuelcasco/claude-code/blob/main/src/skills/bundled/simplify.ts). This skill adapts that review-and-repair approach to Codex and the installed provider routing framework.

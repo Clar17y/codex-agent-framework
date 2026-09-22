@@ -1,5 +1,5 @@
 name = "reviewer"
-description = "Independent Astra-low fallback reviewer for one integrated batch when Claude Opus 5 is unavailable."
+description = "Independent Astra-low fallback reviewer for one integrated batch when Claude Opus 5.5 is unavailable."
 model = "gpt-6-astra"
 model_reasoning_effort = "low"
 sandbox_mode = "read-only"

@@ -100,7 +100,7 @@ def collect_sources(source):
     return files
 
 
-def resolve_routing(source, root, gemini_override=None, claude_override=None, refresh_routing=False, deepseek_override=None):
+def resolve_routing(source, root, gemini_override=None, claude_override=None, refresh_routing=False):
     target = root / 'agent-framework/routing.json'
     preserving = target.exists() and not refresh_routing
     config_path = target if preserving else source / 'routing.example.json'
@@ -122,47 +122,28 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
             raise PreflightError(f'Source routing file {source_example_path} must contain a providers object.')
         source_defaults = source_example['providers']
 
-    target_version = config.get('version', 1) if preserving else 7
+    target_version = config.get('version', 1) if preserving else 9
     if isinstance(target_version, bool) or not isinstance(target_version, int):
         raise PreflightError('Routing configuration version must be an integer.')
 
     providers_info = [
         ('gemini', 'agy', gemini_override),
-        ('deepseek', 'codex', deepseek_override),
         ('claude', 'claude', claude_override)
     ]
     for provider, command, override in providers_info:
         entry = config['providers'].get(provider)
         if entry is None and preserving:
-            if provider == 'deepseek':
-                if target_version < 5 or override is not None:
-                    default_entry = source_defaults.get('deepseek', {
-                        'executable': command,
-                        'profile': 'deepseek',
-                        'model': 'deepseek-flash',
-                        'api_key_env': 'DEEPSEEK_API_KEY'
-                    })
-                    entry = dict(default_entry)
-                    config['providers']['deepseek'] = entry
-                    if override is None:
-                        discovered = shutil.which(command)
-                        entry['executable'] = os.path.abspath(discovered) if discovered else command
-                        if not discovered:
-                            print(f'Warning: {command} not found on PATH; retaining command name.')
-                else:
-                    continue
-            else:
-                default_entry = source_defaults.get(provider, {
-                    'executable': command,
-                    'model': 'gemini-3.8-flash-medium' if provider == 'gemini' else 'claude-opus-5'
-                })
-                entry = dict(default_entry)
-                config['providers'][provider] = entry
-                if override is None:
-                    discovered = shutil.which(command)
-                    entry['executable'] = os.path.abspath(discovered) if discovered else command
-                    if not discovered:
-                        print(f'Warning: {command} not found on PATH; retaining command name.')
+            default_entry = source_defaults.get(provider, {
+                'executable': command,
+                'model': 'gemini-3.8-flash-medium' if provider == 'gemini' else 'claude-opus-5-5'
+            })
+            entry = dict(default_entry)
+            config['providers'][provider] = entry
+            if override is None:
+                discovered = shutil.which(command)
+                entry['executable'] = os.path.abspath(discovered) if discovered else command
+                if not discovered:
+                    print(f'Warning: {command} not found on PATH; retaining command name.')
 
         if entry is None:
             continue
@@ -186,7 +167,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
         # Stream telemetry is universal in v7. Make the effective default
         # visible in preserved routing files while retaining every explicit
         # operator value, including zero (disabled).
-        for provider_name in ('gemini', 'deepseek', 'claude'):
+        for provider_name in ('gemini', 'claude'):
             entry = config['providers'].get(provider_name)
             provider_defaults = source_defaults.get(provider_name, {})
             if (isinstance(entry, dict) and 'heartbeat_seconds' not in entry and
@@ -206,14 +187,33 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
         # treated as an operator override and preserved.
         elif target_version == 6 and isinstance(gemini, dict) and gemini.get('timeout_seconds') == 1800:
             gemini['timeout_seconds'] = defaults.get('timeout_seconds', 3600)
-        if target_version < 7:
-            config['version'] = 7
+        # v8 upgrades only the old packaged review pin. Preserve operator
+        # overrides and make this one-time, including on repeated installs.
+        claude = config['providers'].get('claude')
+        if (target_version < 8 and isinstance(claude, dict) and
+                claude.get('model') == 'claude-opus-5'):
+            claude['model'] = 'claude-opus-5-5'
+        # v9 retires DeepSeek from active routing and defaults.
+        # Pre-v9 upgrades remove the legacy providers.deepseek entry
+        # while preserving other custom provider settings or state.
+        if target_version < 9:
+            retired = config['providers'].pop('deepseek', None)
+            env_name = retired.get('api_key_env') if isinstance(retired, dict) else None
+            if isinstance(env_name, str) and env_name and env_name != 'DEEPSEEK_API_KEY':
+                # Retain only the credential name needed for subprocess/log
+                # filtering, never a provider route or the credential value.
+                names = config.setdefault('retired_secret_env_vars', [])
+                if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+                    raise PreflightError('retired_secret_env_vars must be a list of environment variable names.')
+                if env_name not in names:
+                    names.append(env_name)
+            config['version'] = 9
     else:
-        config['version'] = 7
+        config['version'] = 9
     return config
 
 
-def build_plan(source, root, gemini_override=None, claude_override=None, refresh_routing=False, deepseek_override=None):
+def build_plan(source, root, gemini_override=None, claude_override=None, refresh_routing=False):
     files = collect_sources(source)
     plan = {}
     for name in files:
@@ -235,15 +235,13 @@ def build_plan(source, root, gemini_override=None, claude_override=None, refresh
         gemini_override=gemini_override,
         claude_override=claude_override,
         refresh_routing=refresh_routing,
-        deepseek_override=deepseek_override,
     )
     plan[routing] = (json.dumps(data, indent=2) + '\n').encode('utf-8')
     return plan
 
 
 def install_framework(codex_home=None, dry_run=False, gemini_override=None,
-                      claude_override=None, refresh_routing=False, source=None,
-                      deepseek_override=None):
+                      claude_override=None, refresh_routing=False, source=None):
     if sys.version_info < (3, 11):
         raise PreflightError('Python 3.11 or newer is required.')
     source_root = Path(source or Path(__file__).absolute().parent).expanduser().absolute()
@@ -269,7 +267,6 @@ def install_framework(codex_home=None, dry_run=False, gemini_override=None,
         gemini_override=gemini_override,
         claude_override=claude_override,
         refresh_routing=refresh_routing,
-        deepseek_override=deepseek_override,
     )
     if dry_run:
         print('Dry run requested. No changes made.')
@@ -296,7 +293,6 @@ def install_framework(codex_home=None, dry_run=False, gemini_override=None,
             gemini_override=gemini_override,
             claude_override=claude_override,
             refresh_routing=refresh_routing,
-            deepseek_override=deepseek_override,
         )
         backup_dir.mkdir(parents=True, exist_ok=False)
         backups = {}
@@ -330,7 +326,6 @@ def main(argv=None):
     parser.add_argument('--codex-home', help='Override CODEX_HOME or ~/.codex.')
     parser.add_argument('--dry-run', action='store_true', help='Validate and list destinations without writes.')
     parser.add_argument('--gemini', help='Override Gemini executable.')
-    parser.add_argument('--deepseek', help='Override DeepSeek (Codex) executable.')
     parser.add_argument('--claude', help='Override Claude executable.')
     parser.add_argument('--refresh-routing', action='store_true', help='Reset routing to package defaults and rediscover CLIs.')
     parser.add_argument('--source', help='Use another complete source package.')
@@ -343,7 +338,6 @@ def main(argv=None):
             claude_override=args.claude,
             refresh_routing=args.refresh_routing,
             source=args.source,
-            deepseek_override=args.deepseek,
         )
     except (InstallError, OSError, ValueError) as exc:
         print(f'Installation error: {exc}', file=sys.stderr)

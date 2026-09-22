@@ -1,32 +1,31 @@
 # Architecture and Design Decisions
 
-This document details the six core architectural decisions governing the multi-provider orchestration framework. Each decision addresses concrete failure modes encountered when coordinating external AI developer CLI tools—Google Antigravity (`agy`), DeepSeek Flash via OpenAI Codex CLI (`codex`), and Anthropic Claude Code CLI (`claude`)—under an OpenAI Codex development environment.
+This document details the six core architectural decisions governing the multi-provider orchestration framework. Each decision addresses concrete failure modes encountered when coordinating external AI developer CLI tools—Google Antigravity (`agy`) and Anthropic Claude Code CLI (`claude`), with retained compatibility internals for retired DeepSeek runs—under an OpenAI Codex development environment.
 
 For operational workflows and runtime configuration, see [FRAMEWORK.md](FRAMEWORK.md). For implementation details, see [../scripts/provider_runner.py](../scripts/provider_runner.py).
 
 ---
 
-## 1. Fail-Closed Provider Routing and the Three-Tier Fallback Chain
+## 1. Fail-Closed Provider Routing and the Fallback Chain
 
 ### Problem
 External AI provider CLIs suffer from rate limits, unexpected service outages, payment/quota exhaustion, and transient network errors. In an automated multi-agent coding workflow, unhandled provider failures or ambiguous error states can lead to infinite retry loops, hanging tasks, silent abandonment, or uncontrolled model switching. An orchestrator requires a deterministic routing hierarchy that attempts fast, cost-effective models first and reliably falls back to local or alternative providers without stalling or corrupting workspace state.
 
 ### Decision
-Implement a deterministic, three-tier fail-closed fallback hierarchy for code implementation tasks:
+Implement a deterministic fail-closed fallback hierarchy for code implementation tasks:
 
 1. **Primary Tier (Gemini Flash)**: Google Antigravity (`agy`) running `gemini-3.8-flash-medium`.
-2. **Secondary Tier (DeepSeek Flash)**: DeepSeek Flash v4.1 under the local `deepseek-flash` alias via nested OpenAI Codex CLI (`codex exec -p deepseek`), activated when Gemini reports terminal quota exhaustion, provided DeepSeek is configured and enabled (`providers.deepseek.enabled=true`).
-3. **Final Tier (Native Luna Medium)**: Native OpenAI Codex role `implementer` running `gpt-5.6-luna` (medium effort), activated when DeepSeek monetary balance is depleted, preflight validation fails, or Gemini encounters a non-quota error.
+2. **Fallback Tier (Native Luna Medium)**: Native OpenAI Codex role `implementer` running `gpt-6-luna` (medium effort), selected when Gemini reports terminal quota exhaustion or encounters a non-quota error, with execution gated on safe file ownership. (DeepSeek has been retired from active routing; legacy balance and stream implementation internals remain for backward compatibility).
 
-Independent code reviews follow a dedicated review route: Anthropic Claude Code CLI (`claude`) running `claude-opus-5` (default medium effort; high effort requires a documented reason), falling back directly to native Astra low (`reviewer`) upon quota exhaustion. DeepSeek is excluded from the review path.
+Independent code reviews follow a dedicated review route: Anthropic Claude Code CLI (`claude`) running `claude-opus-5-5` (default medium effort; high effort requires a documented reason), falling back directly to native Astra low (`reviewer`) upon quota exhaustion. DeepSeek is excluded from the review path.
 
 The routing engine fails closed:
 - **Exit 0 (success)**: Provider executed and completed successfully (`available_to_try` is the status subcommand's verdict when no cached block is active, rather than a runner execution exit code).
-- **Exit 20 (`fallback_required`)**: Confirmed quota exhaustion, zero monetary balance, or disabled provider; signals the orchestrator to advance immediately to the next tier without launching the exhausted CLI again.
-- **Exit 1 (`blocked_pending_run` / `balance_check_failed` / `state_error`)**: Unresolved pending runs on overlapping claimed paths, preflight validation error, network failure, or corrupted state. When an unresolved pending run is detected, execution deliberately blocks (`fallback_authorized` is false and `fallback_blocked_by_pending` is true) until an operator resolves it; for other exit-1 errors, the runner directs the orchestrator to fallback while preserving unreadable diagnostic evidence.
+- **Exit 20 (`fallback_required`)**: Confirmed quota exhaustion; signals the orchestrator to advance immediately to the fallback without launching the exhausted CLI again.
+- **Exit 1 (`blocked_pending_run` / `state_error`)**: Unresolved pending runs on overlapping claimed paths, preflight validation error, network failure, or corrupted state. When an unresolved pending run is detected, execution deliberately blocks (`fallback_authorized` is false and `fallback_blocked_by_pending` is true) until an operator resolves it; for other exit-1 errors, the runner directs the orchestrator to fallback while preserving unreadable diagnostic evidence.
 
 ### Why It Matters
-Fail-closed routing prevents unbounded retries against depleted or failing APIs. Every terminal provider outcome routes to a defined next step except unresolved pending-run conflicts, which deliberately block until an operator inspects and resolves them. By capturing terminal quota events and mapping them to structured exit codes, the orchestrator transitions to secondary or native models without human intervention or conversational prompt loops, maintaining deterministic agent behavior.
+Fail-closed routing prevents unbounded retries against depleted or failing APIs. Every terminal provider outcome routes to a defined next step except unresolved pending-run conflicts, which deliberately block until an operator inspects and resolves them. By capturing terminal quota events and mapping them to structured exit codes, the orchestrator transitions to native models without human intervention or conversational prompt loops, maintaining deterministic agent behavior.
 
 ### Implementation Citations
 - **Runner**: [`../scripts/provider_runner.py`](../scripts/provider_runner.py) — `execute()` (lines 1967–2453), `quota_fallback()` (lines 848–860), `luna_fallback()` (lines 844–847), `finish()` (lines 2453–2484), `command_for()` (lines 345–405).
@@ -34,19 +33,19 @@ Fail-closed routing prevents unbounded retries against depleted or failing APIs.
 
 ---
 
-## 2. Monetary Preflight and Quota Caching
+## 2. Quota Caching and Legacy Monetary Preflight
 
 ### Problem
-Pay-as-you-go APIs such as DeepSeek require positive monetary credit balances. Launching a coding agent against an account with an empty balance wastes time, produces noisy failure cascades mid-task, and risks leaving dirty workspace edits. Similarly, invoking rate-limited providers such as Gemini or Claude repeatedly after quota exhaustion wastes network round-trips and adds unnecessary latency to agent execution loops.
+Invoking rate-limited providers such as Gemini or Claude repeatedly after quota exhaustion wastes network round-trips and adds unnecessary latency to agent execution loops. Pay-as-you-go APIs additionally require positive credit balances.
 
 ### Decision
-Enforce a mandatory, live monetary-balance preflight check before every DeepSeek invocation, combined with atomic local quota caching across all providers:
+Enforce atomic local quota caching across providers, combined with retained monetary-balance preflight checks for legacy compatibility:
 
-1. **Live Monetary Preflight**: Before invoking `codex exec -p deepseek`, the runner sends a direct HTTPS request to DeepSeek's balance endpoint (`GET /user/balance`) using Python's standard library `urllib.request`. A custom `NoRedirectHandler` rejects HTTP redirects to prevent credential leaking. If the endpoint returns HTTP 402, `is_available=false`, or a non-positive total balance, the runner exits 20 (`fallback_required`) before spawning the model process. If authentication fails, the network is unreachable, or a 429/5xx error occurs, it exits 1 (`balance_check_failed`), falling back to Luna without misclassifying the incident as confirmed quota exhaustion.
-2. **Atomic Quota Caching**: Confirmed terminal quota errors are recorded in shared JSON cache files (`gemini-quota.json`, `claude-quota.json`, `deepseek-balance.json`) in the framework `state/` directory. Updates are guarded by cross-process file locks (`provider_lock`) and written via atomic file replacement. Cached entries record exact provider reset timestamps when available, or apply a bounded probe cooldown (`quota_probe_seconds`, default 3600s). Status checks inspect these local caches without network overhead unless `--check-live` is explicitly requested.
+1. **Atomic Quota Caching**: Confirmed terminal quota errors are recorded in shared JSON cache files (`gemini-quota.json` and `claude-quota.json`; legacy `deepseek-balance.json` stores a separate balance snapshot) in the framework `state/` directory. Updates are guarded by cross-process file locks (`provider_lock`) and written via atomic file replacement. Cached entries record exact provider reset timestamps when available, or apply a bounded probe cooldown (`quota_probe_seconds`, default 3600s). Status checks inspect these local caches without network overhead.
+2. **Legacy Monetary Preflight**: DeepSeek direct-invocation internals are retained for backward compatibility, including preflight `GET /user/balance` checks via standard library `urllib.request` with redirect rejection.
 
 ### Why It Matters
-Monetary preflights ensure that DeepSeek is never invoked when account credits are depleted, eliminating mid-run payment aborts and routing immediately to native Luna. Quota caching prevents hammering rate-limited APIs during cooldown periods, allowing subsequent operations to bypass exhausted providers instantly.
+Quota caching prevents hammering rate-limited APIs during cooldown periods, allowing subsequent operations to bypass exhausted providers instantly. Retained preflight logic preserves legacy compatibility without active exposure in routing defaults.
 
 ### Implementation Citations
 - **Runner**: [`../scripts/provider_runner.py`](../scripts/provider_runner.py) — `query_deepseek_balance()` (lines 1082–1172), `NoRedirectHandler` (lines 1077–1080), `classify_balance_error()` (lines 1063–1075), `validate_balance_info_entry()` (lines 878–896), `record_balance_snapshot()` (lines 1193–1255), `quota_state()` (lines 1290–1303), `quota_record()` (lines 1305–1322), `provider_lock()` (lines 254–291).
@@ -62,12 +61,12 @@ In a multi-provider orchestrator, child subprocesses are spawned to execute diff
 ### Decision
 Implement strict environment sanitization and subprocess boundary controls:
 
-1. **Subprocess Environment Stripping**: The `child_environment()` function strips `DEEPSEEK_API_KEY` (and any configured environment variable name, e.g. `api_key_env`) from environment dictionaries passed to Gemini and Claude provider subprocesses. `git_evidence()` performs its own value-based secret stripping on Git subprocesses by filtering variables whose values match known credentials. Only the DeepSeek execution path receives the DeepSeek API credential verified by preflight.
-2. **Nested Codex Shell Isolation**: When invoking nested Codex CLI for DeepSeek (`codex exec -p deepseek`), the runner supplies `-c shell_environment_policy.ignore_default_excludes=false`, preventing child shell commands executed by the model from inheriting environment secrets. Unattended execution passes `--approve-for-me`, selecting the workspace-write sandbox while avoiding conflicts with explicit `--sandbox` flags.
+1. **Subprocess Environment Stripping**: The `child_environment()` function strips `DEEPSEEK_API_KEY` (and configured or retired credential names retained in `retired_secret_env_vars`) from environment dictionaries passed to Gemini and Claude provider subprocesses. `git_evidence()` performs its own value-based secret stripping on Git subprocesses by filtering variables whose values match known credentials. Only the DeepSeek execution path receives the DeepSeek API credential verified by preflight.
+2. **Legacy Nested Codex Shell Isolation**: When invoking nested Codex CLI for DeepSeek (`codex exec -p deepseek`), the runner supplies `-c shell_environment_policy.ignore_default_excludes=false`, preventing child shell commands executed by the model from inheriting environment secrets. Unattended execution passes `--approve-for-me`, selecting the workspace-write sandbox while avoiding conflicts with explicit `--sandbox` flags.
 3. **Git Subprocess Hardening**: Git-evidence collection (`git_evidence()`) passes `--no-ext-diff` and `--no-textconv`, and executes git with `-c core.fsmonitor=false`. This prevents untrusted repository configurations from executing external diff drivers, textconv filters, or repository-configured filesystem monitors.
 
 ### Why It Matters
-Credential isolation provides defense-in-depth against credential harvesting and inadvertent leakage. Even if a model or child tool is compromised or misbehaves, it cannot inspect credentials intended for other providers or leak secrets through external tool hooks.
+Credential isolation provides defense-in-depth against credential harvesting and inadvertent leakage. This filtering protects ordinary child environments and retained logs; it is not a hard containment boundary against another process running as the same user.
 
 ### Implementation Citations
 - **Runner**: [`../scripts/provider_runner.py`](../scripts/provider_runner.py) — `child_environment()` (lines 935–945), `deepseek_secrets()` (lines 924–933), `command_for()` (lines 345–405), `direct_windows_codex_command()` (lines 321–343), `git_evidence()` (lines 1944–1965).
@@ -108,7 +107,7 @@ Implement hierarchical path-ownership registration and durable pending-run track
 1. **Hierarchical Path Matching**: Before launching an implementation task, the runner checks the declared `owned_paths` in the task contract. Paths are canonicalized (resolving symlinks and folding Windows case via `normalized_owned_paths`). Ownership is checked hierarchically via `claims_overlap()`: exact file matches, parent-directory ownership of child files, and child-file claims within a claimed directory are all detected as conflicts. An empty `owned_paths` list conservatively claims the entire workspace.
 2. **Atomic Reservation**: Ownership checks and reservations are synchronized using a short-lived coordination lock (`gemini.lock`) via `provider_lock()`. The lock is released immediately after registration so long-running tasks do not block other disjoint writers.
 3. **Durable Pending Runs**: Active runs register pending records under `agent-framework/state/workspaces/<workspace-hash>/gemini-pending/<run-id>.json`. If a task finishes abnormally, hits a timeout, or exits with an uncertain status, the pending record remains active on disk, marking the owned paths as blocked (`blocked_pending_run`). New tasks attempting to modify those paths are rejected until an operator or recovery workflow explicitly inspects and marks the pending run as resolved.
-4. **Non-Interfering Reviews**: Read-only review tasks (Claude Opus 5) do not acquire write ownership locks and can run concurrently alongside implementation writers.
+4. **Non-Interfering Reviews**: Read-only review tasks (Claude Opus 5.5) do not acquire write ownership locks and can run concurrently alongside implementation writers.
 
 ### Why It Matters
 Hierarchical ownership coordinates concurrent writers so multiple agents can safely work in parallel in the same repository when their scopes are disjoint, while preventing conflicting writes on shared files. Durable pending records protect workspaces from accidental corruption after sudden crashes or timeouts, enforcing human or supervisor review before unfinished work is overwritten.

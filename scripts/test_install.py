@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tomllib
 import unittest
 from unittest import mock
 
@@ -19,6 +20,7 @@ from install import (
     InstallLockError,
     PreflightError,
     install_framework,
+    resolve_routing,
     BEGIN_MARKER,
     END_MARKER,
 )
@@ -66,6 +68,24 @@ class TestInstallFramework(unittest.TestCase):
         agents_dir = self.dest_root / "agents"
         self.assertTrue((agents_dir / "implementer.toml").exists())
         self.assertTrue((agents_dir / "reviewer.toml").exists())
+        expected_roles = {
+            "implementer": ("gpt-6-luna", "medium"),
+            "explorer": ("gpt-6-luna", "medium"),
+            "docs-researcher": ("gpt-6-luna", "medium"),
+            "refactor-auditor": ("gpt-6-luna", "medium"),
+            "verifier": ("gpt-6-luna", "medium"),
+            "complex-implementer": ("gpt-6-sol", "medium"),
+            "planner": ("gpt-6-sol", "medium"),
+            "test-engineer": ("gpt-6-sol", "medium"),
+            "correctness-gate": ("gpt-6-sol", "high"),
+            "security-reviewer": ("gpt-6-sol", "high"),
+            "quality-gate-max": ("gpt-6-sol", "max"),
+            "reviewer": ("gpt-6-astra", "low"),
+        }
+        for role, expected in expected_roles.items():
+            with self.subTest(role=role):
+                data = tomllib.loads((agents_dir / (role + ".toml")).read_text(encoding="utf-8"))
+                self.assertEqual((data["model"], data["model_reasoning_effort"]), expected)
 
         # Check skills
         skills_dir = self.dest_root / "skills"
@@ -88,6 +108,9 @@ class TestInstallFramework(unittest.TestCase):
         policy_content = (af_dir / "GLOBAL_POLICY.md").read_text(encoding="utf-8")
         self.assertIn(dest_posix, policy_content)
         self.assertNotIn("{{CODEX_ROOT}}", policy_content)
+        self.assertIn("gpt-6-luna", policy_content)
+        self.assertIn("claude-opus-5-5", policy_content)
+        self.assertNotIn("gpt-5.6-", policy_content)
 
         gemini_content = gemini_skill.read_text(encoding="utf-8")
         self.assertIn(dest_posix, gemini_content)
@@ -118,14 +141,14 @@ class TestInstallFramework(unittest.TestCase):
 
         # Check routing.json
         routing = json.loads((af_dir / "routing.json").read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 7)
+        self.assertEqual(routing.get("version"), 9)
         self.assertIn("providers", routing)
         self.assertIn("gemini", routing["providers"])
-        self.assertIn("deepseek", routing["providers"])
+        self.assertNotIn("deepseek", routing["providers"])
         self.assertIn("claude", routing["providers"])
         self.assertEqual(routing["providers"]["gemini"]["timeout_seconds"], 3600)
-        self.assertEqual(routing["providers"]["deepseek"]["model"], "deepseek-flash")
-        self.assertEqual(routing["providers"]["deepseek"]["profile"], "deepseek")
+        self.assertEqual(routing["providers"]["claude"]["model"], "claude-opus-5-5")
+        self.assertEqual(routing["providers"]["claude"]["effort"], "medium")
 
         # Check lock released
         self.assertFalse((self.dest_root / ".agent-framework-install.lock").exists())
@@ -268,6 +291,61 @@ class TestInstallFramework(unittest.TestCase):
         self.assertEqual(refreshed_data["timeout_seconds"], 900)
         self.assertEqual(refreshed_data["providers"]["gemini"]["timeout_seconds"], 3600)
 
+    def test_v8_review_upgrade_preserves_settings_state_and_is_idempotent(self):
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        data = json.loads(routing_path.read_text(encoding="utf-8"))
+        data["version"] = 7
+        data["providers"]["claude"].update({
+            "model": "claude-opus-5", "executable": "/custom/claude",
+            "effort": "high", "heartbeat_seconds": 0, "timeout_seconds": 1234,
+        })
+        data["providers"]["deepseek"] = {"enabled": False}
+        data["providers"]["gemini"]["model"] = "custom-gemini"
+        data["custom"] = {"preserve": True}
+        routing_path.write_text(json.dumps(data), encoding="utf-8")
+        quota = self.dest_root / "agent-framework/state/claude-quota.json"
+        quota.parent.mkdir(parents=True)
+        quota.write_bytes(b'{"model":"claude-opus-5","retry_at":4070908800}')
+        original_quota = quota.read_bytes()
+        config = self.dest_root / "config.toml"
+        config.write_bytes(b'model = "gpt-6-astra"\r\n')
+        role = self.dest_root / "agents/implementer.toml"
+        role.write_text('model = "gpt-5.6-luna"\n', encoding="utf-8")
+
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        data["version"] = 9
+        data["providers"]["claude"]["model"] = "claude-opus-5-5"
+        data["providers"].pop("deepseek", None)
+        self.assertEqual(json.loads(routing_path.read_text(encoding="utf-8")), data)
+        self.assertEqual(quota.read_bytes(), original_quota)
+        self.assertEqual(config.read_bytes(), b'model = "gpt-6-astra"\r\n')
+        self.assertEqual(tomllib.loads(role.read_text(encoding="utf-8"))["model"], "gpt-6-luna")
+        self.assertIn("claude-opus-5-5", (self.dest_root / "AGENTS.md").read_text(encoding="utf-8"))
+
+        installed = routing_path.read_bytes()
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        self.assertEqual(routing_path.read_bytes(), installed)
+        self.assertEqual(quota.read_bytes(), original_quota)
+
+    def test_v8_review_migration_respects_version_and_custom_models(self):
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        baseline = routing_path.read_text(encoding="utf-8")
+        cases = [(version, "claude-opus-5", "claude-opus-5-5") for version in (4, 5, 6, 7)]
+        cases += [(7, "custom-opus", "custom-opus"), (8, "claude-opus-5", "claude-opus-5"),
+                  (10, "custom-future", "custom-future")]
+        for version, before, after in cases:
+            with self.subTest(version=version, model=before):
+                data = json.loads(baseline)
+                data["version"] = version
+                data["providers"]["claude"]["model"] = before
+                routing_path.write_text(json.dumps(data), encoding="utf-8")
+                resolved = resolve_routing(self.source_root, self.dest_root)
+                data["version"] = max(version, 9)
+                data["providers"]["claude"]["model"] = after
+                self.assertEqual(resolved, data)
+
     def test_v5_global_900_migrates_gemini_lifecycle_defaults_only(self):
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         routing_path = self.dest_root / "agent-framework" / "routing.json"
@@ -280,7 +358,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(data), encoding="utf-8")
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         migrated = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 7)
+        self.assertEqual(migrated["version"], 9)
         self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 3600)
         self.assertEqual(migrated["providers"]["gemini"]["termination_grace_seconds"], 120)
 
@@ -293,7 +371,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(data), encoding="utf-8")
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         migrated = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 7)
+        self.assertEqual(migrated["version"], 9)
         self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 3600)
 
     def test_v6_custom_gemini_timeout_is_preserved(self):
@@ -305,7 +383,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(data), encoding="utf-8")
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         migrated = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 7)
+        self.assertEqual(migrated["version"], 9)
         self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 2700)
 
     def test_preserved_routing_fills_missing_universal_heartbeats_only(self):
@@ -313,14 +391,12 @@ class TestInstallFramework(unittest.TestCase):
         routing_path = self.dest_root / "agent-framework" / "routing.json"
         data = json.loads(routing_path.read_text(encoding="utf-8"))
         data["providers"]["gemini"]["heartbeat_seconds"] = 0
-        data["providers"]["deepseek"].pop("heartbeat_seconds")
         data["providers"]["claude"].pop("heartbeat_seconds")
         routing_path.write_text(json.dumps(data), encoding="utf-8")
 
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         migrated = json.loads(routing_path.read_text(encoding="utf-8"))["providers"]
         self.assertEqual(migrated["gemini"]["heartbeat_seconds"], 0)
-        self.assertEqual(migrated["deepseek"]["heartbeat_seconds"], 60)
         self.assertEqual(migrated["claude"]["heartbeat_seconds"], 60)
 
     def test_v5_custom_timeout_is_preserved(self):
@@ -637,55 +713,117 @@ class TestInstallFramework(unittest.TestCase):
         self.assertFalse((self.dest_root / 'agent-framework/install-manifest.json').exists())
 
 
-    def test_deepseek_executable_override(self):
-        """Specifying custom deepseek executable path overrides discovery."""
-        install_framework(
-            str(self.dest_root),
-            source=str(self.source_root),
-            deepseek_override="/custom/path/to/codex",
-        )
-        routing = json.loads((self.dest_root / "agent-framework/routing.json").read_text(encoding="utf-8"))
-        self.assertEqual(routing["providers"]["deepseek"]["executable"], "/custom/path/to/codex")
-        self.assertEqual(routing["providers"]["deepseek"]["profile"], "deepseek")
-        self.assertEqual(routing["providers"]["deepseek"]["model"], "deepseek-flash")
+    def test_fresh_install_contains_no_deepseek(self):
+        """Fresh install must produce routing v9 with only gemini and claude, no deepseek."""
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework" / "routing.json"
+        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(routing.get("version"), 9)
+        self.assertIn("gemini", routing["providers"])
+        self.assertIn("claude", routing["providers"])
+        self.assertNotIn("deepseek", routing["providers"])
 
-    def test_upgrade_injects_deepseek_preserving_customizations(self):
-        """Upgrade on older routing.json without deepseek adds deepseek while preserving existing customizations."""
-        # 1. First install
+    def test_upgrade_from_pre_v5_and_v8_removes_deepseek_and_preserves_unrelated(self):
+        """Upgrades from pre-v5 (v4) and v8 remove legacy providers.deepseek while preserving unrelated settings and quota files."""
+        # Case 1: Upgrade from pre-v5 (v4) with legacy deepseek entry
         install_framework(str(self.dest_root), source=str(self.source_root))
         routing_path = self.dest_root / "agent-framework/routing.json"
-        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        v4_data = {
+            "version": 4,
+            "providers": {
+                "gemini": {"executable": "agy", "model": "gemini-custom-ultra", "timeout_seconds": 3600},
+                "deepseek": {"executable": "codex", "model": "deepseek-flash", "profile": "deepseek"},
+                "claude": {"executable": "claude", "model": "claude-opus-5", "effort": "medium"},
+            },
+            "custom_field": "custom_v4_value",
+        }
+        routing_path.write_text(json.dumps(v4_data, indent=2), encoding="utf-8")
+        quota = self.dest_root / "agent-framework/state/claude-quota.json"
+        quota.parent.mkdir(parents=True, exist_ok=True)
+        quota.write_bytes(b'{"model":"claude-opus-5","retry_at":4070908800}')
+        original_quota = quota.read_bytes()
 
-        # 2. Simulate a pre-v5 routing file: remove deepseek, customize gemini
-        del routing["providers"]["deepseek"]
-        routing["version"] = 4
-        routing["providers"]["gemini"]["model"] = "gemini-custom-ultra"
-        routing["custom_field"] = "custom_value"
-        routing_path.write_text(json.dumps(routing, indent=2), encoding="utf-8")
-
-        # 3. Upgrade without refresh_routing
         install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
-        updated_routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        upgraded_v4 = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded_v4.get("version"), 9)
+        self.assertNotIn("deepseek", upgraded_v4["providers"])
+        self.assertEqual(upgraded_v4["providers"]["gemini"]["model"], "gemini-custom-ultra")
+        self.assertEqual(upgraded_v4["providers"]["claude"]["model"], "claude-opus-5-5")
+        self.assertEqual(upgraded_v4["custom_field"], "custom_v4_value")
+        self.assertEqual(quota.read_bytes(), original_quota)
 
-        # 4. Verify custom settings preserved and deepseek added
-        self.assertEqual(updated_routing["providers"]["gemini"]["model"], "gemini-custom-ultra")
-        self.assertEqual(updated_routing["custom_field"], "custom_value")
-        self.assertIn("deepseek", updated_routing["providers"])
-        self.assertEqual(updated_routing["providers"]["deepseek"]["model"], "deepseek-flash")
-        self.assertEqual(updated_routing["providers"]["deepseek"]["profile"], "deepseek")
-        self.assertEqual(updated_routing["providers"]["deepseek"]["api_key_env"], "DEEPSEEK_API_KEY")
+        # Case 2: Upgrade from v8 with legacy deepseek entry
+        v8_data = {
+            "version": 8,
+            "providers": {
+                "gemini": {"executable": "agy", "model": "gemini-2.5-pro", "timeout_seconds": 3600},
+                "deepseek": {"executable": "codex", "model": "deepseek-flash", "enabled": True},
+                "claude": {"executable": "/custom/claude", "model": "claude-opus-5-5", "effort": "high"},
+            },
+            "custom_v8_setting": 42,
+        }
+        routing_path.write_text(json.dumps(v8_data, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        upgraded_v8 = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded_v8.get("version"), 9)
+        self.assertNotIn("deepseek", upgraded_v8["providers"])
+        self.assertEqual(upgraded_v8["providers"]["gemini"]["model"], "gemini-2.5-pro")
+        self.assertEqual(upgraded_v8["providers"]["claude"]["executable"], "/custom/claude")
+        self.assertEqual(upgraded_v8["custom_v8_setting"], 42)
+        self.assertEqual(quota.read_bytes(), original_quota)
 
-    def test_v5_preserves_deliberate_deepseek_absence(self):
-        """The one-time v4 migration must not re-enable a v5 opt-out by removal."""
+    def test_repeated_upgrade_idempotent(self):
+        """Repeated installation on upgraded config is idempotent and does not re-add deepseek."""
         install_framework(str(self.dest_root), source=str(self.source_root))
         routing_path = self.dest_root / "agent-framework/routing.json"
-        routing = json.loads(routing_path.read_text(encoding="utf-8"))
-        del routing["providers"]["deepseek"]
-        routing["version"] = 5
-        routing_path.write_text(json.dumps(routing), encoding="utf-8")
+        first_installed_bytes = routing_path.read_bytes()
+
+        # Second install
         install_framework(str(self.dest_root), source=str(self.source_root))
-        updated = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertNotIn("deepseek", updated["providers"])
+        second_installed_bytes = routing_path.read_bytes()
+        self.assertEqual(first_installed_bytes, second_installed_bytes)
+        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(routing.get("version"), 9)
+        self.assertNotIn("deepseek", routing["providers"])
+
+    def test_retired_custom_credential_stays_filtered_after_upgrade(self):
+        from scripts.provider_runner import child_environment, deepseek_secrets
+
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        data = json.loads(routing_path.read_text(encoding="utf-8"))
+        data["version"] = 8
+        data["providers"]["deepseek"] = {"api_key_env": "CUSTOM_RETIRED_DS_KEY"}
+        data["retired_secret_env_vars"] = ["OLDER_RETIRED_KEY"]
+        routing_path.write_text(json.dumps(data), encoding="utf-8")
+
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        upgraded = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertNotIn("deepseek", upgraded["providers"])
+        self.assertEqual(upgraded["retired_secret_env_vars"],
+                         ["OLDER_RETIRED_KEY", "CUSTOM_RETIRED_DS_KEY"])
+        credentials = {"CUSTOM_RETIRED_DS_KEY": "fixture-retired-secret",
+                       "OLDER_RETIRED_KEY": "fixture-older-secret"}
+        with mock.patch.dict(os.environ, credentials):
+            for provider in ("gemini", "claude", "git"):
+                child = child_environment(upgraded, provider)
+                self.assertTrue(all(name not in child for name in credentials))
+            captured = dict(deepseek_secrets(upgraded))
+            self.assertTrue(all(captured[name] == value for name, value in credentials.items()))
+        self.assertNotIn("fixture-retired-secret", routing_path.read_text(encoding="utf-8"))
+        installed = routing_path.read_bytes()
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        self.assertEqual(routing_path.read_bytes(), installed)
+
+    def test_deepseek_cli_flag_removed(self):
+        """Passing --deepseek to install.py is rejected by argument parsing."""
+        res = subprocess.run(
+            [sys.executable, str(self.source_root / "install.py"), "--codex-home", str(self.dest_root), "--deepseek", "codex"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("unrecognized arguments", res.stderr)
 
     def test_malformed_routing_version_fails_preflight(self):
         install_framework(str(self.dest_root), source=str(self.source_root))
@@ -711,7 +849,8 @@ class TestInstallFramework(unittest.TestCase):
         routing_path = self.dest_root / "agent-framework/routing.json"
         self.assertTrue(routing_path.exists())
         routing = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertIn("deepseek", routing["providers"])
+        self.assertEqual(routing.get("version"), 9)
+        self.assertNotIn("deepseek", routing["providers"])
         self.assertIn("gemini", routing["providers"])
         self.assertIn("claude", routing["providers"])
 

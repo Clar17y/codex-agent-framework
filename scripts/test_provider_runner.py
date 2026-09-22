@@ -32,7 +32,7 @@ class ProviderTests(unittest.TestCase):
         self.config = self.root / "config.json"
         self.settings = {"providers": {
             "gemini": {"executable": [sys.executable, str(self.fake)], "model": "gemini-3.8-flash-medium", "heartbeat_seconds": 0},
-            "claude": {"executable": [sys.executable, str(self.fake)], "model": "claude-opus-5"}},
+            "claude": {"executable": [sys.executable, str(self.fake)], "model": "claude-opus-5-5"}},
             "timeout_seconds": 5,
             "heartbeat_seconds": 0}
         self.args = argparse.Namespace(role="implement", workspace=str(self.root), task_file=str(self.task),
@@ -553,11 +553,66 @@ class ProviderTests(unittest.TestCase):
         first, code = self.run_provider()
         self.assertEqual(code, 20)
         self.assertFalse(first["cached"])
-        self.assertEqual(first["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertEqual(first["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
         self.settings["providers"]["gemini"]["executable"] = "not-a-real-program"
         second, code = self.run_provider()
         self.assertEqual(code, 20)
         self.assertTrue(second["cached"])
+
+    def test_gemini_quota_fallback_direct_to_luna_with_legacy_deepseek_configurations(self):
+        """Gemini quota fallback unconditionally routes directly to gpt-6-luna medium across enabled, disabled, and missing DeepSeek configs."""
+        expected_luna = {"model": "gpt-6-luna", "effort": "medium"}
+
+        # 1. Direct unit test of runner.quota_fallback with legacy config variations
+        configs = [
+            # enabled legacy deepseek
+            {"providers": {"gemini": {}, "deepseek": {"enabled": True, "model": "deepseek-flash"}}},
+            # disabled legacy deepseek
+            {"providers": {"gemini": {}, "deepseek": {"enabled": False, "model": "deepseek-flash"}}},
+            # missing deepseek
+            {"providers": {"gemini": {}, "claude": {}}},
+            # None config
+            None,
+        ]
+        for cfg in configs:
+            with self.subTest(config=cfg):
+                self.assertEqual(runner.quota_fallback("gemini", cfg), expected_luna)
+
+        # 2. End-to-end provider run with simulated quota exhaustion across legacy config states
+        self.fake_result({"error": {"code": "QUOTA_EXHAUSTED", "message": "Daily quota exhausted"}})
+
+        # 2a. Legacy DeepSeek enabled
+        self.settings["providers"]["deepseek"] = {
+            "enabled": True,
+            "executable": [sys.executable, str(self.fake)],
+            "model": "deepseek-flash",
+        }
+        res_enabled, code_enabled = self.run_provider()
+        self.assertEqual(code_enabled, 20)
+        self.assertEqual(res_enabled["status"], "fallback_required")
+        self.assertEqual(res_enabled["fallback"], expected_luna)
+
+        # Clear quota file between runs
+        quota_file = self.root / "state" / "gemini-quota.json"
+        if quota_file.exists():
+            quota_file.unlink()
+
+        # 2b. Legacy DeepSeek disabled
+        self.settings["providers"]["deepseek"]["enabled"] = False
+        res_disabled, code_disabled = self.run_provider()
+        self.assertEqual(code_disabled, 20)
+        self.assertEqual(res_disabled["status"], "fallback_required")
+        self.assertEqual(res_disabled["fallback"], expected_luna)
+
+        if quota_file.exists():
+            quota_file.unlink()
+
+        # 2c. DeepSeek missing
+        self.settings["providers"].pop("deepseek", None)
+        res_missing, code_missing = self.run_provider()
+        self.assertEqual(code_missing, 20)
+        self.assertEqual(res_missing["status"], "fallback_required")
+        self.assertEqual(res_missing["fallback"], expected_luna)
 
     def test_plain_terminal_quota_fallback(self):
         self.fake.write_text("import sys\nprint('Error: daily usage limit reached',file=sys.stderr)\nsys.exit(1)", encoding="utf-8")
@@ -651,7 +706,7 @@ class ProviderTests(unittest.TestCase):
     def test_provider_timing_default_is_gemini_specific(self):
         config = {"providers": {
             "gemini": {"model": "gemini-3.8-flash-medium"},
-            "claude": {"model": "claude-opus-5"},
+            "claude": {"model": "claude-opus-5-5"},
             "deepseek": {"model": "deepseek-flash"},
         }}
         self.assertEqual(runner.provider_timing(config, "gemini")[0], 3600)
@@ -663,7 +718,7 @@ class ProviderTests(unittest.TestCase):
 
     def test_packaged_global_timeout_remains_authoritative_for_claude_and_deepseek(self):
         config = {"timeout_seconds": 900, "providers": {
-            "claude": {"model": "claude-opus-5"},
+            "claude": {"model": "claude-opus-5-5"},
             "deepseek": {"model": "deepseek-flash"},
         }}
         self.assertEqual(runner.provider_timing(config, "claude")[0], 900)
@@ -831,10 +886,10 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("--permission-prompts", command)
         self.assertIn("--strict-mcp-config", command)
         self.assertNotIn("--fallback-model", command)
-        self.assertEqual(command[command.index("--model") + 1], "claude-opus-5")
+        self.assertEqual(command[command.index("--model") + 1], "claude-opus-5-5")
         self.assertEqual(command[command.index("--effort") + 1], "medium")
         self.assertFalse((self.root / "state").exists())
-        for forbidden in ("sonnet", "fable", "opus"):
+        for forbidden in ("sonnet", "fable", "opus", "claude-opus-5", "claude-sonnet-5", "claude-fable-5"):
             self.settings["providers"]["claude"]["model"] = forbidden
             with self.assertRaises(ValueError):
                 self.run_provider()
@@ -920,6 +975,19 @@ class ProviderTests(unittest.TestCase):
         self.fake_result({"type": "result", "is_error": True, "result": "You've hit your Sonnet limit"})
         result, code = self.run_provider()
         self.assertEqual((result["status"], code), ("provider_error", 1))
+
+    def test_legacy_opus_quota_still_blocks_upgraded_review_without_spawn(self):
+        self.args.role = "review"
+        quota = self.root / "state/claude-quota.json"
+        runner.write_json(quota, {"provider": "claude", "model": "claude-opus-5",
+                                  "retry_at": time.time() + 3600})
+        original = quota.read_bytes()
+        with mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("must not launch")):
+            result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("fallback_required", 20))
+        self.assertEqual(result["model"], "claude-opus-5-5")
+        self.assertEqual(result["fallback"], {"model": "gpt-6-astra", "effort": "low"})
+        self.assertEqual(quota.read_bytes(), original)
 
     def test_cli_quota_set_and_status_without_task(self):
         runner.write_json(self.config, self.settings)
@@ -1647,7 +1715,7 @@ class ProviderTests(unittest.TestCase):
 
         self.assertEqual(code, 20)
         self.assertEqual(result["status"], "fallback_required")
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
         self.assertFalse(sentinel.exists(), "CLI process must NOT be spawned when balance is depleted")
 
         # Balance snapshot records depleted status
@@ -1669,7 +1737,7 @@ class ProviderTests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertEqual(result["status"], "balance_check_failed")
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
         self.assertIn("not set or empty", result["error"])
         self.assertFalse(sentinel.exists(), "CLI process must NOT be spawned when API key is missing")
 
@@ -1689,7 +1757,7 @@ class ProviderTests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertEqual(result["status"], "balance_check_failed")
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
         self.assertIn("HTTP 500", result["error"])
         self.assertFalse(sentinel.exists(), "CLI process must NOT be spawned when balance query returns HTTP 500")
 
@@ -1745,7 +1813,7 @@ class ProviderTests(unittest.TestCase):
             with mock.patch.object(runner, "query_deepseek_balance", return_value=(available, None)):
                 result, code = self.run_provider()
         self.assertEqual((result["status"], code), ("fallback_required", 20))
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
         self.assertNotIn("fallback_blocked_by_pending", result)
         self.assertEqual(runner.read_json(self.pending_path)["status"], "resolved")
         self.assertFalse(runner.read_json(runner.balance_path(Path(self.args.state_dir)))["is_available"])
@@ -1778,7 +1846,7 @@ class ProviderTests(unittest.TestCase):
                 result, code = self.run_provider()
 
         self.assertEqual((result["status"], code), ("provider_error", 1))
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
         self.assertTrue(runner.read_json(runner.balance_path(Path(self.args.state_dir)))["is_available"])
         self.assertEqual(runner.read_json(self.pending_path)["status"], "resolved")
 
@@ -1842,7 +1910,7 @@ class ProviderTests(unittest.TestCase):
         self.assertFalse(result["fallback_authorized"])
         self.assertTrue(result["fallback_blocked_by_pending"])
 
-    def test_gemini_quota_exhaustion_points_to_deepseek_when_configured(self):
+    def test_gemini_quota_exhaustion_ignores_legacy_deepseek_when_configured(self):
         self.settings["providers"]["deepseek"] = {
             "executable": "codex",
             "profile": "deepseek",
@@ -1851,7 +1919,7 @@ class ProviderTests(unittest.TestCase):
         self.fake_result({"error": {"code": "QUOTA_EXHAUSTED", "message": "Daily quota exhausted"}})
         result, code = self.run_provider()
         self.assertEqual(code, 20)
-        self.assertEqual(result["fallback"], {"provider": "deepseek", "model": "deepseek-flash"})
+        self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
 
     def test_gemini_non_quota_error_without_terminal_envelope_stays_uncertain(self):
         self.settings["providers"]["deepseek"] = {
@@ -1875,7 +1943,7 @@ class ProviderTests(unittest.TestCase):
         )
         result, code = self.run_provider()
         self.assertEqual((result["status"], code), ("provider_error", 1))
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
         self.assertNotIn("fallback_blocked_by_pending", result)
         self.assertEqual(runner.read_json(self.pending_path)["status"], "resolved")
 
@@ -1909,7 +1977,7 @@ class ProviderTests(unittest.TestCase):
                 result, code = self.run_provider()
         self.assertEqual(code, 1)
         self.assertEqual(result["status"], "blocked_pending_run")
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
 
         # Disjoint path runs successfully
         self.fake.write_text(
@@ -2248,7 +2316,7 @@ class ProviderTests(unittest.TestCase):
 
             self.assertEqual(code, 1)
             self.assertEqual(result["status"], "provider_error")
-            self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+            self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
 
             # Because output was terminal, pending state IS safely resolved
             pending_record = runner.read_json(self.pending_path)
@@ -2388,7 +2456,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(result["status"], "state_error")
         self.assertEqual(result["available_to_try"], 0)
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
         self.assertIn("Malformed or unreadable", result["error"])
 
     def test_deepseek_secret_non_disclosure_error_paths(self):
@@ -2471,7 +2539,7 @@ class ProviderTests(unittest.TestCase):
         self.assertIn("--verbose", cmd)
         self.assertNotIn("--include-partial-messages", cmd)
         self.assertNotIn("--stream-tokens", cmd)
-        self.assertEqual(cmd[cmd.index("--model") + 1], "claude-opus-5")
+        self.assertEqual(cmd[cmd.index("--model") + 1], "claude-opus-5-5")
         self.assertEqual(cmd[cmd.index("--effort") + 1], "medium")
         self.assertIn("--no-session-persistence", cmd)
         self.assertIn("--dangerously-skip-permissions", cmd)
@@ -2971,7 +3039,7 @@ class ProviderTests(unittest.TestCase):
             with mock.patch.object(runner, "query_deepseek_balance", return_value=(avail, None)):
                 result, code = self.run_provider()
         self.assertEqual((result["status"], code), ("provider_error", 1))
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
 
         # 4. DeepSeek Runtime 402 Insufficient Balance
         self.args.state_dir = str(self.root / "state-ds-402")
@@ -2985,7 +3053,7 @@ class ProviderTests(unittest.TestCase):
             with mock.patch.object(runner, "query_deepseek_balance", return_value=(avail, None)):
                 result, code = self.run_provider()
         self.assertEqual((result["status"], code), ("fallback_required", 20))
-        self.assertEqual(result["fallback"], {"model": "gpt-5.6-luna", "effort": "medium"})
+        self.assertEqual(result["fallback"], {"model": "gpt-6-luna", "effort": "medium"})
 
     def test_timeout_state_all_providers(self):
         """Timeout marks adapter state as timeout in progress.json and heartbeat.json for all providers."""

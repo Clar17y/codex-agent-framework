@@ -1,7 +1,7 @@
 name = "planner"
 description = "Implementation planner for decomposing non-trivial work into owned, testable tasks with explicit dependencies and acceptance criteria."
-model = "gpt-5.6-sol"
-model_reasoning_effort = "low"
+model = "gpt-6-sol"
+model_reasoning_effort = "medium"
 sandbox_mode = "read-only"
 developer_instructions = """
 Do not edit files. Inspect enough of the repository to produce an executable plan rather than a generic checklist.

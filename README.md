@@ -1,22 +1,22 @@
 # Codex Agent Framework
 
-Multi-provider orchestration framework coordinating Gemini Flash, DeepSeek Flash, and Claude Code under OpenAI Codex with fail-closed fallback routing, live quota caching, and process isolation.
+Multi-provider orchestration framework coordinating Gemini Flash and Claude Code under OpenAI Codex with fail-closed fallback routing, live quota caching, and process isolation.
 
 [![CI](https://github.com/Clar17y/codex-agent-framework/actions/workflows/tests.yml/badge.svg)](https://github.com/Clar17y/codex-agent-framework/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## What this is
 
-This framework integrates external AI developer CLI tools—Google Antigravity (`agy`), DeepSeek Flash via OpenAI Codex CLI (`codex`), and Anthropic Claude Code CLI (`claude`)—into an OpenAI Codex development environment. It routes implementation tasks through a deterministic three-tier chain (Gemini Flash to DeepSeek Flash to native Luna medium) and independent code reviews through Claude Opus 5 with native Astra low fallback (restricted to read and search tools, with shell execution, file edits, and MCP excluded). All execution runs through a local Python orchestration runner that coordinates file-level concurrency, enforces live monetary preflight checks, caches terminal quota exhaustion, and isolates credentials across child subprocesses. Ownership coordination and quota state are local to one machine and do not coordinate writers across separate computers or network-mounted workspaces.
+This framework integrates external AI developer CLI tools—Google Antigravity (`agy`) and Anthropic Claude Code CLI (`claude`)—into an OpenAI Codex development environment. It routes implementation tasks primarily through Gemini Flash falling back directly to native Luna medium (`gpt-6-luna`), and independent code reviews through Claude Opus 5.5 with native Astra low fallback (restricted to read and search tools, with shell execution, file edits, and MCP excluded). All execution runs through a local Python orchestration runner that coordinates file-level concurrency, caches terminal quota exhaustion, and isolates credentials across child subprocesses. Ownership coordination and quota state are local to one machine and do not coordinate writers across separate computers or network-mounted workspaces.
 
 ## Design highlights
 
-- **Deterministic fail-closed fallback chain**: Implementation tasks route primarily to Gemini Flash (`gemini-3.8-flash-medium`), fall back upon quota exhaustion to DeepSeek Flash v4.1 (`deepseek-flash`), and transition to native Luna medium (`gpt-5.6-luna`) on DeepSeek balance depletion or non-quota failure.
-- **Live monetary preflight and atomic quota caching**: DeepSeek invocations require a real-time `GET /user/balance` preflight using standard library `urllib` without redirection, failing closed before model launch if balance is depleted, while Gemini and Claude quota states are cached atomically with provider reset times or cooldowns.
-- **Subprocess credential isolation**: Child environments for Gemini and Claude explicitly strip `DEEPSEEK_API_KEY` (and configured provider key names), Git subprocesses strip variables matching known secrets, and DeepSeek subprocesses enforce shell secret exclusion (`shell_environment_policy.ignore_default_excludes=false`). Credential isolation and artifact redaction are defense in depth, not a hard same-user process-containment boundary.
+- **Deterministic fail-closed fallback chain**: Implementation tasks route primarily to Gemini Flash (`gemini-3.8-flash-medium`) and fall back directly upon quota exhaustion or non-quota failure to native Luna medium (`gpt-6-luna`).
+- **Atomic quota caching**: Gemini and Claude quota states are cached atomically with provider reset times or cooldowns. Legacy DeepSeek balance preflight and caching internals are retained for backward compatibility.
+- **Subprocess credential isolation**: Credential isolation and artifact redaction are defense in depth, not a hard same-user process-containment boundary.
 - **Retained-artifact secret redaction**: Retained execution logs (`prompt.txt`, `stdout.log`, `stderr.log`, `last_message.txt`, `provider.log`, `progress.json`, `heartbeat.json`, `status.txt`, `diff.txt`, `head.txt`) in workspace `.llm-output/` are scanned via full-file memory maps (`mmap`) and rewritten using bounded 64 KB copy chunks with atomic replacement (falling back to single-link in-place rewriting for locked Windows file handles). `result.json` is sanitized separately in memory before being written to disk.
 - **Granular path-ownership claims and pending-run locking**: Cooperating implementation workers register hierarchical file or directory paths under a short coordination lock, preventing concurrent conflicting writers on identical or ancestor/descendant files while preserving pending records after abnormal termination until explicit operator resolution. Coordination is local to one machine and does not coordinate writers across computers or network-mounted workspaces.
-- **Bounded-memory stream telemetry parsing**: CLI lifecycle events across Gemini (`stream-json`), Claude (`stream-json`), and DeepSeek (`--json`) are parsed using an incremental raw-byte reader in 64 KB chunks up to 1 MB per line, emitting rate-limited stderr progress and evaluating terminal success from a bounded tail buffer without accumulating multi-megabyte transcripts in memory.
+- **Bounded-memory stream telemetry parsing**: CLI lifecycle events across Gemini (`stream-json`) and Claude (`stream-json`) are parsed using an incremental raw-byte reader in 64 KB chunks up to 1 MB per line, emitting rate-limited stderr progress and evaluating terminal success from a bounded tail buffer without accumulating multi-megabyte transcripts in memory.
 
 ## Provider routing chain
 
@@ -27,29 +27,18 @@ flowchart TD
         PendingCheck -- "Yes" --> Blocked["Blocked (exit 1 / blocked_pending_run)<br/>Halts until operator resolution"]
         PendingCheck -- "No" --> GeminiCheck{"Check local quota cache"}
         GeminiCheck -- "Available" --> Gemini["Primary: gemini-3.8-flash-medium"]
-        GeminiCheck -- "Quota exhausted" --> DeepSeekCheck{"DeepSeek enabled & configured?"}
+        GeminiCheck -- "Quota exhausted" --> Luna["Native fallback: native Luna medium (gpt-6-luna)"]
 
         Gemini -- "Success" --> Done["Done"]
-        Gemini -- "Terminal quota exhaustion" --> RecordGemini["Record quota in gemini-quota.json"] --> DeepSeekCheck
-        Gemini -- "Non-quota error / failure" --> Luna["Native fallback: native Luna medium (gpt-5.6-luna)"]
-
-        DeepSeekCheck -- "No / Disabled" --> Luna
-        DeepSeekCheck -- "Yes" --> Preflight{"Live balance preflight<br/>GET /user/balance"}
-
-        Preflight -- "Available (balance > 0)" --> DeepSeek["Tier 2: deepseek-flash"]
-        Preflight -- "Exhausted / zero balance (402)" --> RecordBalance["Record zero balance"] --> Luna
-        Preflight -- "Auth / network / check failed" --> Luna
-
-        DeepSeek -- "Success" --> Done
-        DeepSeek -- "Runtime 402 / depletion" --> RecordRuntime["Record balance snapshot"] --> Luna
-        DeepSeek -- "Non-quota error / timeout" --> Luna
+        Gemini -- "Terminal quota exhaustion" --> RecordGemini["Record quota in gemini-quota.json"] --> Luna
+        Gemini -- "Non-quota error / failure" --> Luna
 
         Luna --> Done
     end
 
     subgraph Review["Review Chain"]
         ReviewStart["Task: Independent Review"] --> ClaudeCheck{"Check local quota cache"}
-        ClaudeCheck -- "Available" --> Claude["Primary: claude-opus-5"]
+        ClaudeCheck -- "Available" --> Claude["Primary: claude-opus-5-5"]
         ClaudeCheck -- "Quota exhausted" --> Astra["Native fallback: native Astra low (reviewer)"]
 
         Claude -- "Success" --> ReviewDone["Done"]
@@ -62,12 +51,18 @@ flowchart TD
 
 ## Evidence
 
-- **Offline test suite**: 192 unit tests executed across [`scripts/test_provider_runner.py`](scripts/test_provider_runner.py) and [`scripts/test_install.py`](scripts/test_install.py) with 0 failures, 0 errors, and platform-dependent skips. Tests use temporary installation roots and mock CLI processes under `.llm-output/` without consuming provider tokens or live credentials. These offline checks do not prove provider authentication, pinned-model availability, or role discovery in a live Codex host.
+The current native roles use GPT-6 Luna for focused work and GPT-6 Sol for complex implementation, planning and correctness checks. Independent review uses Claude Opus 5.5. See the [dated model routing rationale](docs/MODEL_ROUTING.md) for sources, effort choices and evaluation limits.
+
+- **Offline test suite**: 198 unit tests executed across [`scripts/test_provider_runner.py`](scripts/test_provider_runner.py) and [`scripts/test_install.py`](scripts/test_install.py) with 0 failures, 0 errors, and platform-dependent skips. Tests use temporary installation roots and mock CLI processes under `.llm-output/` without consuming provider tokens or live credentials. These offline checks do not prove provider authentication, pinned-model availability, or role discovery in a live Codex host.
 - **Continuous integration matrix**: Multi-platform GitHub Actions workflow at [`.github/workflows/tests.yml`](.github/workflows/tests.yml) executing test discovery and git patch whitespace validation across three platforms: `ubuntu-latest`, `windows-latest`, and `macos-latest` on Python 3.11.
 - **Release history**: Existing release tags present in the repository include `v4.1.0`, `v4.1.1`, `v4.1.2`, `v4.2.0`, and `v5.0.0`.
 - **Historical benchmarks**: Supplied evaluation data from the v3 architecture is preserved in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) as historical reference data; it does not represent measurements of current Gemini or Claude models.
 
 ## Install
+
+The Opus 5.5 review route requires **Claude Code 2.1.280 or later**. Check `claude --version`; use `claude update` or the package manager reported by that command to upgrade. If the supported executable is outside PATH, pass its path with the installer's `--claude` option.
+
+Ordinary installation migrates the exact pre-v8 packaged `claude-opus-5` pin to `claude-opus-5-5` while preserving unrelated routing settings and quota state. The v9 migration removes pre-v9 DeepSeek provider entries and retains custom credential names only as filtering metadata. Custom Claude model values remain intact; the review runner requires the exact supported pin and rejects other models. A current-version override is not silently migrated again.
 
 You need **Python 3.11+**, Git, and Codex signed into your account. If Python is missing or older, install a current version from [python.org](https://www.python.org/downloads/) and reopen your terminal.
 
@@ -108,10 +103,9 @@ The installer enforces lexical path checks, refusing linked source or target pat
 
 ### Connect external provider CLIs
 
-Install and sign into the **Antigravity CLI (`agy`)**, **Codex CLI (`codex`)** for DeepSeek, and **Claude Code CLI (`claude`)**, following their official documentation:
+Install and sign into the **Antigravity CLI (`agy`)** and **Claude Code CLI (`claude`)**, following their official documentation:
 
 - [Antigravity installation and authentication](https://www.antigravity.google/docs/cli/install/)
-- [OpenAI Codex CLI setup](https://learn.chatgpt.com/docs/codex-cli) (uses profile `deepseek` and `DEEPSEEK_API_KEY` for DeepSeek Flash v4.1)
 - [Claude Code quickstart](https://code.claude.com/docs/en/quickstart)
 
 The framework installer does not install provider binaries or transfer authentication credentials. Native roles can be installed even when a provider CLI is absent. Once the provider tools are installed and on your `PATH`, refresh routing:
@@ -119,7 +113,6 @@ The framework installer does not install provider binaries or transfer authentic
 - **macOS / Linux**:
   ```bash
   command -v agy
-  command -v codex
   command -v claude
   python3 install.py --refresh-routing
   ```
@@ -130,56 +123,14 @@ The framework installer does not install provider binaries or transfer authentic
 
 If a CLI binary is outside your system `PATH`, supply its explicit path:
 ```bash
-python3 install.py --gemini "$HOME/.local/bin/agy" --deepseek "$HOME/.local/bin/codex" --claude "$HOME/.local/bin/claude"
+python3 install.py --gemini "$HOME/.local/bin/agy" --claude "$HOME/.local/bin/claude"
 ```
 
-### Configure the DeepSeek Codex profile
+### Legacy provider compatibility
 
-The framework references a user-level Codex profile named `deepseek`; the installer does not create or overwrite user Codex profiles. Profile files reside next to `config.toml` under `$CODEX_HOME` (defaulting to `~/.codex/deepseek.config.toml`). Create or merge the following configuration:
+DeepSeek has been retired from active framework routing in v9. Any preexisting user Codex profiles (`deepseek.config.toml`) or environment credentials (`DEEPSEEK_API_KEY`) on your machine remain untouched. Legacy adapter internals and balance verification logic are retained for compatibility, but DeepSeek is no longer configured, offered, or automatically recommended for active tasks.
 
-```toml
-model = "deepseek-flash"
-model_provider = "deepseek"
-model_reasoning_effort = "high"
-web_search = "disabled"
-
-[model_providers.deepseek]
-name = "DeepSeek"
-base_url = "https://api.deepseek.com/"
-wire_api = "responses"
-env_key = "DEEPSEEK_API_KEY"
-env_key_instructions = "Set DEEPSEEK_API_KEY before starting Codex."
-```
-
-This configuration aligns with the [OpenAI configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference): provider settings are user-level, profile files are selected with `--profile`, and `env_key` identifies the environment variable containing the secret. Never paste API keys directly into TOML files. Do not add a `sandbox_mode` setting to this profile; the adapter's `--approve-for-me` flag automatically selects the workspace-write sandbox.
-
-Ensure `DEEPSEEK_API_KEY` is exported in the environment from which Codex is launched. Run these non-inference checks:
-
-- **macOS / Linux**:
-  ```bash
-  if [ -z "${DEEPSEEK_API_KEY:-}" ]; then echo "DEEPSEEK_API_KEY is not visible" >&2; else echo "DEEPSEEK_API_KEY is visible"; fi
-  codex --profile deepseek debug prompt-input "profile validation" >/dev/null
-  python3 "$HOME/.codex/agent-framework/scripts/provider_runner.py" status \
-    --provider deepseek --check-live \
-    --config "$HOME/.codex/agent-framework/routing.json"
-  ```
-- **Windows (PowerShell)**:
-  ```powershell
-  if (-not $env:DEEPSEEK_API_KEY) { Write-Error "DEEPSEEK_API_KEY is not visible" } else { Write-Host "DEEPSEEK_API_KEY is visible" }
-  codex --profile deepseek debug prompt-input "profile validation" | Out-Null
-  $frameworkRoot = Join-Path $HOME '.codex/agent-framework'
-  python "$frameworkRoot/scripts/provider_runner.py" status --provider deepseek --check-live --config "$frameworkRoot/routing.json"
-  ```
-
-The first command confirms profile loading without invoking the model. The second command queries DeepSeek's balance endpoint; expect `available_to_try` only when the key is valid and account balance is positive.
-
-An optional end-to-end smoke test can be executed, but note that **this smoke test incurs paid API token costs**:
-```bash
-codex exec --profile deepseek --model deepseek-flash --sandbox read-only --ephemeral \
-  "Reply with exactly OK. Do not call tools."
-```
-
-The installed routing preserves Gemini `gemini-3.8-flash-medium` as primary implementer, DeepSeek Flash v4.1 under the local `deepseek-flash` alias as quota fallback, Claude `claude-opus-5` with medium review effort by default, and native fallback roles (`gpt-5.6-luna` medium for implementation; Astra low for review). Installation does not guarantee that these models are activated on your external accounts.
+The installed routing preserves Gemini `gemini-3.8-flash-medium` as primary implementer, falling back directly to native Luna medium (`gpt-6-luna`), Claude `claude-opus-5-5` with medium review effort by default, and native fallback roles (Astra low for review). Installation does not guarantee that these models are activated on your external accounts.
 
 ## Command reference and usage
 
@@ -191,45 +142,38 @@ Check provider availability and cached quota state without invoking models or cr
   ```bash
   framework_root="${CODEX_HOME:-$HOME/.codex}/agent-framework"
   python3 "$framework_root/scripts/provider_runner.py" status --provider gemini --config "$framework_root/routing.json"
-  python3 "$framework_root/scripts/provider_runner.py" status --provider deepseek --config "$framework_root/routing.json"
   python3 "$framework_root/scripts/provider_runner.py" status --provider claude --config "$framework_root/routing.json"
   ```
 - **Windows (PowerShell)**:
   ```powershell
   $frameworkRoot = Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }) 'agent-framework'
   python "$frameworkRoot/scripts/provider_runner.py" status --provider gemini --config "$frameworkRoot/routing.json"
-  python "$frameworkRoot/scripts/provider_runner.py" status --provider deepseek --config "$frameworkRoot/routing.json"
   python "$frameworkRoot/scripts/provider_runner.py" status --provider claude --config "$frameworkRoot/routing.json"
   ```
 
-To perform an on-demand live balance check against DeepSeek's official `GET /user/balance` API, pass `--check-live`:
-```bash
-python3 "$framework_root/scripts/provider_runner.py" status --provider deepseek --check-live --config "$framework_root/routing.json"
-```
-
 Exit codes:
 - `0` (`available_to_try`): No cached block is active.
-- `20` (`fallback_required`): Confirmed quota exhaustion or depleted balance; routes to next tier.
-- `1` (`state_error` or `balance_check_failed`): Unverified balance or unreadable state; routes to fallback with error disclosed.
+- `20` (`fallback_required`): Confirmed quota exhaustion; routes to fallback.
+- `1` (`state_error`): Unreadable state; routes to fallback with error disclosed.
 
-Shared state files live in `agent-framework/state/` (`gemini-quota.json`, `claude-quota.json`, `deepseek-balance.json`). See [docs/FRAMEWORK.md](docs/FRAMEWORK.md) for details on quota caching.
+Shared state files live in `agent-framework/state/` (`gemini-quota.json`, `claude-quota.json`; legacy `deepseek-balance.json` is retained if present). See [docs/FRAMEWORK.md](docs/FRAMEWORK.md) for details on quota caching.
 
 ### Delegated implementation and review execution
 
 Execute tasks via the provider runner:
 
 ```bash
-# Implementation (Gemini Flash -> DeepSeek Flash -> Luna medium)
+# Implementation (Gemini Flash -> Luna medium)
 python3 "$framework_root/scripts/provider_runner.py" implement \
   --workspace "$PWD" --task-file "$PWD/.llm-output/task.json" \
   --config "$framework_root/routing.json"
 
-# Review (Claude Opus 5, routine medium effort)
+# Review (Claude Opus 5.5, routine medium effort)
 python3 "$framework_root/scripts/provider_runner.py" review \
   --workspace "$PWD" --task-file "$PWD/.llm-output/task.json" \
   --config "$framework_root/routing.json"
 
-# Review (Claude Opus 5, high effort with justified reason)
+# Review (Claude Opus 5.5, high effort with justified reason)
 python3 "$framework_root/scripts/provider_runner.py" review \
   --workspace "$PWD" --task-file "$PWD/.llm-output/task.json" \
   --config "$framework_root/routing.json" \
@@ -266,11 +210,11 @@ To update from source:
   python install.py
   ```
 
-Updates preserve custom routing configurations. Passing `--refresh-routing` resets `routing.json` from the packaged defaults and rediscovers executables; to update only a specific CLI executable while preserving the rest of your custom routing, pass `--gemini`, `--deepseek`, or `--claude` with the desired path. To restore an overwritten file, look up its snapshot under `agent-framework/backups/` as recorded in `agent-framework/install-manifest.json`. Backups are never deleted automatically.
+Updates preserve custom routing configurations. Passing `--refresh-routing` resets `routing.json` from the packaged defaults and rediscovers executables; to update only a specific CLI executable while preserving the rest of your custom routing, pass `--gemini` or `--claude` with the desired path. To restore an overwritten file, look up its snapshot under `agent-framework/backups/` as recorded in `agent-framework/install-manifest.json`. Backups are never deleted automatically.
 
 ### Stream telemetry and run artifacts
 
-Gemini, Claude, and DeepSeek runs stream CLI lifecycle events (`stream-json` / `--json`). The adapter writes raw stream records to `stdout.log`, emits throttled step/tool transitions on stderr at 15-second intervals, updates a content-minimized `progress.json`, and records periodic `heartbeat.json` snapshots (defaulting to 60 seconds) for quiet-period liveness monitoring.
+Gemini and Claude runs stream CLI lifecycle events (`stream-json`). The adapter writes raw stream records to `stdout.log`, emits throttled step/tool transitions on stderr at 15-second intervals, updates a content-minimized `progress.json`, and records periodic `heartbeat.json` snapshots (defaulting to 60 seconds) for quiet-period liveness monitoring.
 
 Progress metadata excludes prompts, model response text, tool parameters, and tool outputs. However, raw child logs (`stdout.log` and `stderr.log`) stored under `.llm-output/agent-framework/` retain complete session streams until post-execution sanitization runs; credential isolation and redaction are defense in depth, not a hard same-user process-containment boundary.
 

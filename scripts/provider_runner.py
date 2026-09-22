@@ -363,7 +363,7 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
     if role == "review":
         if provider_name != "claude":
             raise ValueError(f"Review role is Claude-only; got {provider_name}")
-        expected = "claude-opus-5"
+        expected = "claude-opus-5-5"
         if model != expected:
             raise ValueError(f"{role} requires pinned model {expected}; got {model}")
         if effort not in ("medium", "high"):
@@ -842,16 +842,11 @@ def balance_path(state_dir):
 
 
 def luna_fallback():
-    return {"model": "gpt-5.6-luna", "effort": "medium"}
+    return {"model": "gpt-6-luna", "effort": "medium"}
 
 
 def quota_fallback(provider, config=None):
     if provider == "gemini":
-        if config and isinstance(config.get("providers"), dict) and "deepseek" in config["providers"]:
-            ds = config["providers"]["deepseek"]
-            if isinstance(ds, dict) and ds.get("enabled", True) is not False:
-                model = ds.get("model", "deepseek-flash")
-                return {"provider": "deepseek", "model": model}
         return luna_fallback()
     if provider == "deepseek":
         return luna_fallback()
@@ -922,11 +917,14 @@ def _sanitize_all_secrets(text, secrets=None):
 
 
 def deepseek_secrets(config):
-    """Return configured DeepSeek credentials present in this process, never their names or values in results."""
+    """Return current/retired DeepSeek credentials for filtering, never disclose them in results."""
     providers = config.get("providers", {}) if isinstance(config, dict) else {}
     deepseek = providers.get("deepseek", {}) if isinstance(providers, dict) else {}
     configured = deepseek.get("api_key_env", "DEEPSEEK_API_KEY") if isinstance(deepseek, dict) else "DEEPSEEK_API_KEY"
     names = {"DEEPSEEK_API_KEY"}
+    retired = config.get("retired_secret_env_vars", []) if isinstance(config, dict) else []
+    if isinstance(retired, list):
+        names.update(name for name in retired if isinstance(name, str))
     if isinstance(configured, str):
         names.add(configured)
     return [(name, os.environ[name]) for name in names if os.environ.get(name) and os.environ[name].strip()]

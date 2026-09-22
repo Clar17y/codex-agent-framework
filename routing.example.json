@@ -1,5 +1,5 @@
 {
-  "version": 7,
+  "version": 9,
   "providers": {
     "gemini": {
       "executable": "agy",
@@ -8,16 +8,9 @@
       "termination_grace_seconds": 120,
       "heartbeat_seconds": 60
     },
-    "deepseek": {
-      "executable": "codex",
-      "profile": "deepseek",
-      "model": "deepseek-flash",
-      "api_key_env": "DEEPSEEK_API_KEY",
-      "heartbeat_seconds": 60
-    },
     "claude": {
       "executable": "claude",
-      "model": "claude-opus-5",
+      "model": "claude-opus-5-5",
       "effort": "medium",
       "heartbeat_seconds": 60
     }

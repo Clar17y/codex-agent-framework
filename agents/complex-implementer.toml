@@ -1,7 +1,7 @@
 name = "complex_implementer"
 description = "Escalation implementation agent for well-specified stateful, concurrent, contract-heavy, or cross-module changes."
-model = "gpt-5.6-terra"
-model_reasoning_effort = "low"
+model = "gpt-6-sol"
+model_reasoning_effort = "medium"
 sandbox_mode = "workspace-write"
 developer_instructions = """
 Explicitly own the assigned complete bounded outcome: investigation, implementation, adversarial testing, routine repairs, command waiting and interpretation, and self-review until criteria pass or a concrete blocker is escalated.

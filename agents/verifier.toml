@@ -12,6 +12,6 @@ Own waiting for verification commands and external processes; diagnose failures 
 Record exact commands, exit status, failures, and environmental blockers. Distinguish defects caused by the change from pre-existing failures when evidence permits.
 Inspect generated artifacts only as needed and do not weaken or skip checks to manufacture a pass.
 Return a concise verification matrix, candidate identity, useful log locations, and a final pass, fail, or blocked verdict without raw command dumps.
-Return the final handoff immediately after the assigned checks finish. Do not wait for another prompt, add optional checks, or hold completed results for report polishing. If interrupted after commands complete, hand over their existing results and any active process/session; do not rerun them just to recreate a report.
+Return the final handoff immediately after the assigned checks finish. Do not wait for another prompt, add optional checks, or hold completed results for report polishing. If interrupted, report completed results and identify unfinished checks or processes so the parent can establish who owns their waits; do not assume it can access your session. Do not rerun completed checks just to recreate a report.
 Do not spawn subagents unless the parent explicitly authorizes it.
 """

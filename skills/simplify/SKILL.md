@@ -11,7 +11,7 @@ Make the selected code easier to maintain without changing its observable behavi
 
 The full workflow below is coordinated by the primary agent. An implementer assigned a pre-review simplification pass uses only the three review dimensions as a local self-check:
 
-Before handing work over for independent review, inspect your own changes for reuse, clarity, and unnecessary work. Apply only justified simplifications within your assigned files, preserve observable behavior and others' edits, and rerun affected checks after any edits. Include a brief simplification summary (or state that none was warranted) and the resulting check evidence in your handoff. Perform this pass yourself; do not invoke the full $simplify workflow, spawn reviewers, or delegate this pass. This self-check does not replace explicitly required independent review or verification.
+Before handing work over for independent review, inspect your own changes for reuse, clarity, and unnecessary work. Apply only justified simplifications within your assigned files, preserve observable behavior and others' edits, and rerun affected checks after any edits. Include a brief simplification summary (or state that none was warranted) and the resulting check evidence in your handoff. Perform this pass yourself; do not invoke the full $simplify workflow, spawn reviewers, or delegate this pass. This self-check does not replace independent review or verification selected by the primary for a concrete risk or explicitly required by the task or repository.
 
 ## Establish scope
 
@@ -41,7 +41,7 @@ Small, well-understood repairs may be completed directly with focused checks. Fo
 
 Apply only evidence-backed improvements. Reject speculative abstractions, cosmetic churn, and changes whose compatibility cannot be established. Preserve API contracts, error behavior, ordering, side effects, accessibility, and security boundaries. A shorter implementation is not sufficient justification. Report consequential findings that require a separate behavior change rather than silently making it.
 
-Inspect the integrated diff and run checks appropriate to the changed behavior, honoring repository gates. Reuse credible matching evidence for unchanged inputs. Select independent review, a correctness gate or a verifier only for a named unresolved question, meaningful independence or an explicit requirement; neither a high-risk label nor this skill mandates all three.
+Inspect the integrated diff and run checks appropriate to the changed behavior, honoring repository gates. Reuse credible matching evidence for unchanged inputs. Choose initial review and verification proportionately under the framework policy. Repeat review or verification, or an extra correctness gate, needs a named unresolved question or explicit requirement; neither a high-risk label nor this skill mandates all three.
 
 For repairs after review, check the original finding, repair delta and affected invariants. Do not restart the full review/verification sequence after each edit. A second cycle exposing another defect in the same behavior requires the orchestrator to consolidate the owning component's remaining failure paths into one repair batch before continuing. Follow the framework's review and handoff discipline; never use cycle reduction to waive a real defect or required check. If no uncertainty remains after focused checks and self-review, finish. When no changes are warranted, avoid manufacturing edits or unnecessary test runs.
 

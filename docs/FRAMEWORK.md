@@ -95,6 +95,16 @@ The routing table applies when delegation is useful. The primary may implement a
 
 The primary can run checks directly. Delegate verification when it adds useful independence or substantial parallel work, not merely to obtain a fresh agent. Worker claims alone are not test evidence. Reuse credible matching evidence when relevant inputs, commands, and conditions match; do not automatically duplicate verification. Require reruns only when relevant inputs changed, evidence is missing or unreliable, explicit repository requirements mandate it, or a specific concern warrants it. Record the candidate and enough relevant input, command, configuration, and environment context to judge whether evidence still applies. For small tasks, HEAD, the scoped diff/status, and command results usually suffice. Use scoped hashes or aggregate generated-input hashes when reuse or concurrent changes warrant them; avoid exhaustive repository, dependency, ignored-file, or scratch-file inventories. Keep secrets out of records. Review output is not test evidence.
 
+### Review and repair batches
+
+Follow the mandatory [review and handoff discipline](../GLOBAL_POLICY.md#review-and-handoff-discipline). The unit of repair is an affected behavior or invariant, including its relevant callers and failure paths. Collect and adjudicate available findings before returning one batch to its owner. A second cycle exposing another related defect triggers a component-level reassessment before another patch; it is not a limit on fixing bugs.
+
+The usual shape is one complete implementation/validation handoff, one integrated review when warranted, then targeted repair checks. A follow-up contract carries the original findings, changed candidate, affected invariants and reusable evidence. Whole-change reviews, extra gates and broad reruns need a specific remaining question or explicit requirement. For example, several findings about start, retry and cleanup belong in one lifecycle repair; they should not each start a fresh reviewer/gate/verifier chain.
+
+Workers return immediately when their assigned outcome is complete. Recover a delayed report from existing command results instead of repeating completed work. Local and hosted work may overlap after their prerequisites are satisfied; required CI and release gates still determine final acceptance.
+
+These are instructions installed into the orchestrator policy, skills and roles. The provider adapter does not intercept every native-agent or GitHub review call, so this is not a runtime cap on review count. It preserves the ability to address real defects and mandatory checks.
+
 ## Lightweight records
 
 Keep useful command logs and provider-required task/result files in the active workspace's `.llm-output/`. Read saved results rather than rerunning unchanged checks. File writes are not a checklist: quick reads and successful short checks usually need no separate file.

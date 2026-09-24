@@ -20,6 +20,8 @@ This framework integrates external AI developer CLI tools—Google Antigravity (
 
 ## Provider routing chain
 
+The installed [review and handoff discipline](GLOBAL_POLICY.md#review-and-handoff-discipline) requires related findings to be repaired as one batch, a stated reason for repeat review or verification, and immediate completion handoffs. The `simplify` skill covers reuse, quality and efficiency without forcing a reviewer/gate/verifier chain. These are instruction-level constraints; the adapter does not impose a runtime review-count limit or waive required checks.
+
 ```mermaid
 flowchart TD
     subgraph Implementation["Implementation Chain"]

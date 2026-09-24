@@ -21,6 +21,8 @@ Use this skill when independent review adds meaningful confidence or is explicit
 
 ## Concurrent reviews
 
+Collect material findings in one coherent report, including related affected paths needed to repair the behavior completely. For a follow-up, review the original findings, repair delta and affected invariants while retaining prior acceptance of unchanged areas. A whole-change restart needs a material design/scope change or another concrete unresolved risk named in the contract. Substantiate runtime and API assumptions; distinguish proven defects from questions or cosmetic suggestions. Return promptly once the assigned review is complete.
+
 Independent Claude reviews may run concurrently, including in the same workspace. The adapter does not impose the Gemini ownership gates on read-only reviews. Provide a stable candidate and distinct task contracts so each review has clear scope.
 
 ## Lifecycle telemetry

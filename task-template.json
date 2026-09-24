@@ -20,7 +20,7 @@
     "CLAUDE.md"
   ],
   "known_partial_work": "Prior baseline, existing diffs, or evidence context if continuing or repairing; omit when starting fresh.",
-  "handoff": "Return completion or blocker status, candidate identity, key decisions or findings, checks or evidence assessed, residual concerns, and useful log locations without chatter or raw dumps. For implementation tasks, also include owned changed paths.",
+  "handoff": "Return immediately when the assigned outcome and checks finish, or a concrete blocker is established. Include completion or blocker status, candidate identity, key decisions or findings, checks or evidence assessed, residual concerns, and useful log locations without chatter or raw dumps. For implementation tasks, also include owned changed paths. Do not hold completed results for optional work or wait for permission to report.",
   "risk": "ordinary",
   "risk_reason": "Briefly explain risk and the chosen check/review depth; no separate risk record is needed.",
   "scope": "State the affected uses or feature flow, existing reusable components, chosen owning layer, and deliberate exclusions as applicable. Keep this concise; do not create a separate scope report.",
@@ -28,6 +28,7 @@
     "mode": "none | integrated_batch | integrated_batch_plus_correctness_gate",
     "candidate": "HEAD or commit identifier",
     "base": "Base revision when applicable",
-    "diff_path": "Saved integrated diff path when applicable"
+    "diff_path": "Saved integrated diff path when applicable",
+    "focus": "For a repeat review or extra gate, name the unresolved question or explicit requirement, related finding IDs, repair delta, affected invariants and earlier evidence to reuse. Batch related findings under one owner; a new commit alone is not a reason to restart the whole review."
   }
 }

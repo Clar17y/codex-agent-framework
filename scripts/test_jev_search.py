@@ -1,4 +1,5 @@
 """Unit tests for TypeSafe Jev semantic code search helper."""
+import errno
 import json
 import math
 import os
@@ -552,17 +553,28 @@ class TestReviewedSearchBoundaries(unittest.TestCase):
         with patch("jev_search.shutil.which", return_value="rg"), \
              patch("jev_search._inventory_command", return_value=(names, False, True)):
             result = run_inspect(self.ws, [])
+            search = run_search(self.ws, "target")
         self.assertEqual(result["status"], "partial")
         self.assertIn("unsupported_path_encoding", result["coverage"]["reasons"])
         self.assertEqual(result["files_scanned"], 1)
+        self.assertEqual(search["status"], "unavailable")
+        self.assertFalse(search["coverage"]["complete"])
+        self.assertIn("unsupported_path_encoding", search["coverage"]["reasons"])
+        self.assertEqual([item["path"] for item in search["results"]], ["safe.py"])
 
     @unittest.skipUnless(os.name == "posix" and shutil.which("rg"), "POSIX byte filenames and ripgrep required")
     def test_real_non_utf8_filename_is_skipped(self):
         (self.ws / "safe.py").write_text("def target(): pass\n", encoding="utf-8")
-        with open(os.fsencode(self.ws) + b"/bad_\xff.py", "wb") as handle:
-            handle.write(b"def unsupported(): pass\n")
+        try:
+            with open(os.fsencode(self.ws) + b"/bad_\xff.py", "wb") as handle:
+                handle.write(b"def unsupported(): pass\n")
+        except OSError as exc:
+            if exc.errno == errno.EILSEQ:
+                self.skipTest("Filesystem requires valid UTF-8 filenames")
+            raise
         result = run_search(self.ws, "target")
-        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["status"], "unavailable")
+        self.assertFalse(result["coverage"]["complete"])
         self.assertIn("unsupported_path_encoding", result["coverage"]["reasons"])
         self.assertEqual([item["path"] for item in result["results"]], ["safe.py"])
 

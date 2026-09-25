@@ -545,6 +545,55 @@ class TestReviewedSearchBoundaries(unittest.TestCase):
                        "glpat-" + "E" * 20, "xoxb-" + "F" * 20):
             self.assertTrue(contains_literal_secret(secret.encode()))
 
+    def test_unsupported_inventory_encoding_preserves_safe_files(self):
+        safe = self.ws / "safe.py"
+        safe.write_text("def target(): pass\n", encoding="utf-8")
+        names = [os.fsencode(str(safe)), b"bad_\xff.py", b"bad_\xed\xb3\xbf.py"]
+        with patch("jev_search.shutil.which", return_value="rg"), \
+             patch("jev_search._inventory_command", return_value=(names, False, True)):
+            result = run_inspect(self.ws, [])
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("unsupported_path_encoding", result["coverage"]["reasons"])
+        self.assertEqual(result["files_scanned"], 1)
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("rg"), "POSIX byte filenames and ripgrep required")
+    def test_real_non_utf8_filename_is_skipped(self):
+        (self.ws / "safe.py").write_text("def target(): pass\n", encoding="utf-8")
+        with open(os.fsencode(self.ws) + b"/bad_\xff.py", "wb") as handle:
+            handle.write(b"def unsupported(): pass\n")
+        result = run_search(self.ws, "target")
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("unsupported_path_encoding", result["coverage"]["reasons"])
+        self.assertEqual([item["path"] for item in result["results"]], ["safe.py"])
+
+    @unittest.skipUnless(shutil.which("git"), "Git required for inventory fallback")
+    def test_git_fallback_file_and_directory_scopes_are_literal_and_ignore_aware(self):
+        import subprocess
+        git = shutil.which("git")
+        subprocess.run([git, "init", "--quiet", str(self.ws)], check=True)
+        (self.ws / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
+        for directory in ("src[1]", "src1"):
+            (self.ws / directory).mkdir()
+        for name in ("tracked.py", "untracked.py", "file[1].py", "file1.py", "ignored.py", ".env"):
+            (self.ws / "src[1]" / name).write_text("def target(): pass\n", encoding="utf-8")
+        (self.ws / "src1" / "outside_scope.py").write_text("def other(): pass\n", encoding="utf-8")
+        subprocess.run([git, "--literal-pathspecs", "-C", str(self.ws), "add", "--", "src[1]/tracked.py"], check=True)
+        with patch("jev_search.shutil.which", side_effect=lambda name: git if name == "git" else None):
+            for name in ("tracked.py", "untracked.py", "file[1].py"):
+                with self.subTest(file=name):
+                    files, _, reasons = enumerate_files(self.ws, ["src[1]/" + name])
+                    self.assertEqual(files, [self.ws / "src[1]" / name])
+                    self.assertEqual(reasons, [])
+            files, _, reasons = enumerate_files(self.ws, ["src[1]"])
+            self.assertEqual({p.name for p in files}, {"tracked.py", "untracked.py", "file[1].py", "file1.py"})
+            self.assertEqual(reasons, [])
+            files, _, reasons = enumerate_files(self.ws, ["src[1]/ignored.py"])
+            self.assertEqual(files, [])
+            self.assertIn("scope_file_ignored_or_unavailable", reasons)
+            files, _, reasons = enumerate_files(self.ws, ["src[1]/.env"])
+            self.assertEqual(files, [])
+            self.assertIn("excluded_scope", reasons)
+
 
 class TestInventoryAndChunkRepair(unittest.TestCase):
     def setUp(self):

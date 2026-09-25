@@ -519,6 +519,11 @@ def _rg_base(rg: str) -> List[str]:
     return cmd
 
 
+def _git_base(git: str, workspace: Path) -> List[str]:
+    return [git, "--literal-pathspecs", "-C", str(workspace), "ls-files", "-z",
+            "--cached", "--others", "--exclude-standard", "--"]
+
+
 def enumerate_files(workspace: Path, scopes: List[str]) -> Tuple[List[Path], List[Dict[str, str]], List[str]]:
     """Ignore-aware NUL inventory; errors never trigger an unsafe manual walk."""
     files, skipped, reasons = [], [], []
@@ -554,15 +559,20 @@ def enumerate_files(workspace: Path, scopes: List[str]) -> Tuple[List[Path], Lis
             reasons.append("excluded_scope")
             continue
         if target.is_file():
-            if not rg:
+            if rg:
+                # Only one directory level, so an explicit root file never inventories the repository.
+                cmd = _rg_base(rg) + ["--max-depth", "1", str(target.parent)]
+                expected_name = os.fsencode(str(target))
+            elif git and (workspace / ".git").exists():
+                cmd = _git_base(git, workspace) + [rel_target.as_posix()]
+                expected_name = os.fsencode(rel_target.as_posix())
+            else:
                 reasons.append("scope_file_inventory_unavailable")
                 continue
-            # Only one directory level, so an explicit root file never inventories the repository.
-            cmd = _rg_base(rg) + ["--max-depth", "1", str(target.parent)]
             names, incomplete, valid = _inventory_command(cmd, MAX_ENUMERATED_FILES, cwd=workspace, deadline=inventory_deadline)
             if incomplete:
                 reasons.append("inventory_incomplete")
-            if not valid or os.fsencode(str(target)) not in names:
+            if not valid or expected_name not in names:
                 reasons.append("scope_file_ignored_or_unavailable")
                 continue
             names = [os.fsencode(str(target))]
@@ -571,7 +581,7 @@ def enumerate_files(workspace: Path, scopes: List[str]) -> Tuple[List[Path], Lis
             if rg:
                 cmd, base = _rg_base(rg) + [str(target)], workspace
             elif git and (workspace / ".git").exists():
-                cmd = [git, "-C", str(workspace), "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", str(rel_target)]
+                cmd = _git_base(git, workspace) + [rel_target.as_posix()]
                 base = workspace
             else:
                 reasons.append("inventory_tool_unavailable")
@@ -586,7 +596,13 @@ def enumerate_files(workspace: Path, scopes: List[str]) -> Tuple[List[Path], Lis
             reasons.append("nonregular_scope")
             continue
         for name in names:
-            path = base / os.fsdecode(name)
+            try:
+                decoded_name = os.fsdecode(name)
+                decoded_name.encode("utf-8")
+            except UnicodeError:
+                reasons.append("unsupported_path_encoding")
+                continue
+            path = base / decoded_name
             if len(seen) >= MAX_ENUMERATED_FILES:
                 reasons.append("file_enumeration_limit")
                 break

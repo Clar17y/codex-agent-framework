@@ -427,7 +427,7 @@ if __name__ == "__main__":
 class TestAdversarialSearch(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.ws = Path(self.tmp.name)
+        self.ws = Path(self.tmp.name).resolve()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -479,7 +479,7 @@ class TestAdversarialSearch(unittest.TestCase):
 class TestReviewedSearchBoundaries(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.ws = Path(self.tmp.name)
+        self.ws = Path(self.tmp.name).resolve()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -549,7 +549,7 @@ class TestReviewedSearchBoundaries(unittest.TestCase):
 class TestInventoryAndChunkRepair(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.ws = self.root / ".llm-output" / "jev-smoke"
         self.ws.mkdir(parents=True)
 

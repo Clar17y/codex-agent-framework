@@ -59,7 +59,7 @@ A signal is not a verified vulnerability. Low scores do not waive existing revie
 
 ## Verification and limits
 
-Run all offline checks with:
+Install Git and ripgrep on `PATH`, then run all offline checks with:
 
 ```text
 python -m unittest discover -s scripts -p "test_*.py"

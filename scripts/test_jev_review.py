@@ -23,7 +23,7 @@ index 123..456 100644
 class TestReview(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.ws = Path(self.tmp.name)
+        self.ws = Path(self.tmp.name).resolve()
         (self.ws / "diff.txt").write_text(DIFF, encoding="utf-8")
 
     def tearDown(self):
@@ -118,7 +118,7 @@ if __name__ == "__main__":
 class TestReviewedDiffBoundaries(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.ws = Path(self.tmp.name)
+        self.ws = Path(self.tmp.name).resolve()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -198,7 +198,7 @@ class TestReviewedDiffBoundaries(unittest.TestCase):
 class TestFileBlockDisclosureBoundary(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.ws = Path(self.tmp.name)
+        self.ws = Path(self.tmp.name).resolve()
 
     def tearDown(self):
         self.tmp.cleanup()

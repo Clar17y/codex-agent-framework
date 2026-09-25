@@ -107,6 +107,8 @@ These are instructions installed into the orchestrator policy, skills and roles.
 
 ## Lightweight records
 
+Optional `jev-search` and `jev-review` capabilities use the same Python runtime and the TypeSafe API. Search retains raw candidates internally and returns compact source evidence; review returns advisory diff signals. The primary/native explorer prepares this evidence before provider delegation. These tools do not change routing, ownership, quota state, required checks or acceptance. Remote calls require saved exact-workspace authorization under `capabilities.jev` or an already-authorized invocation with `--allow-remote`. `TYPESAFE_API_KEY` is excluded from execution-provider child environments and registered for retained-artifact redaction. See [Jev usage](JEV.md).
+
 Keep useful command logs and provider-required task/result files in the active workspace's `.llm-output/`. Read saved results rather than rerunning unchanged checks. File writes are not a checklist: quick reads and successful short checks usually need no separate file.
 
 For a small task, conversation and PR notes are enough. If continuity or handoff needs a durable scratch record, prefer one `run.md` containing scope, decisions, material findings, and check results. The templates in `docs/` are optional aids for larger work; omit unused fields and do not automatically create a repo map, decisions file, brief, validation manifest, metrics file, and worker report. Collect metrics only when useful for diagnosing workflow cost or requested by the user.

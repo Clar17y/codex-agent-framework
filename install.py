@@ -85,9 +85,12 @@ def collect_sources(source):
     """Explicit core files make incomplete source packages fail before mutation."""
     names = ['GLOBAL_POLICY.md', 'task-template.json', 'README.md',
              'routing.example.json', 'install.py', 'scripts/provider_runner.py',
-             'scripts/test_provider_runner.py', 'scripts/test_install.py', 'docs/FRAMEWORK.md']
+             'scripts/test_provider_runner.py', 'scripts/test_install.py', 'docs/FRAMEWORK.md',
+             'scripts/jev_client.py', 'scripts/jev_search.py', 'scripts/jev_review.py',
+             'scripts/test_jev_client.py', 'scripts/test_jev_search.py', 'scripts/test_jev_review.py']
     names += [f'agents/{name}.toml' for name in ROLE_FILES]
-    names += [f'skills/{name}/SKILL.md' for name in ('ask-gemini', 'ask-claude', 'simplify')]
+    names += [f'skills/{name}/SKILL.md' for name in ('ask-gemini', 'ask-claude', 'simplify',
+                                                  'jev-search', 'jev-review')]
     # Optional maintained templates, never recursive installation of state or logs.
     names += [p.relative_to(source).as_posix() for p in (source / 'docs').glob('*')
               if p.suffix in ('.md', '.json')]
@@ -210,6 +213,18 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
             config['version'] = 9
     else:
         config['version'] = 9
+    # Optional capabilities have their own defaults; adding one never enables
+    # remote source disclosure or overwrites saved workspace choices on upgrade.
+    defaults = source_example if preserving else config
+    capabilities = config.setdefault('capabilities', {})
+    if not isinstance(capabilities, dict):
+        raise PreflightError('Routing capabilities must be an object.')
+    jev_defaults = defaults.get('capabilities', {}).get('jev', {})
+    jev = capabilities.setdefault('jev', {})
+    if not isinstance(jev, dict):
+        raise PreflightError('Routing capabilities.jev must be an object.')
+    for key, value in jev_defaults.items():
+        jev.setdefault(key, value)
     return config
 
 

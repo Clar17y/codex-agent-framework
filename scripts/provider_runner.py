@@ -930,10 +930,19 @@ def deepseek_secrets(config):
     return [(name, os.environ[name]) for name in names if os.environ.get(name) and os.environ[name].strip()]
 
 
+def framework_secrets(config):
+    """Credentials used by framework helpers, never by execution-provider children."""
+    secrets = dict(deepseek_secrets(config))
+    if os.environ.get("TYPESAFE_API_KEY", "").strip():
+        secrets["TYPESAFE_API_KEY"] = os.environ["TYPESAFE_API_KEY"]
+    return list(secrets.items())
+
+
 def child_environment(config, provider_name, checked_deepseek_key=None):
-    """Explicit child environment: no DeepSeek credential crosses non-DeepSeek provider boundaries."""
+    """Keep helper credentials out of external execution-provider environments."""
     env = dict(os.environ)
-    for name, _ in deepseek_secrets(config):
+    env.pop("TYPESAFE_API_KEY", None)
+    for name, _ in framework_secrets(config):
         env.pop(name, None)
     if provider_name == "deepseek" and checked_deepseek_key:
         # The default Codex profile consumes this canonical name.  Do not leave a
@@ -2017,7 +2026,7 @@ def execute(args):
             dry_run_meta["review_reason"] = review_reason
         return dry_run_meta, 0
 
-    secrets = [value.strip() for _, value in deepseek_secrets(config)]
+    secrets = [value.strip() for _, value in framework_secrets(config)]
     checked_deepseek_key = None
     if provider_name == "deepseek":
         ds_env = provider.get("api_key_env", "DEEPSEEK_API_KEY")

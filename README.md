@@ -55,7 +55,7 @@ flowchart TD
 
 The current native roles use GPT-6 Luna for focused work and GPT-6 Sol for complex implementation, planning and correctness checks. Independent review uses Claude Opus 5.5. See the [dated model routing rationale](docs/MODEL_ROUTING.md) for sources, effort choices and evaluation limits.
 
-- **Offline test suite**: 198 unit tests executed across [`scripts/test_provider_runner.py`](scripts/test_provider_runner.py) and [`scripts/test_install.py`](scripts/test_install.py) with 0 failures, 0 errors, and platform-dependent skips. Tests use temporary installation roots and mock CLI processes under `.llm-output/` without consuming provider tokens or live credentials. These offline checks do not prove provider authentication, pinned-model availability, or role discovery in a live Codex host.
+- **Offline test suite**: Provider, installer and Jev helper tests use temporary installation roots, mock CLI processes and fake HTTP transports without consuming provider tokens or live credentials. These offline checks do not prove provider authentication, retrieval quality, probability calibration, pinned-model availability, or role discovery in a live Codex host.
 - **Continuous integration matrix**: Multi-platform GitHub Actions workflow at [`.github/workflows/tests.yml`](.github/workflows/tests.yml) executing test discovery and git patch whitespace validation across three platforms: `ubuntu-latest`, `windows-latest`, and `macos-latest` on Python 3.11.
 - **Release history**: Existing release tags present in the repository include `v4.1.0`, `v4.1.1`, `v4.1.2`, `v4.2.0`, and `v5.0.0`.
 - **Historical benchmarks**: Supplied evaluation data from the v3 architecture is preserved in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) as historical reference data; it does not represent measurements of current Gemini or Claude models.
@@ -102,6 +102,17 @@ The default installation destination is `~/.codex` (honoring `CODEX_HOME` or `--
 The installer enforces lexical path checks, refusing linked source or target paths (including symlinks and NTFS reparse points) to prevent circular links or synced-folder collisions. If a macOS source directory has a symlinked ancestor, supply its physical path: `python3 install.py --source "$(pwd -P)"`. Choose a physical destination path as well; symlinks inside the Codex directory are prohibited. The installer also inspects `AGENTS.md` before modification, refusing ambiguous, malformed, or reversed policy markers. Installation is not a filesystem-wide transaction and there is no automatic uninstaller; restore from `agent-framework/backups/` if manual recovery is required. An existing `.agent-framework-install.lock` prevents concurrent installations and dry runs. **Stop active framework jobs before upgrading.**
 
 ## Provider setup
+
+### Optional Jev search and review assistance
+
+The `jev-search` skill finds code by behaviour while keeping raw candidate scans out of the agent's context. It returns compact original source excerpts and coverage information. The `jev-review` skill prepares an advisory focus brief from a saved diff; ordinary code review and validation remain in force. Both use the existing Python runtime, with no extra packages.
+
+Provide `TYPESAFE_API_KEY` to the invoking process. Remote evaluation requires saved workspace authorization in `capabilities.jev`, or `--allow-remote` for an already-authorized individual invocation. Fresh installations leave it disabled. The key is filtered from Gemini/Claude child environments and included in retained-artifact redaction. See [Jev configuration and usage](docs/JEV.md).
+
+```text
+python scripts/jev_search.py search --workspace . --query "Where are provider credentials filtered?" --scope scripts --top-k 6 --allow-remote
+python scripts/jev_review.py --workspace . --diff-file .llm-output/candidate.diff --allow-remote
+```
 
 ### Connect external provider CLIs
 
@@ -244,13 +255,15 @@ The test suite runs with simulated mock CLI processes and offline fixtures witho
 | [`routing.example.json`](routing.example.json) | Package default routing template defining provider CLI executables, models, and timeouts |
 | [`task-template.json`](task-template.json) | Standard task contract template specifying objective, acceptance criteria, and path ownership |
 | `agents/` | Twelve custom agent role definitions (`implementer`, `complex-implementer`, `reviewer`, `quality-gate-max`, `correctness-gate`, `security-reviewer`, `test-engineer`, `planner`, `explorer`, `docs-researcher`, `refactor-auditor`, `verifier`) |
-| `skills/` | Custom workflow skills: `ask-gemini/` (implementation delegation), `ask-claude/` (read-only review), and `simplify/` (simplification workflow) |
+| `skills/` | Provider workflows (`ask-gemini`, `ask-claude`), simplification (`simplify`), and optional Jev tools (`jev-search`, `jev-review`) |
 | `scripts/` | Orchestration runner ([`provider_runner.py`](scripts/provider_runner.py)) and unit tests ([`test_install.py`](scripts/test_install.py), [`test_provider_runner.py`](scripts/test_provider_runner.py)) |
 | `docs/` | Architecture rationale ([`ARCHITECTURE.md`](docs/ARCHITECTURE.md)), framework operational policy ([`FRAMEWORK.md`](docs/FRAMEWORK.md)), historical benchmarks ([`BENCHMARKS.md`](docs/BENCHMARKS.md)), and workflow templates |
 
 During installation, the installer merges one managed routing-policy block from `GLOBAL_POLICY.md` into the user's own `AGENTS.md` (bounded by `<!-- BEGIN CODEX MULTI-PROVIDER FRAMEWORK -->` and `<!-- END CODEX MULTI-PROVIDER FRAMEWORK -->`) and preserves surrounding personal instructions and configuration.
 
 ## Documentation
+
+- [docs/JEV.md](docs/JEV.md): Optional semantic code search and advisory review helpers, workspace authorization, budgets, and evaluation limits.
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Comprehensive analysis of the six core architectural decisions (fail-closed routing, monetary preflights, credential isolation, artifact redaction, path ownership, and bounded stream telemetry).
 - [docs/FRAMEWORK.md](docs/FRAMEWORK.md): Complete operational routing policy, timeout configurations, and lifecycle diagnostics.

@@ -15,6 +15,20 @@
       "heartbeat_seconds": 60
     }
   },
+  "capabilities": {
+    "jev": {
+      "enabled": false,
+      "allowed_roots": [],
+      "model": "jev-1.13.0",
+      "timeout_seconds": 10,
+      "deadline_seconds": 30,
+      "max_requests": 8,
+      "max_input_tokens": 120000,
+      "max_candidates": 96,
+      "max_output_chars": 12000,
+      "cache_ttl_seconds": 604800
+    }
+  },
   "timeout_seconds": 900,
   "quota_probe_seconds": 3600,
   "lock_timeout_seconds": 30

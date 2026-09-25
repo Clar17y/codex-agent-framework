@@ -1292,7 +1292,7 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pinned model deepseek-flash"):
             runner.command_for(
                 role="implement",
-                provider={"executable": "codex", "profile": "deepseek", "model": "deepseek-chat"},
+                provider={"executable": "codex.exe", "profile": "deepseek", "model": "deepseek-chat"},
                 prompt="p", timeout=10, workspace=self.root, effort="medium",
                 provider_name="deepseek", output_dir=output_dir,
             )
@@ -1367,6 +1367,38 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 302)
         self.assertIn("not permitted", str(caught.exception))
         caught.exception.close()
+
+    def test_jev_key_is_removed_from_every_execution_provider(self):
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "jev-test-credential",
+                                          "JEV_TEST_NONSECRET": "preserved"}):
+            for provider in ("gemini", "claude", "deepseek"):
+                with self.subTest(provider=provider):
+                    env = runner.child_environment({}, provider, "legacy-checked-key")
+                    self.assertNotIn("TYPESAFE_API_KEY", env)
+                    self.assertEqual(env["JEV_TEST_NONSECRET"], "preserved")
+
+    def test_jev_key_is_redacted_from_execution_artifacts_and_results(self):
+        secret = "jev-test-credential-" + uuid.uuid4().hex
+        for role in ("implement", "review"):
+            with self.subTest(role=role):
+                self.args.role = role
+                payload = ({"status": "SUCCESS", "response": secret} if role == "implement"
+                           else {"type": "result", "subtype": "success", "is_error": False,
+                                 "result": secret})
+                self.fake.write_text(
+                    "import os, sys\n"
+                    "assert 'TYPESAFE_API_KEY' not in os.environ\n"
+                    f"print({secret!r}, file=sys.stderr)\n"
+                    f"print({json.dumps(payload)!r})\n", encoding="utf-8")
+                with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": secret}):
+                    result, code = self.run_provider()
+                self.assertEqual((result["status"], code), ("completed", 0))
+                self.assertNotIn(secret, json.dumps(result))
+                output = Path(result["logs"])
+                for name in ("stdout.log", "stderr.log", "last_message.txt", "result.json"):
+                    path = output / name
+                    if path.exists():
+                        self.assertNotIn(secret, path.read_text(encoding="utf-8"))
 
     def test_finish_redacts_timeout_artifacts(self):
         secret = "timeout-secret-" + uuid.uuid4().hex
@@ -2551,7 +2583,8 @@ class ProviderTests(unittest.TestCase):
         self.args.role = "implement"
         self.args.provider = "deepseek"
         self.settings["providers"]["deepseek"] = {
-            "executable": "codex",
+            # Command-format assertions must not discover a real Windows npm shim.
+            "executable": "codex.exe",
             "profile": "deepseek",
             "model": "deepseek-flash",
             "api_key_env": "TEST_DS_KEY",

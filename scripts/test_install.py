@@ -62,6 +62,8 @@ class TestInstallFramework(unittest.TestCase):
         self.assertTrue((af_dir / "routing.example.json").exists())
         self.assertTrue((af_dir / "install.py").exists())
         self.assertTrue((af_dir / "scripts" / "provider_runner.py").exists())
+        for name in ('jev_client.py', 'jev_search.py', 'jev_review.py'):
+            self.assertTrue((af_dir / 'scripts' / name).is_file())
         self.assertTrue((af_dir / "docs" / "FRAMEWORK.md").exists())
 
         # Check agents
@@ -98,6 +100,10 @@ class TestInstallFramework(unittest.TestCase):
         simplify_text = simplify.read_text(encoding='utf-8')
         self.assertNotIn('{{CODEX_ROOT}}', simplify_text)
         self.assertIn(self.dest_root.resolve().as_posix() + '/agent-framework/docs/FRAMEWORK.md', simplify_text)
+        for name in ('jev-search', 'jev-review'):
+            content = (skills_dir / name / 'SKILL.md').read_text(encoding='utf-8')
+            self.assertNotIn('{{CODEX_ROOT}}', content)
+            self.assertIn(self.dest_root.resolve().as_posix() + '/agent-framework/scripts/', content)
 
         # Check AGENTS.md
         agents_md = self.dest_root / "AGENTS.md"
@@ -267,6 +273,34 @@ class TestInstallFramework(unittest.TestCase):
         updated_routing_2 = json.loads(routing_path.read_text(encoding="utf-8"))
         self.assertEqual(updated_routing_2["providers"]["gemini"]["executable"], custom_gemini)
         self.assertEqual(updated_routing_2["providers"]["claude"]["executable"], custom_claude)
+
+    def test_jev_defaults_upgrade_without_enabling_or_overwriting_settings(self):
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        routing = self.dest_root / 'agent-framework/routing.json'
+        original = json.loads(routing.read_text(encoding='utf-8'))
+        self.assertFalse(original['capabilities']['jev']['enabled'])
+        self.assertEqual(original['capabilities']['jev']['allowed_roots'], [])
+        old = dict(original)
+        old.pop('capabilities')
+        routing.write_text(json.dumps(old), encoding='utf-8')
+        migrated = resolve_routing(self.source_root, self.dest_root)
+        self.assertEqual(migrated, original)
+        customized = original['capabilities']['jev']
+        customized.update(enabled=True, allowed_roots=['C:/authorized/project'], max_candidates=25)
+        original['capabilities']['unrelated'] = {'preserve': True}
+        routing.write_text(json.dumps(original), encoding='utf-8')
+        self.assertEqual(resolve_routing(self.source_root, self.dest_root), original)
+
+    def test_malformed_jev_capability_is_not_silently_replaced(self):
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        routing = self.dest_root / 'agent-framework/routing.json'
+        original = json.loads(routing.read_text(encoding='utf-8'))
+        for bad in ([], {'jev': False}):
+            with self.subTest(capabilities=bad):
+                original['capabilities'] = bad
+                routing.write_text(json.dumps(original), encoding='utf-8')
+                with self.assertRaises(PreflightError):
+                    resolve_routing(self.source_root, self.dest_root)
 
     def test_routing_refresh(self):
         """Explicit --refresh-routing re-generates routing.json from routing.example.json."""

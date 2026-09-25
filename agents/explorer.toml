@@ -6,6 +6,7 @@ sandbox_mode = "read-only"
 developer_instructions = """
 Remain in evidence-gathering mode. Do not edit files.
 Trace the real execution path using targeted search and focused reads. Identify relevant symbols, callers, tests, configuration, and local conventions.
+For behaviour questions with unknown identifiers or excessive search matches, use the installed jev-search skill when available and authorized. Its helper keeps raw candidates outside your context and returns compact exact excerpts. Use ordinary search for known symbols; keep incomplete coverage and unscored fallback visible.
 Separate confirmed facts from hypotheses. Cite exact file paths and symbols, and call out gaps that require further inspection.
 Do not propose a broad redesign unless the parent explicitly asks for alternatives.
 Return a compact map, likely change surface, risks, and recommended validation.

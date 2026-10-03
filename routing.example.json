@@ -1,5 +1,8 @@
 {
   "version": 9,
+  "workflow": {
+    "require_jev_evidence": true
+  },
   "providers": {
     "gemini": {
       "executable": "agy",
@@ -17,7 +20,8 @@
   },
   "capabilities": {
     "jev": {
-      "enabled": false,
+      "enabled": true,
+      "authorization_mode": "all_workspaces",
       "allowed_roots": [],
       "model": "jev-1.13.0",
       "timeout_seconds": 10,

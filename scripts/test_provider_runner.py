@@ -3370,5 +3370,505 @@ class ProviderTests(unittest.TestCase):
             self.assertNotIn(m, ds_str, f"DeepSeek progress leaked {m}")
 
 
+class JevGateTests(unittest.TestCase):
+    def setUp(self):
+        import hashlib
+        self.hashlib = hashlib
+        self.root = Path(__file__).resolve().parent.parent / ".llm-output" / str(uuid.uuid4())
+        self.root.mkdir(parents=True)
+        self.marker = self.root / "provider_started.marker"
+        self.fake = self.root / "fake.py"
+        self.fake.write_text(
+            f"from pathlib import Path\nPath(r'{self.marker}').write_text('started', encoding='utf-8')\nprint('{{\"status\":\"SUCCESS\",\"response\":\"Done\"}}')",
+            encoding="utf-8"
+        )
+        self.config_path = self.root / "config.json"
+        self.settings = {
+            "version": 9,
+            "workflow": {
+                "require_jev_evidence": True
+            },
+            "providers": {
+                "gemini": {
+                    "executable": [sys.executable, str(self.fake)],
+                    "model": "gemini-3.8-flash-medium",
+                    "heartbeat_seconds": 0
+                },
+                "claude": {
+                    "executable": [sys.executable, str(self.fake)],
+                    "model": "claude-opus-5-5",
+                    "effort": "medium",
+                    "heartbeat_seconds": 0
+                }
+            },
+            "timeout_seconds": 5,
+            "heartbeat_seconds": 0
+        }
+        runner.write_json(self.config_path, self.settings)
+        self.task_file = self.root / "task.json"
+        self.base_task = {
+            "objective": "Test",
+            "acceptance_criteria": ["Done"],
+            "owned_paths": [],
+            "validation": [],
+            "instructions_files": []
+        }
+        self.args = argparse.Namespace(
+            role="implement",
+            workspace=str(self.root),
+            task_file=str(self.task_file),
+            config=str(self.config_path),
+            state_dir=str(self.root / "state"),
+            dry_run=False,
+            provider="gemini"
+        )
+
+    def write_task(self, extra):
+        task = dict(self.base_task)
+        task.update(extra)
+        runner.write_json(self.task_file, task)
+        return task
+
+    def test_missing_jev_decision_rejected(self):
+        """When require_jev_evidence is true, missing jev or stage decision raises ValueError and never launches provider."""
+        # Missing jev
+        self.write_task({})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+        # Empty jev
+        self.write_task({"jev": {}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+        # Implement role missing search
+        self.write_task({"jev": {"review": {"status": "not_applicable", "reason": "foo"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+        # Review role missing review
+        self.args.role = "review"
+        self.args.provider = "claude"
+        self.write_task({"jev": {"search": {"status": "not_applicable", "reason": "foo"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+    def test_malformed_stage_status_and_reason_rejected(self):
+        """Malformed stage object, invalid status, or missing/empty reason raises ValueError."""
+        # Non-dict stage
+        self.write_task({"jev": {"search": "not_a_dict"}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+        # Invalid status
+        self.write_task({"jev": {"search": {"status": "invalid_status"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+        # not_applicable missing reason
+        self.write_task({"jev": {"search": {"status": "not_applicable"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+        # not_applicable empty string reason
+        self.write_task({"jev": {"search": {"status": "not_applicable", "reason": ""}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+        # not_applicable whitespace-only reason
+        self.write_task({"jev": {"search": {"status": "not_applicable", "reason": "   \t  "}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+        # not_applicable non-string reason
+        self.write_task({"jev": {"search": {"status": "not_applicable", "reason": 123}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+        # attempted missing result_path
+        self.write_task({"jev": {"search": {"status": "attempted"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+        # attempted empty string result_path
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": ""}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+    def test_allowed_explicit_exemption(self):
+        """Valid not_applicable status with specific non-empty reason is accepted in dry-run and execution."""
+        # Implement stage exemption
+        self.write_task({
+            "jev": {
+                "search": {
+                    "status": "not_applicable",
+                    "reason": "Exact lookup for known symbol"
+                }
+            }
+        })
+        self.args.dry_run = True
+        meta, code = runner.execute(self.args)
+        self.assertEqual(code, 0)
+        self.assertEqual(meta["status"], "dry_run")
+        self.assertIn("jev", meta)
+        self.assertEqual(meta["jev"]["stage"], "search")
+        self.assertEqual(meta["jev"]["decision"], "not_applicable")
+        self.assertEqual(meta["jev"]["reason"], "Exact lookup for known symbol")
+        self.assertFalse(self.marker.exists())
+
+        # Normal execution
+        self.args.dry_run = False
+        res, code = runner.execute(self.args)
+        self.assertEqual(code, 0)
+        self.assertIn("jev", res)
+        self.assertEqual(res["jev"]["decision"], "not_applicable")
+        self.assertTrue(self.marker.exists())
+
+        # Review stage exemption
+        self.marker.unlink()
+        self.args.role = "review"
+        self.args.provider = "claude"
+        self.write_task({
+            "jev": {
+                "review": {
+                    "status": "not_applicable",
+                    "reason": "Documentation-only change"
+                }
+            }
+        })
+        self.args.dry_run = True
+        meta, code = runner.execute(self.args)
+        self.assertEqual(code, 0)
+        self.assertEqual(meta["jev"]["stage"], "review")
+        self.assertEqual(meta["jev"]["decision"], "not_applicable")
+        self.assertEqual(meta["jev"]["reason"], "Documentation-only change")
+
+    def test_actual_search_and_review_outputs_accepted(self):
+        """Valid search and review helper JSON outputs inside workspace are accepted."""
+        # 1. Search evidence
+        search_ev_path = self.root / "search_output.json"
+        runner.write_json(search_ev_path, {
+            "command": "search",
+            "status": "complete",
+            "workspace": str(self.root),
+            "coverage": {"complete": True, "reasons": []},
+            "results": [{"path": "foo.py", "score": 0.9}]
+        })
+        self.write_task({
+            "jev": {
+                "search": {
+                    "status": "attempted",
+                    "result_path": "search_output.json"
+                }
+            }
+        })
+        self.args.dry_run = True
+        meta, code = runner.execute(self.args)
+        self.assertEqual(code, 0)
+        self.assertIn("jev", meta)
+        self.assertEqual(meta["jev"]["stage"], "search")
+        self.assertEqual(meta["jev"]["decision"], "attempted")
+        self.assertEqual(meta["jev"]["status"], "complete")
+        self.assertEqual(meta["jev"]["result_path"], "search_output.json")
+        self.assertEqual(meta["jev"]["coverage"], {"complete": True, "reasons": []})
+        self.assertNotIn("results", meta["jev"])
+
+        # 2. Review evidence
+        diff_file = self.root / "candidate.diff"
+        diff_bytes = b"--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-print(1)\n+print(2)\n"
+        diff_file.write_bytes(diff_bytes)
+        diff_sha = self.hashlib.sha256(diff_bytes).hexdigest()
+
+        review_ev_path = self.root / "review_output.json"
+        runner.write_json(review_ev_path, {
+            "command": "review",
+            "status": "complete",
+            "diff_sha256": diff_sha,
+            "coverage": {"complete": True, "reasons": []},
+            "focus": [{"category": "coordination", "hunk": 0, "probability": 0.8}],
+            "focus_count": 1,
+            "unknown_count": 0
+        })
+        self.args.role = "review"
+        self.args.provider = "claude"
+        self.write_task({
+            "review": {
+                "diff_path": "candidate.diff"
+            },
+            "jev": {
+                "review": {
+                    "status": "attempted",
+                    "result_path": "review_output.json"
+                }
+            }
+        })
+        meta, code = runner.execute(self.args)
+        self.assertEqual(code, 0)
+        self.assertEqual(meta["jev"]["stage"], "review")
+        self.assertEqual(meta["jev"]["decision"], "attempted")
+        self.assertEqual(meta["jev"]["status"], "complete")
+        self.assertEqual(meta["jev"]["diff_sha256"], diff_sha)
+        self.assertEqual(meta["jev"]["focus_count"], 1)
+        self.assertNotIn("focus", meta["jev"])
+
+    def test_partial_unavailable_and_error_continuation(self):
+        """Real partial, unavailable, and error helper outputs are accepted and carry diagnostics."""
+        # Partial search output
+        ev_path = self.root / "partial_search.json"
+        runner.write_json(ev_path, {
+            "command": "search",
+            "status": "partial",
+            "workspace": str(self.root),
+            "coverage": {"complete": False, "reasons": ["budget_reached"]}
+        })
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "partial_search.json"}}})
+        self.args.dry_run = True
+        meta, code = runner.execute(self.args)
+        self.assertEqual(code, 0)
+        self.assertEqual(meta["jev"]["status"], "partial")
+        self.assertFalse(meta["jev"]["coverage"]["complete"])
+
+        # Unavailable search output
+        ev_path = self.root / "unavail_search.json"
+        runner.write_json(ev_path, {
+            "command": "search",
+            "status": "unavailable",
+            "workspace": str(self.root),
+            "error": "TypeSafe API temporarily unavailable"
+        })
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "unavail_search.json"}}})
+        meta, code = runner.execute(self.args)
+        self.assertEqual(code, 0)
+        self.assertEqual(meta["jev"]["status"], "unavailable")
+        self.assertEqual(meta["jev"]["error"], "TypeSafe API temporarily unavailable")
+
+        # Error review output (may lack diff_sha256)
+        ev_path = self.root / "error_review.json"
+        runner.write_json(ev_path, {
+            "command": "review",
+            "status": "error",
+            "error": "Invalid diff hunk format"
+        })
+        self.args.role = "review"
+        self.args.provider = "claude"
+        self.write_task({"jev": {"review": {"status": "attempted", "result_path": "error_review.json"}}})
+        meta, code = runner.execute(self.args)
+        self.assertEqual(code, 0)
+        self.assertEqual(meta["jev"]["status"], "error")
+        self.assertEqual(meta["jev"]["error"], "Invalid diff hunk format")
+
+    def test_doctor_and_inspect_rejected(self):
+        """Diagnostic doctor or inspect output is rejected as actual helper evidence."""
+        for cmd in ("doctor", "inspect"):
+            with self.subTest(cmd=cmd):
+                ev_path = self.root / f"{cmd}.json"
+                runner.write_json(ev_path, {"command": cmd, "status": "complete"})
+                self.write_task({"jev": {"search": {"status": "attempted", "result_path": f"{cmd}.json"}}})
+                with self.assertRaises(ValueError):
+                    runner.execute(self.args)
+                self.assertFalse(self.marker.exists())
+
+    def test_mismatched_workspace_rejected(self):
+        """Search evidence workspace that does not match active workspace is rejected."""
+        ev_path = self.root / "other_ws.json"
+        runner.write_json(ev_path, {
+            "command": "search",
+            "status": "complete",
+            "workspace": str(self.root.parent / "different_workspace"),
+            "coverage": {"complete": True, "reasons": []}
+        })
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "other_ws.json"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+    def test_stale_review_hashes_rejected(self):
+        """Review evidence whose diff_sha256 does not match task.review.diff_path is rejected."""
+        diff_file = self.root / "candidate.diff"
+        diff_file.write_bytes(b"diff content 1")
+        actual_sha = self.hashlib.sha256(b"diff content 1").hexdigest()
+        stale_sha = self.hashlib.sha256(b"different content").hexdigest()
+
+        ev_path = self.root / "stale_review.json"
+        runner.write_json(ev_path, {
+            "command": "review",
+            "status": "complete",
+            "diff_sha256": stale_sha,
+            "coverage": {"complete": True, "reasons": []}
+        })
+        self.args.role = "review"
+        self.args.provider = "claude"
+        self.write_task({
+            "review": {"diff_path": "candidate.diff"},
+            "jev": {"review": {"status": "attempted", "result_path": "stale_review.json"}}
+        })
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+    def test_unsafe_paths_and_bounded_input(self):
+        """Outside-workspace paths, traversal, and oversized or malformed inputs are rejected."""
+        # Traversal ..
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "../escape.json"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+
+        # Outside workspace
+        outside_file = self.root.parent / "outside.json"
+        runner.write_json(outside_file, {"command": "search", "status": "complete"})
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": str(outside_file)}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+
+        # Nonexistent file
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "missing.json"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+
+        # Oversized file (> 1 MB)
+        oversized = self.root / "oversized.json"
+        oversized.write_bytes(b"{" + b" " * (1024 * 1024 + 10) + b"}")
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "oversized.json"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+
+        # Malformed JSON
+        malformed = self.root / "malformed.json"
+        malformed.write_text("{not json", encoding="utf-8")
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "malformed.json"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+
+        # JSON array instead of dict
+        arr_file = self.root / "array.json"
+        arr_file.write_text("[]", encoding="utf-8")
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "array.json"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+
+        self.assertFalse(self.marker.exists())
+
+    def test_fabricated_success_rejected(self):
+        """Helper reporting status 'complete' while coverage.complete is False is rejected."""
+        ev_path = self.root / "fabricated.json"
+        runner.write_json(ev_path, {
+            "command": "search",
+            "status": "complete",
+            "workspace": str(self.root),
+            "coverage": {"complete": False, "reasons": ["unscored_candidates"]}
+        })
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "fabricated.json"}}})
+        with self.assertRaises(ValueError):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+    def test_opt_out_and_legacy_behavior(self):
+        """When workflow.require_jev_evidence is false or absent, tasks without jev run without error."""
+        # 1. Explicit opt-out (require_jev_evidence: false)
+        self.settings["workflow"]["require_jev_evidence"] = False
+        runner.write_json(self.config_path, self.settings)
+        self.write_task({})
+        self.args.dry_run = True
+        meta, code = runner.execute(self.args)
+        self.assertEqual(code, 0)
+        self.assertEqual(meta["status"], "dry_run")
+        self.assertNotIn("jev", meta)
+
+        # 2. Legacy config without workflow section
+        self.settings.pop("workflow", None)
+        runner.write_json(self.config_path, self.settings)
+        meta, code = runner.execute(self.args)
+        self.assertEqual(code, 0)
+        self.assertEqual(meta["status"], "dry_run")
+        self.assertNotIn("jev", meta)
+
+
+    def test_opt_out_and_legacy_ignore_present_stages(self):
+        for gate_setting in (False, None):
+            settings = {key: value for key, value in self.settings.items() if key != "workflow"}
+            if gate_setting is not None:
+                settings["workflow"] = {"require_jev_evidence": gate_setting}
+            runner.write_json(self.config_path, settings)
+            for role, provider, stage in (("implement", "gemini", "search"), ("review", "claude", "review")):
+                for decision in ({"status": "attempted", "result_path": "deleted-evidence.json"}, "legacy metadata"):
+                    with self.subTest(setting=gate_setting, role=role, decision=decision):
+                        self.args.role, self.args.provider = role, provider
+                        self.write_task({"jev": {stage: decision}})
+                        payload = ({"status": "SUCCESS", "response": "Done"} if role == "implement"
+                                   else {"type": "result", "subtype": "success", "is_error": False})
+                        self.fake.write_text(
+                            f"from pathlib import Path\nPath({str(self.marker)!r}).touch()\n"
+                            f"print({json.dumps(payload)!r})\n", encoding="utf-8")
+                        result, code = runner.execute(self.args)
+                        self.assertEqual((result["status"], code), ("completed", 0))
+                        self.assertNotIn("jev", result)
+                        self.assertTrue(self.marker.exists())
+                        self.marker.unlink()
+
+    def test_utf8_bom_evidence_and_utf16_diagnostic(self):
+        path = self.root / "encoded.json"
+        report = {"command": "search", "status": "partial", "workspace": str(self.root),
+                  "coverage": {"complete": False, "reasons": ["operation_budget_reached"]}}
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "encoded.json"}}})
+        self.args.dry_run = True
+        path.write_text(json.dumps(report), encoding="utf-8-sig")
+        metadata, code = runner.execute(self.args)
+        self.assertEqual(code, 0)
+        self.assertEqual(metadata["jev"]["status"], "partial")
+        self.assertEqual(metadata["jev"]["coverage"], report["coverage"])
+        path.write_text(json.dumps(report), encoding="utf-16")
+        with self.assertRaisesRegex(ValueError, "UTF-16.*UTF-8"):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+    def test_workflow_runtime_types_rejected(self):
+        self.write_task({"jev": {"search": {"status": "not_applicable", "reason": "Exact symbol lookup"}}})
+        for workflow in (None, [], "invalid", {"require_jev_evidence": 1}, {"require_jev_evidence": "true"}):
+            with self.subTest(workflow=workflow):
+                settings = {**self.settings, "workflow": workflow}
+                runner.write_json(self.config_path, settings)
+                with self.assertRaisesRegex(ValueError, "workflow.*must be (an object|a boolean)"):
+                    runner.execute(self.args)
+                self.assertFalse(self.marker.exists())
+
+    def test_hardlinked_evidence_rejected(self):
+        source = self.root / "source.json"
+        runner.write_json(source, {"command": "search", "status": "complete", "workspace": str(self.root)})
+        link = self.root / "hardlink.json"
+        try:
+            os.link(source, link)
+        except OSError as exc:
+            self.skipTest(f"Hardlinks unavailable: {exc}")
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "hardlink.json"}}})
+        with self.assertRaisesRegex(ValueError, "without links or hardlinks"):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+    def test_symlinked_evidence_rejected(self):
+        source = self.root / "source.json"
+        runner.write_json(source, {"command": "search", "status": "complete", "workspace": str(self.root)})
+        link = self.root / "symlink.json"
+        try:
+            link.symlink_to(source)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"Symlinks unavailable: {exc}")
+        self.write_task({"jev": {"search": {"status": "attempted", "result_path": "symlink.json"}}})
+        with self.assertRaisesRegex(ValueError, "without links or hardlinks"):
+            runner.execute(self.args)
+        self.assertFalse(self.marker.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

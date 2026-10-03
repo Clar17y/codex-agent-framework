@@ -213,8 +213,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
             config['version'] = 9
     else:
         config['version'] = 9
-    # Optional capabilities have their own defaults; adding one never enables
-    # remote source disclosure or overwrites saved workspace choices on upgrade.
+    # Merge capability defaults without overwriting saved operator choices.
     defaults = source_example if preserving else config
     capabilities = config.setdefault('capabilities', {})
     if not isinstance(capabilities, dict):
@@ -223,8 +222,27 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
     jev = capabilities.setdefault('jev', {})
     if not isinstance(jev, dict):
         raise PreflightError('Routing capabilities.jev must be an object.')
+    if preserving and 'allowed_roots' in jev and 'authorization_mode' not in jev:
+        jev['authorization_mode'] = 'allowed_roots'
     for key, value in jev_defaults.items():
         jev.setdefault(key, value)
+    if not isinstance(jev.get('enabled'), bool):
+        raise PreflightError('Routing capabilities.jev.enabled must be a boolean.')
+    if jev.get('authorization_mode') not in ('all_workspaces', 'allowed_roots'):
+        raise PreflightError('Routing capabilities.jev.authorization_mode must be all_workspaces or allowed_roots.')
+    # Workflow settings define execution gates. Merge missing defaults on upgrade
+    # while preserving explicit operator choices and unrelated settings.
+    workflow_defaults = defaults.get('workflow', {})
+    if not isinstance(workflow_defaults, dict):
+        raise PreflightError('Source routing workflow must be an object.')
+    workflow = config.setdefault('workflow', {})
+    if not isinstance(workflow, dict):
+        raise PreflightError('Routing workflow must be an object.')
+    for key, value in workflow_defaults.items():
+        workflow.setdefault(key, value)
+    for key, value in workflow.items():
+        if key == 'require_jev_evidence' and not isinstance(value, bool):
+            raise PreflightError('Routing workflow.require_jev_evidence must be a boolean.')
     return config
 
 

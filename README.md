@@ -103,15 +103,17 @@ The installer enforces lexical path checks, refusing linked source or target pat
 
 ## Provider setup
 
-### Optional Jev search and review assistance
+### Jev search and review assistance
 
-The `jev-search` skill finds code by behaviour while keeping raw candidate scans out of the agent's context. It returns compact original source excerpts and coverage information. The `jev-review` skill prepares an advisory focus brief from a saved diff; ordinary code review and validation remain in force. Both use the existing Python runtime, with no extra packages.
+The `jev-search` skill finds code by behaviour while keeping raw candidate scans out of the agent's context. Running `jev-search` is mandatory at the start of substantial coding investigations or architectural exploration before delegating implementation. The `jev-review` skill prepares an advisory focus brief from a saved diff, and is mandatory on integrated code-changing diffs before review or push. Permitted concise exemptions (e.g. exact known identifiers, tiny localized single-site fixes, or non-code diffs) require recording a concise non-empty reason. Both use the existing Python runtime, with no extra packages.
 
-Provide `TYPESAFE_API_KEY` to the invoking process. Remote evaluation requires saved workspace authorization in `capabilities.jev`, or `--allow-remote` for an already-authorized individual invocation. Fresh installations leave it disabled. The key is filtered from Gemini/Claude child environments and included in retained-artifact redaction. See [Jev configuration and usage](docs/JEV.md).
+The primary agent or native explorer performs remote Jev preparation before delegation; external Gemini and Claude child processes do not inherit `TYPESAFE_API_KEY`. When `workflow.require_jev_evidence=true` in `routing.json` (merged by default on installation and upgrades), `provider_runner.py` mechanically enforces `task.jev.search` accounting on implementation tasks and `task.jev.review` accounting (bound to the SHA-256 of `task.review.diff_path`) on review tasks. Instruction-level policy governs arbitrary native subagent calls.
+
+Provide `TYPESAFE_API_KEY` to the invoking process. Jev defaults to enabled with `authorization_mode: "all_workspaces"`, so coding repositories and Git worktrees need no per-workspace prompt or `--allow-remote`. Explicit opt-outs and `allowed_roots` restrictions remain available and are preserved on upgrade. Unavailable results are not a session-wide skip: reassess later applicable work and retry after readiness changes. The key is filtered from Gemini/Claude child environments and included in retained-artifact redaction. See [Jev configuration and usage](docs/JEV.md).
 
 ```text
-python scripts/jev_search.py search --workspace . --query "Where are provider credentials filtered?" --scope scripts --top-k 6 --allow-remote
-python scripts/jev_review.py --workspace . --diff-file .llm-output/candidate.diff --allow-remote
+python scripts/jev_search.py search --workspace . --query "Where are provider credentials filtered?" --scope scripts --top-k 6
+python scripts/jev_review.py --workspace . --diff-file .llm-output/candidate.diff
 ```
 
 ### Connect external provider CLIs
@@ -255,7 +257,7 @@ The test suite runs with simulated mock CLI processes and offline fixtures witho
 | [`routing.example.json`](routing.example.json) | Package default routing template defining provider CLI executables, models, and timeouts |
 | [`task-template.json`](task-template.json) | Standard task contract template specifying objective, acceptance criteria, and path ownership |
 | `agents/` | Twelve custom agent role definitions (`implementer`, `complex-implementer`, `reviewer`, `quality-gate-max`, `correctness-gate`, `security-reviewer`, `test-engineer`, `planner`, `explorer`, `docs-researcher`, `refactor-auditor`, `verifier`) |
-| `skills/` | Provider workflows (`ask-gemini`, `ask-claude`), simplification (`simplify`), and optional Jev tools (`jev-search`, `jev-review`) |
+| `skills/` | Provider workflows (`ask-gemini`, `ask-claude`), simplification (`simplify`), and Jev tools (`jev-search`, `jev-review`) |
 | `scripts/` | Orchestration runner ([`provider_runner.py`](scripts/provider_runner.py)) and unit tests ([`test_install.py`](scripts/test_install.py), [`test_provider_runner.py`](scripts/test_provider_runner.py)) |
 | `docs/` | Architecture rationale ([`ARCHITECTURE.md`](docs/ARCHITECTURE.md)), framework operational policy ([`FRAMEWORK.md`](docs/FRAMEWORK.md)), historical benchmarks ([`BENCHMARKS.md`](docs/BENCHMARKS.md)), and workflow templates |
 
@@ -263,7 +265,7 @@ During installation, the installer merges one managed routing-policy block from 
 
 ## Documentation
 
-- [docs/JEV.md](docs/JEV.md): Optional semantic code search and advisory review helpers, workspace authorization, budgets, and evaluation limits.
+- [docs/JEV.md](docs/JEV.md): Semantic code search and advisory review helpers, workspace authorization, budgets, and evaluation limits.
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Comprehensive analysis of the six core architectural decisions (fail-closed routing, monetary preflights, credential isolation, artifact redaction, path ownership, and bounded stream telemetry).
 - [docs/FRAMEWORK.md](docs/FRAMEWORK.md): Complete operational routing policy, timeout configurations, and lifecycle diagnostics.

@@ -8,6 +8,20 @@ import unittest
 from unittest.mock import patch
 from jev_client import JevClient
 from jev_review import parse_diff, run_review
+from jev_search import load_config
+
+_offline_key = patch.dict(os.environ, {"TYPESAFE_API_KEY": ""})
+_offline_network = patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("Unexpected live HTTP in offline Jev tests"))
+
+
+def setUpModule():
+    _offline_key.start()
+    _offline_network.start()
+
+
+def tearDownModule():
+    _offline_network.stop()
+    _offline_key.stop()
 
 DIFF = """diff --git a/a.py b/a.py
 index 123..456 100644
@@ -30,12 +44,32 @@ class TestReview(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_local_facts_without_authorization(self):
-        result = run_review(self.ws, "diff.txt")
+        config = self.ws / "disabled.json"
+        config.write_text(json.dumps({"capabilities": {"jev": {"enabled": False}}}), encoding="utf-8")
+        result = run_review(self.ws, "diff.txt", config_path=str(config))
         self.assertEqual({k: result["facts"][k] for k in ("changed_files", "hunks", "added_lines", "deleted_lines")},
                          {"changed_files": 1, "hunks": 1, "added_lines": 1, "deleted_lines": 1})
         self.assertEqual(result["diff_sha256"], hashlib.sha256((self.ws / "diff.txt").read_bytes()).hexdigest())
         self.assertEqual(result["focus"], [])
         self.assertIn("remote_disabled", result["coverage"]["reasons"])
+
+    def test_default_remote_review_and_recovery(self):
+        calls = []
+        def transport(payload, headers):
+            calls.append(payload)
+            return {"model": "jev-1.13.0", "answers": {qid: {"type": "noul", "noul": 0.1} for qid in payload["questions"]}, "usage": {"input_tokens": 1, "output_tokens": 1}}
+        client = JevClient(transport=transport)
+        default = run_review(self.ws, "diff.txt", client=client)
+        self.assertGreater(default["usage"]["requests_made"], 0)
+        config = self.ws / "routing.json"
+        config.write_text(json.dumps({"capabilities": {"jev": {"enabled": False}}}), encoding="utf-8")
+        denied = run_review(self.ws, "diff.txt", config_path=str(config), client=client)
+        self.assertIn("remote_disabled", denied["coverage"]["reasons"])
+        attempts = len(calls)
+        config.write_text(json.dumps({"capabilities": {"jev": {"enabled": True, "authorization_mode": "all_workspaces"}}}), encoding="utf-8")
+        retried = run_review(self.ws, "diff.txt", config_path=str(config), client=client)
+        self.assertGreater(len(calls), attempts)
+        self.assertGreater(retried["usage"]["requests_made"], 0)
 
     def test_partial_answers_keep_unknown(self):
         def fake(payload, headers):
@@ -47,6 +81,22 @@ class TestReview(unittest.TestCase):
         self.assertEqual(result["focus"][0]["new_start"], 1)
         self.assertTrue(result["unknowns"])
         self.assertFalse(result["coverage"]["complete"])
+
+    def test_invalid_saved_config_review_never_sends_diff(self):
+        config = self.ws / "routing.json"
+        script_dir = self.ws / "scripts"
+        script_dir.mkdir()
+        def forbidden(*args):
+            self.fail("Remote call with malformed saved controls")
+        client = JevClient(transport=forbidden)
+        for document in ([], {"capabilities": None}, {"capabilities": {"jev": None}},
+                         {"capabilities": {"jev": False}}, {"jev": None}):
+            config.write_text(json.dumps(document), encoding="utf-8")
+            for config_path in (None, str(config)):
+                with self.subTest(document=document, config_path=config_path):
+                    with patch("jev_review.load_config", side_effect=lambda path: load_config(path, script_dir=script_dir)):
+                        result = run_review(self.ws, "diff.txt", config_path=config_path, client=client)
+                    self.assertEqual(result["status"], "error")
 
     def test_failure_after_partial_batch_keeps_signal(self):
         from jev_client import JevServerError

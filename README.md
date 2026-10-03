@@ -111,9 +111,22 @@ The primary agent or native explorer performs remote Jev preparation before dele
 
 Provide `TYPESAFE_API_KEY` to the invoking process. Jev defaults to enabled with `authorization_mode: "all_workspaces"`, so coding repositories and Git worktrees need no per-workspace prompt or `--allow-remote`. Explicit opt-outs and `allowed_roots` restrictions remain available and are preserved on upgrade. Unavailable results are not a session-wide skip: reassess later applicable work and retry after readiness changes. The key is filtered from Gemini/Claude child environments and included in retained-artifact redaction. See [Jev configuration and usage](docs/JEV.md).
 
-```text
-python scripts/jev_search.py search --workspace . --query "Where are provider credentials filtered?" --scope scripts --top-k 6
-python scripts/jev_review.py --workspace . --diff-file .llm-output/candidate.diff
+Save each helper's JSON in the active workspace before launching the corresponding adapter task. These output paths match `task-template.json`; `task.review.diff_path` must name the same saved diff passed to the review helper. Create `.llm-output` first and save the candidate diff there before review.
+
+On macOS / Linux:
+
+```bash
+mkdir -p .llm-output
+python3 scripts/jev_search.py search --workspace . --query "Where are provider credentials filtered?" --scope scripts --top-k 6 > .llm-output/jev-search.json
+python3 scripts/jev_review.py --workspace . --diff-file .llm-output/candidate.diff > .llm-output/jev-review.json
+```
+
+On Windows (PowerShell), save UTF-8 explicitly so the gate can read the JSON:
+
+```powershell
+New-Item -ItemType Directory -Force .llm-output | Out-Null
+python scripts/jev_search.py search --workspace . --query "Where are provider credentials filtered?" --scope scripts --top-k 6 | Set-Content -Encoding utf8 .llm-output/jev-search.json
+python scripts/jev_review.py --workspace . --diff-file .llm-output/candidate.diff | Set-Content -Encoding utf8 .llm-output/jev-review.json
 ```
 
 ### Connect external provider CLIs

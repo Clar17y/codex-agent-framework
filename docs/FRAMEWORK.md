@@ -30,6 +30,8 @@ Before handing over implementation, inspect your changes for reuse, clarity, and
 
 ## Invocation
 
+The shared task template includes both `jev.search` and `jev.review`; the adapter validates only the stage for the selected role. Save helper output as UTF-8 JSON before invoking it: `.llm-output/jev-search.json` for implementation and `.llm-output/jev-review.json` for review, matching the template's `result_path` values. For review, save the diff at `.llm-output/candidate.diff` (or update `review.diff_path` to the exact file passed to the helper). See [Jev commands](JEV.md) for shell redirection and PowerShell UTF-8 examples.
+
 When delegating through the provider adapter, copy `task-template.json` to the active workspace's `.llm-output/` and fill it with real criteria, owned paths, scoped instructions, checks, and Jev accounting. When `workflow.require_jev_evidence=true` in `routing.json` (merged by default on installation and upgrades), implementation tasks require `task.jev.search` and review tasks require `task.jev.review` (with SHA-256 diff binding to `task.review.diff_path`). Status must be `attempted` (pointing to a bounded, valid helper JSON inside the workspace) or `not_applicable` with a concise non-empty `reason`. The adapter mechanically enforces this accounting gate prior to dry-run execution or process launch, failing closed if evidence is missing or invalid. By contrast, instruction-level policy governs arbitrary native subagent calls. Always use the repository's provisioned worktree when required. For review, include candidate HEAD, base revision and the path to a saved integrated diff in the objective; Claude has read/search tools only, so it cannot generate a diff with shell commands.
 
 ```bash

@@ -23,11 +23,23 @@ The primary agent or native explorer performs remote Jev preparation before exte
 
 The helper enumerates eligible files and builds bounded source fragments locally, then asks Jev to score relevance. Raw scans and request payloads remain inside the helper; the caller receives a compact JSON response containing original excerpts, locations, scores when available, usage and coverage. Running a verbose grep into the agent's context before invoking Jev defeats that benefit. Exact symbol/literal searches should still use ordinary local tools.
 
-```text
-python scripts/jev_search.py doctor --workspace .
-python scripts/jev_search.py inspect --workspace . --scope scripts
-python scripts/jev_search.py search --workspace . --scope scripts --query "Where do we prevent overlapping writers?" --top-k 6
+Create the active workspace's `.llm-output` directory before saving evidence. In a macOS / Linux shell:
+
+```bash
+mkdir -p .llm-output
+python3 scripts/jev_search.py doctor --workspace .
+python3 scripts/jev_search.py inspect --workspace . --scope scripts
+python3 scripts/jev_search.py search --workspace . --scope scripts --query "Where do we prevent overlapping writers?" --top-k 6 > .llm-output/jev-search.json
 ```
+
+On Windows (PowerShell), use explicit UTF-8 output:
+
+```powershell
+New-Item -ItemType Directory -Force .llm-output | Out-Null
+python scripts/jev_search.py search --workspace . --scope scripts --query "Where do we prevent overlapping writers?" --top-k 6 | Set-Content -Encoding utf8 .llm-output/jev-search.json
+```
+
+The saved JSON is the file referenced by `task.jev.search.result_path`. Console output alone does not satisfy the gate. `doctor` and `inspect` remain diagnostics, not search evidence.
 
 Use `python3` where needed. In an installed framework, invoke the script under `<codex-root>/agent-framework/scripts/` and pass `--workspace` for the repository being searched. `--config` selects the installed `routing.json`; otherwise the helper looks beside the installed scripts' parent directory. `--scope` is repeatable and confines evaluation to selected workspace paths. `--query-file` accepts a saved question.
 
@@ -69,9 +81,17 @@ Processing limits and returned-context limits are separate. Keep returned contex
 
 Save the candidate diff inside the workspace, including applicable untracked changes, without printing the whole diff into the parent conversation. Then run:
 
-```text
-python scripts/jev_review.py --workspace . --diff-file .llm-output/candidate.diff --description-file .llm-output/task-description.txt
+```bash
+python3 scripts/jev_review.py --workspace . --diff-file .llm-output/candidate.diff --description-file .llm-output/task-description.txt > .llm-output/jev-review.json
 ```
+
+On Windows (PowerShell):
+
+```powershell
+python scripts/jev_review.py --workspace . --diff-file .llm-output/candidate.diff --description-file .llm-output/task-description.txt | Set-Content -Encoding utf8 .llm-output/jev-review.json
+```
+
+Set `task.jev.review.result_path` to this saved JSON and `task.review.diff_path` to the same diff file supplied above. The shared task template includes both `jev.search` and `jev.review`; the adapter validates the stage for its task role and ignores the other stage.
 
 The description is optional. Jev evaluates narrow semantic questions such as changes to authorization, credential flow, ownership coordination, cancellation, persistence and public interfaces. The helper associates signals with parsed diff hunks; counts and locations are computed locally. It returns an advisory review focus and a hash of the exact diff it evaluated. Ambiguous file-header-shaped content inside a hunk keeps that file block local and marks it unknown, even when the text might be literal source content.
 

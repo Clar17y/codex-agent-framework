@@ -29,13 +29,17 @@
     "search": {
       "status": "attempted",
       "result_path": ".llm-output/jev-search.json"
+    },
+    "review": {
+      "status": "attempted",
+      "result_path": ".llm-output/jev-review.json"
     }
   },
   "review": {
     "mode": "none | integrated_batch | integrated_batch_plus_correctness_gate",
     "candidate": "HEAD or commit identifier",
     "base": "Base revision when applicable",
-    "diff_path": "Saved integrated diff path when applicable",
+    "diff_path": ".llm-output/candidate.diff",
     "focus": "For a repeat review or extra gate, name the unresolved question or explicit requirement, related finding IDs, repair delta, affected invariants and earlier evidence to reuse. Batch related findings under one owner; a new commit alone is not a reason to restart the whole review."
   }
 }

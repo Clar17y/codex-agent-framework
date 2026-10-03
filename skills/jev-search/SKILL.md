@@ -10,8 +10,16 @@ Concise permitted exemptions:
 - Tiny localized single-site fixes, documentation-only changes, or configuration edits where behavioral search is not applicable.
 When claiming an exemption, record a concise, non-empty reason.
 
-```text
-python "{{CODEX_ROOT}}/agent-framework/scripts/jev_search.py" search --workspace "<absolute workspace>" --query "Where are overlapping writers prevented?" --scope scripts --top-k 6 --config "{{CODEX_ROOT}}/agent-framework/routing.json"
+Create `<absolute workspace>/.llm-output` first. Save the helper JSON before delegation and use its exact path in `task.jev.search.result_path`; console output alone does not satisfy the gate. In a macOS / Linux shell:
+
+```bash
+python3 "{{CODEX_ROOT}}/agent-framework/scripts/jev_search.py" search --workspace "<absolute workspace>" --query "Where are overlapping writers prevented?" --scope scripts --top-k 6 --config "{{CODEX_ROOT}}/agent-framework/routing.json" > "<absolute workspace>/.llm-output/jev-search.json"
+```
+
+On Windows (PowerShell), save UTF-8 explicitly:
+
+```powershell
+python "{{CODEX_ROOT}}/agent-framework/scripts/jev_search.py" search --workspace "<absolute workspace>" --query "Where are overlapping writers prevented?" --scope scripts --top-k 6 --config "{{CODEX_ROOT}}/agent-framework/routing.json" | Set-Content -Encoding utf8 "<absolute workspace>/.llm-output/jev-search.json"
 ```
 
 Use `python3` where required. `doctor` and `inspect` are offline diagnostics (not search evidence). `--scope` can repeat; start with relevant directories and broaden only when evidence or incomplete coverage warrants it. `--query-file` supports longer questions. Keep the returned context budget small and read the cited files in detail as needed.

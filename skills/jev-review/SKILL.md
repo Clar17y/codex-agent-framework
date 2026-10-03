@@ -9,9 +9,19 @@ Concise permitted exemptions:
 - Non-code diffs without logic changes (e.g. documentation-only, comments, markdown, or static data/asset changes).
 When claiming an exemption, record a concise, non-empty reason.
 
-```text
-python "{{CODEX_ROOT}}/agent-framework/scripts/jev_review.py" --workspace "<absolute workspace>" --diff-file "<saved diff inside workspace>" --config "{{CODEX_ROOT}}/agent-framework/routing.json"
+Create `<absolute workspace>/.llm-output` first. Save the helper JSON before requesting review and use its exact path in `task.jev.review.result_path`; console output alone does not satisfy the gate. In a macOS / Linux shell:
+
+```bash
+python3 "{{CODEX_ROOT}}/agent-framework/scripts/jev_review.py" --workspace "<absolute workspace>" --diff-file "<saved diff inside workspace>" --config "{{CODEX_ROOT}}/agent-framework/routing.json" > "<absolute workspace>/.llm-output/jev-review.json"
 ```
+
+On Windows (PowerShell), save UTF-8 explicitly:
+
+```powershell
+python "{{CODEX_ROOT}}/agent-framework/scripts/jev_review.py" --workspace "<absolute workspace>" --diff-file "<saved diff inside workspace>" --config "{{CODEX_ROOT}}/agent-framework/routing.json" | Set-Content -Encoding utf8 "<absolute workspace>/.llm-output/jev-review.json"
+```
+
+Set `task.review.diff_path` to the same saved diff passed to the helper. The shared task template already includes `jev.review`; the adapter ignores its unused search stage for a review task.
 
 Use `python3` where required. Save the actual integrated diff locally inside the workspace without printing it into the calling agent's context. Include applicable untracked changes in the candidate when preparing the saved diff. Use `--description-file` for the task or PR description when checking intent alignment. The helper does not generate a diff, post comments, edit source or approve a merge.
 

@@ -36,6 +36,20 @@ from jev_search import (
 )
 
 
+_offline_key = patch.dict(os.environ, {"TYPESAFE_API_KEY": ""})
+_offline_network = patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("Unexpected live HTTP in offline Jev tests"))
+
+
+def setUpModule():
+    _offline_key.start()
+    _offline_network.start()
+
+
+def tearDownModule():
+    _offline_network.stop()
+    _offline_key.stop()
+
+
 class TestConfigAndAuthorization(unittest.TestCase):
     """Test configuration discovery, loading, bounds validation, and authorization."""
 
@@ -49,7 +63,9 @@ class TestConfigAndAuthorization(unittest.TestCase):
     def test_default_config_when_absent(self):
         cfg, src = load_config(config_path=None, script_dir=self.temp_path)
         self.assertEqual(src, "defaults")
-        self.assertFalse(cfg["enabled"])
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["authorization_mode"], "all_workspaces")
+        self.assertTrue(is_remote_authorized(self.temp_path, cfg, allow_remote=False))
         self.assertEqual(cfg["allowed_roots"], [])
         self.assertEqual(cfg["model"], "jev-1.13.0")
         self.assertEqual(cfg["max_requests"], 8)
@@ -101,6 +117,35 @@ class TestConfigAndAuthorization(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_config_dict({"allowed_roots": "not_a_list"})
 
+    def test_malformed_saved_settings_do_not_enable_default(self):
+        script_dir = self.temp_path / "scripts"
+        script_dir.mkdir()
+        config = self.temp_path / "routing.json"
+        malformed = (None, [], {"capabilities": None}, {"capabilities": []},
+                     {"capabilities": {"jev": None}}, {"capabilities": {"jev": False}},
+                     {"capabilities": {"jev": []}}, {"jev": None}, {"jev": False},
+                     {"capabilities": {"jev": None}, "jev": {"enabled": True}})
+        for document in malformed:
+            config.write_text(json.dumps(document), encoding="utf-8")
+            for config_path in (None, str(config)):
+                with self.subTest(document=document, config_path=config_path), self.assertRaises(ValueError):
+                    load_config(config_path, script_dir=script_dir)
+        config.unlink()
+        config.mkdir()
+        with self.assertRaises(ValueError):
+            load_config(script_dir=script_dir)
+
+    def test_absent_saved_settings_use_global_default(self):
+        script_dir = self.temp_path / "scripts"
+        script_dir.mkdir()
+        config = self.temp_path / "routing.json"
+        for document in ({}, {"capabilities": {}}, {"capabilities": {}, "timeout_seconds": 900}):
+            config.write_text(json.dumps(document), encoding="utf-8")
+            for config_path in (None, str(config)):
+                with self.subTest(document=document, config_path=config_path):
+                    settings, _ = load_config(config_path, script_dir=script_dir)
+                    self.assertTrue(is_remote_authorized(self.temp_path, settings, allow_remote=False))
+
     def test_authorization_checks(self):
         ws = self.temp_path
         # 1. Disabled -> unauthorized
@@ -118,6 +163,22 @@ class TestConfigAndAuthorization(unittest.TestCase):
         # 4. --allow-remote overrides
         cfg = {"enabled": False, "allowed_roots": []}
         self.assertTrue(is_remote_authorized(ws, cfg, allow_remote=True))
+
+    def test_global_default_and_explicit_controls(self):
+        default = validate_config_dict({})
+        unlisted = self.temp_path / "new-worktree"
+        self.assertTrue(is_remote_authorized(unlisted, default, allow_remote=False))
+        disabled = validate_config_dict({"enabled": False, "authorization_mode": "all_workspaces"})
+        self.assertFalse(is_remote_authorized(unlisted, disabled, allow_remote=False))
+        restricted = validate_config_dict({"enabled": True, "authorization_mode": "allowed_roots", "allowed_roots": [str(self.temp_path)]})
+        self.assertTrue(is_remote_authorized(self.temp_path, restricted, allow_remote=False))
+        self.assertFalse(is_remote_authorized(unlisted, restricted, allow_remote=False))
+        legacy = validate_config_dict({"enabled": True, "allowed_roots": [str(self.temp_path)]})
+        self.assertEqual(legacy["authorization_mode"], "allowed_roots")
+        self.assertFalse(is_remote_authorized(unlisted, legacy, allow_remote=False))
+        for value in (None, True, [], "all", ""):
+            with self.subTest(mode=value), self.assertRaisesRegex(ValueError, "authorization_mode"):
+                validate_config_dict({"authorization_mode": value})
 
 
 class TestCandidatePipelineAndExclusions(unittest.TestCase):
@@ -303,11 +364,13 @@ class TestSearchOperationTransitionsAndFallbacks(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_lexical_fallback_when_remote_disabled(self):
+        config = self.ws / "disabled.json"
+        config.write_text(json.dumps({"capabilities": {"jev": {"enabled": False}}}), encoding="utf-8")
         res = run_search(
             workspace=self.ws,
             query="auth",
             allow_remote=False,
-            config_path=None,
+            config_path=str(config),
         )
         self.assertEqual(res["status"], "unavailable")
         self.assertIn("remote_disabled", res["coverage"]["reasons"])
@@ -315,6 +378,40 @@ class TestSearchOperationTransitionsAndFallbacks(unittest.TestCase):
         first = res["results"][0]
         self.assertIsNone(first["score"])
         self.assertTrue(first["unscored"])
+
+    def test_denial_then_enable_retries_same_search(self):
+        config = self.ws / "routing.json"
+        config.write_text(json.dumps({"capabilities": {"jev": {"enabled": True, "authorization_mode": "allowed_roots", "allowed_roots": []}}}), encoding="utf-8")
+        calls = []
+        def transport(payload, headers):
+            calls.append(payload)
+            return {"model": "jev-1.13.0", "answers": {qid: {"type": "noul", "noul": 0.9} for qid in payload["questions"]}, "usage": {"input_tokens": 1, "output_tokens": 1}}
+        client = JevClient(transport=transport)
+        first = run_search(self.ws, "auth", scopes=["module.py"], config_path=str(config), client=client)
+        self.assertIn("remote_disabled", first["coverage"]["reasons"])
+        self.assertFalse(calls)
+        config.write_text(json.dumps({"capabilities": {"jev": {"enabled": True, "authorization_mode": "all_workspaces"}}}), encoding="utf-8")
+        second = run_search(self.ws, "auth", scopes=["module.py"], config_path=str(config), client=client)
+        self.assertTrue(calls)
+        self.assertGreater(second["stats"]["requests_made"], 0)
+        self.assertTrue(any(not item["unscored"] for item in second["results"]))
+
+    def test_invalid_saved_config_search_never_sends_source(self):
+        config = self.ws / "routing.json"
+        script_dir = self.ws / "scripts"
+        script_dir.mkdir()
+        def forbidden(*args):
+            self.fail("Remote call with malformed saved controls")
+        client = JevClient(transport=forbidden)
+        for document in ([], {"capabilities": None}, {"capabilities": {"jev": None}},
+                         {"capabilities": {"jev": False}}, {"jev": None}):
+            config.write_text(json.dumps(document), encoding="utf-8")
+            for config_path in (None, str(config)):
+                with self.subTest(document=document, config_path=config_path):
+                    with patch("jev_search.load_config", side_effect=lambda path: load_config(path, script_dir=script_dir)):
+                        result = run_search(self.ws, "auth", scopes=["module.py"], config_path=config_path, client=client)
+                    self.assertEqual(result["status"], "error")
+                    self.assertIn("config_error", result["coverage"]["reasons"])
 
     def test_stale_source_dropped_after_scoring(self):
         """If source file on disk changes between candidate generation and evidence return, drop candidate."""

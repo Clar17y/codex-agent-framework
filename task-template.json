@@ -6,7 +6,8 @@
     "For implementation tasks: Own the complete bounded outcome: local investigation, implementation, focused validation, routine repairs, command waiting and interpretation, and self-review until criteria pass or a concrete blocker is escalated.",
     "For implementation tasks: Resolve ordinary implementation, design, and repair decisions autonomously within the contract using judgment. Escalate to the primary only for concrete blockers: material product, requirements, or architectural decisions; ownership conflicts; missing authorization or unavailable prerequisites; or repeated failures requiring reassessment.",
     "For implementation tasks: Before implementation, confirm that the assigned change addresses the underlying cause or intended feature behavior and relevant affected cases. Look for related uses and existing reusable components, keeping investigation proportional. If the assignment misses coverage or a better shared implementation would cross your owned files, tell the primary before expanding ownership; do not silently deliver a known-incomplete fix. Validate representative affected cases and mention deliberate exclusions concisely. This is a lightweight scope check, not a required report or extra review round.",
-    "For implementation tasks: Before handing over implementation, inspect your changes for reuse, clarity, and unnecessary work. Apply justified simplifications within your ownership, preserve observable behavior and others' edits, and rerun affected checks if needed. Include a short summary and check results in the handoff. Perform this pass yourself; separate review or verification is chosen by the primary according to risk."
+    "For implementation tasks: Before handing over implementation, inspect your changes for reuse, clarity, and unnecessary work. Apply justified simplifications within your ownership, preserve observable behavior and others' edits, and rerun affected checks if needed. Include a short summary and check results in the handoff. Perform this pass yourself; separate review or verification is chosen by the primary according to risk.",
+    "When workflow.require_jev_evidence is true: implement tasks require task.jev.search and review tasks require task.jev.review. Each stage is an object with status 'attempted' (with result_path to saved JSON helper output inside workspace) or 'not_applicable' (with a non-empty specific reason). Review attempted evidence binds diff_sha256 to task.review.diff_path."
   ],
   "owned_paths": [
     "path/to/owned/source"
@@ -24,11 +25,21 @@
   "risk": "ordinary",
   "risk_reason": "Briefly explain risk and the chosen check/review depth; no separate risk record is needed.",
   "scope": "State the affected uses or feature flow, existing reusable components, chosen owning layer, and deliberate exclusions as applicable. Keep this concise; do not create a separate scope report.",
+  "jev": {
+    "search": {
+      "status": "attempted",
+      "result_path": ".llm-output/jev-search.json"
+    },
+    "review": {
+      "status": "attempted",
+      "result_path": ".llm-output/jev-review.json"
+    }
+  },
   "review": {
     "mode": "none | integrated_batch | integrated_batch_plus_correctness_gate",
     "candidate": "HEAD or commit identifier",
     "base": "Base revision when applicable",
-    "diff_path": "Saved integrated diff path when applicable",
+    "diff_path": ".llm-output/candidate.diff",
     "focus": "For a repeat review or extra gate, name the unresolved question or explicit requirement, related finding IDs, repair delta, affected invariants and earlier evidence to reuse. Batch related findings under one owner; a new commit alone is not a reason to restart the whole review."
   }
 }

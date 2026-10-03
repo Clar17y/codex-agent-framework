@@ -52,7 +52,8 @@ except ImportError:
     )
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "enabled": False,
+    "enabled": True,
+    "authorization_mode": "all_workspaces",
     "allowed_roots": [],
     "model": DEFAULT_MODEL,
     "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
@@ -194,6 +195,15 @@ def validate_config_dict(cfg: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"config.enabled must be a boolean, got {type(val).__name__}")
         validated["enabled"] = val
 
+    if "authorization_mode" in cfg:
+        mode = cfg["authorization_mode"]
+        if mode not in ("all_workspaces", "allowed_roots"):
+            raise ValueError("config.authorization_mode must be all_workspaces or allowed_roots")
+        validated["authorization_mode"] = mode
+    elif "allowed_roots" in cfg:
+        # Retain the meaning of an existing explicit allowlist on upgrade.
+        validated["authorization_mode"] = "allowed_roots"
+
     if "allowed_roots" in cfg:
         val = cfg["allowed_roots"]
         if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
@@ -241,6 +251,27 @@ def validate_config_dict(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return validated
 
 
+def _extract_jev_config(data: Any, source: Path, allow_bare: bool) -> Dict[str, Any]:
+    """Distinguish absent settings from malformed saved controls."""
+    if not isinstance(data, dict):
+        raise ValueError(f"Config at {source} must be a JSON object")
+    if "capabilities" in data:
+        capabilities = data["capabilities"]
+        if not isinstance(capabilities, dict):
+            raise ValueError(f"Config at {source} has malformed capabilities object")
+        if "jev" in capabilities:
+            jev_obj = capabilities["jev"]
+        else:
+            jev_obj = data.get("jev", {})
+    elif "jev" in data:
+        jev_obj = data["jev"]
+    else:
+        jev_obj = data if allow_bare else {}
+    if not isinstance(jev_obj, dict):
+        raise ValueError(f"Config at {source} has malformed Jev object")
+    return jev_obj
+
+
 def load_config(config_path: Optional[str] = None, script_dir: Optional[Path] = None) -> Tuple[Dict[str, Any], str]:
     """Load configuration from explicit path or discover ../routing.json."""
     if script_dir is None:
@@ -256,29 +287,20 @@ def load_config(config_path: Optional[str] = None, script_dir: Optional[Path] = 
         except Exception as e:
             raise ValueError(f"Malformed config JSON at {config_path}: {e}") from None
 
-        jev_obj = data.get("capabilities", {}).get("jev") if isinstance(data, dict) and "capabilities" in data else None
-        if jev_obj is None and isinstance(data, dict) and "jev" in data:
-            jev_obj = data.get("jev")
-        if jev_obj is None and isinstance(data, dict):
-            jev_obj = data
-
-        if not isinstance(jev_obj, dict):
-            raise ValueError(f"Config at {config_path} has malformed capabilities.jev object")
+        jev_obj = _extract_jev_config(data, cp, allow_bare=True)
         return validate_config_dict(jev_obj), str(cp)
 
     # Discover ../routing.json relative to script
     default_routing = (script_dir / "../routing.json").resolve()
-    if default_routing.is_file():
+    if default_routing.exists():
         try:
             content = default_routing.read_text(encoding="utf-8-sig")
             data = json.loads(content)
         except Exception as e:
             raise ValueError(f"Malformed discovered routing.json at {default_routing}: {e}") from None
 
-        if isinstance(data, dict):
-            jev_obj = data.get("capabilities", {}).get("jev", {})
-            if isinstance(jev_obj, dict):
-                return validate_config_dict(jev_obj), str(default_routing)
+        jev_obj = _extract_jev_config(data, default_routing, allow_bare=False)
+        return validate_config_dict(jev_obj), str(default_routing)
 
     # Absent file means defaults
     return dict(DEFAULT_CONFIG), "defaults"
@@ -290,6 +312,8 @@ def is_remote_authorized(workspace: Path, config: Dict[str, Any], allow_remote: 
         return True
     if not config.get("enabled", False):
         return False
+    if config.get("authorization_mode") == "all_workspaces":
+        return True
 
     resolved_ws = workspace.resolve()
     allowed_roots = [Path(r).resolve() for r in config.get("allowed_roots", [])]

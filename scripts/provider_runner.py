@@ -34,6 +34,18 @@ CODEX_TOOL_ITEM_TYPES = frozenset(("command_execution", "file_change", "mcp_tool
 # Gemini-only telemetry implementation.
 GEMINI_STREAM_POLL_SECONDS = STREAM_POLL_SECONDS
 GEMINI_PROGRESS_EMIT_SECONDS = STREAM_PROGRESS_EMIT_SECONDS
+MAX_EVIDENCE_BYTES = 1024 * 1024
+
+def safe_regular_file(path, workspace):
+    """Load the shared Jev path checks only when evidence validation needs them."""
+    try:
+        from jev_search import safe_regular_file as jev_safe_regular_file
+    except ImportError:
+        try:
+            from scripts.jev_search import safe_regular_file as jev_safe_regular_file
+        except ImportError as exc:
+            raise ValueError("Jev evidence checks are unavailable; reinstall the complete framework") from exc
+    return jev_safe_regular_file(path, workspace)
 
 DEEPSEEK_OUTPUT_SCHEMA = {
     "type": "object",
@@ -316,6 +328,159 @@ def prompt_for(workspace, task_path, task=None):
             "Read nearest scoped CLAUDE.md for every area touched. "
             "Report changes, checks, unresolved issues and evidence.\nTASK CONTRACT\n"
             + json.dumps(task, indent=2) + "\nREPOSITORY INSTRUCTIONS\n" + "\n".join(instructions))
+
+
+def read_bounded_evidence_file(file_path_str, workspace, max_bytes=MAX_EVIDENCE_BYTES):
+    path = Path(file_path_str)
+    if ".." in path.parts:
+        raise ValueError(f"Evidence path contains parent traversal: {file_path_str}")
+    target = path if path.is_absolute() else (workspace / path)
+    target_abs = Path(os.path.abspath(target))
+    workspace_abs = Path(os.path.abspath(workspace))
+    if not safe_regular_file(target_abs, workspace_abs):
+        raise ValueError(f"Evidence file must be a regular file inside workspace without links or hardlinks: {file_path_str}")
+    try:
+        size = target_abs.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"Cannot stat evidence file '{file_path_str}': {exc}") from exc
+    if size > max_bytes:
+        raise ValueError(f"Evidence file exceeds size limit ({size} > {max_bytes} bytes): {file_path_str}")
+    try:
+        with target_abs.open("rb") as stream:
+            opened_stat = os.fstat(stream.fileno())
+            raw = stream.read(max_bytes + 1)
+        current_stat = target_abs.stat()
+        if (opened_stat.st_dev, opened_stat.st_ino, opened_stat.st_size) != (current_stat.st_dev, current_stat.st_ino, current_stat.st_size):
+            raise ValueError(f"Evidence file changed during read: {file_path_str}")
+        if not safe_regular_file(target_abs, workspace_abs):
+            raise ValueError(f"Evidence file link status changed during read: {file_path_str}")
+    except OSError as exc:
+        raise ValueError(f"Cannot read evidence file '{file_path_str}': {exc}") from exc
+    if len(raw) > max_bytes:
+        raise ValueError(f"Evidence file exceeds size limit: {file_path_str}")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        raise ValueError(f"Evidence file is UTF-16; save it as UTF-8: {file_path_str}")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeError as exc:
+        raise ValueError(f"Evidence file must be UTF-8: {file_path_str}") from exc
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"Evidence file is malformed JSON: {file_path_str}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Evidence file must contain a JSON object: {file_path_str}")
+    return data
+
+
+def validate_jev_task(task, workspace, role):
+    stage_name = "search" if role == "implement" else "review"
+    jev_section = task.get("jev")
+    if jev_section is None or not isinstance(jev_section, dict):
+        raise ValueError(f"Task contract missing required 'jev' object for {role} role")
+    if stage_name not in jev_section:
+        raise ValueError(f"Task contract missing required 'jev.{stage_name}' object for {role} role")
+    stage = jev_section[stage_name]
+    if not isinstance(stage, dict):
+        raise ValueError(f"Task contract 'jev.{stage_name}' must be an object")
+
+    decision_status = stage.get("status")
+    if decision_status not in ("attempted", "not_applicable"):
+        raise ValueError(f"Task jev.{stage_name}.status must be 'attempted' or 'not_applicable'; got {decision_status!r}")
+
+    if decision_status == "not_applicable":
+        reason = stage.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"Task jev.{stage_name} with status 'not_applicable' requires a non-empty string 'reason'")
+        return {
+            "stage": stage_name,
+            "decision": "not_applicable",
+            "reason": reason.strip(),
+        }
+
+    # decision_status == "attempted"
+    result_path = stage.get("result_path")
+    if not isinstance(result_path, str) or not result_path.strip():
+        raise ValueError(f"Task jev.{stage_name} with status 'attempted' requires a non-empty string 'result_path'")
+    result_path_str = result_path.strip()
+
+    evidence = read_bounded_evidence_file(result_path_str, workspace)
+
+    cmd = evidence.get("command")
+    if cmd in ("doctor", "inspect"):
+        raise ValueError(f"Diagnostic {cmd} output rejected as actual Jev evidence: {result_path_str}")
+    if cmd != stage_name:
+        raise ValueError(f"Evidence command '{cmd}' does not match required stage '{stage_name}': {result_path_str}")
+
+    helper_status = evidence.get("status")
+    if helper_status not in ("complete", "partial", "unavailable", "error"):
+        raise ValueError(f"Jev evidence status must be 'complete', 'partial', 'unavailable', or 'error'; got {helper_status!r}")
+
+    if helper_status == "complete" and isinstance(evidence.get("coverage"), dict) and evidence["coverage"].get("complete") is False:
+        raise ValueError(f"Fabricated success: helper status is 'complete' but coverage.complete is false: {result_path_str}")
+
+    if stage_name == "search":
+        evidence_ws = evidence.get("workspace")
+        if evidence_ws is not None and isinstance(evidence_ws, str) and evidence_ws.strip():
+            try:
+                ev_resolved = Path(evidence_ws).resolve()
+                ws_resolved = Path(workspace).resolve()
+                if os.path.normcase(str(ev_resolved)) != os.path.normcase(str(ws_resolved)):
+                    raise ValueError(
+                        f"Search evidence workspace mismatch: evidence workspace '{evidence_ws}' does not match active workspace '{workspace}'"
+                    )
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(f"Invalid workspace path in search evidence: {exc}") from exc
+
+    if stage_name == "review":
+        if helper_status in ("complete", "partial"):
+            diff_sha = evidence.get("diff_sha256")
+            if not isinstance(diff_sha, str) or not diff_sha.strip():
+                raise ValueError(f"Successful/partial review evidence must include 'diff_sha256': {result_path_str}")
+
+            review_info = task.get("review")
+            if not isinstance(review_info, dict) or not review_info.get("diff_path") or not isinstance(review_info["diff_path"], str) or not review_info["diff_path"].strip():
+                raise ValueError(f"Review task requires non-empty 'review.diff_path' to bind with review evidence")
+            diff_path_str = review_info["diff_path"].strip()
+
+            diff_path = Path(diff_path_str)
+            if ".." in diff_path.parts:
+                raise ValueError(f"Review diff path contains parent traversal: {diff_path_str}")
+            diff_target = diff_path if diff_path.is_absolute() else (workspace / diff_path)
+            diff_target_abs = Path(os.path.abspath(diff_target))
+            if not safe_regular_file(diff_target_abs, Path(os.path.abspath(workspace))):
+                raise ValueError(f"Review diff file must be a regular file inside workspace without links or hardlinks: {diff_path_str}")
+            try:
+                with diff_target_abs.open("rb") as f:
+                    diff_raw = f.read(MAX_EVIDENCE_BYTES + 1)
+            except OSError as exc:
+                raise ValueError(f"Cannot read review diff file '{diff_path_str}': {exc}") from exc
+            if len(diff_raw) > MAX_EVIDENCE_BYTES:
+                raise ValueError(f"Review diff file exceeds size limit: {diff_path_str}")
+            actual_diff_sha = hashlib.sha256(diff_raw).hexdigest()
+            if diff_sha.strip().lower() != actual_diff_sha.lower():
+                raise ValueError(
+                    f"Review evidence diff hash mismatch: evidence diff_sha256 '{diff_sha}' does not match diff file SHA-256 '{actual_diff_sha}' ({diff_path_str})"
+                )
+
+    jev_meta = {
+        "stage": stage_name,
+        "decision": "attempted",
+        "result_path": result_path_str,
+        "status": helper_status,
+    }
+    if "coverage" in evidence and evidence["coverage"] is not None:
+        jev_meta["coverage"] = evidence["coverage"]
+    if "diff_sha256" in evidence and evidence["diff_sha256"] is not None:
+        jev_meta["diff_sha256"] = evidence["diff_sha256"]
+    if "error" in evidence and evidence["error"] is not None:
+        jev_meta["error"] = evidence["error"]
+    if "focus_count" in evidence:
+        jev_meta["focus_count"] = evidence["focus_count"]
+    if "unknown_count" in evidence:
+        jev_meta["unknown_count"] = evidence["unknown_count"]
+
+    return jev_meta
 
 
 def direct_windows_codex_command(command, platform_name=None):
@@ -1976,6 +2141,12 @@ def execute(args):
     if not workspace.is_dir():
         raise ValueError("Workspace must be a directory")
     config = read_json(args.config)
+    workflow = config.get("workflow", {})
+    if not isinstance(workflow, dict):
+        raise ValueError("Routing workflow must be an object")
+    require_jev = workflow.get("require_jev_evidence", False)
+    if not isinstance(require_jev, bool):
+        raise ValueError("Routing workflow.require_jev_evidence must be a boolean")
     quota_cooldown(config)
     provider_name = getattr(args, "provider", None) or ("gemini" if args.role == "implement" else "claude")
     if args.role == "review" and provider_name != "claude":
@@ -2010,6 +2181,9 @@ def execute(args):
         else:
             review_reason = review_reason_arg.strip() if (review_reason_arg and review_reason_arg.strip()) else None
     task = read_json(args.task_file)
+    jev_meta = None
+    if require_jev:
+        jev_meta = validate_jev_task(task, workspace, args.role)
     owned_paths = normalized_owned_paths(workspace, task.get("owned_paths"))
     owned_claims = [os.path.normcase(str((workspace / path).resolve())) for path in owned_paths]
     prompt = prompt_for(workspace, args.task_file, task)
@@ -2024,6 +2198,8 @@ def execute(args):
         if args.role == "review":
             dry_run_meta["review_effort"] = review_effort
             dry_run_meta["review_reason"] = review_reason
+        if jev_meta is not None:
+            dry_run_meta["jev"] = jev_meta
         return dry_run_meta, 0
 
     secrets = [value.strip() for _, value in framework_secrets(config)]
@@ -2106,6 +2282,8 @@ def execute(args):
               "outer_timeout_seconds": timeout + termination_grace,
               "heartbeat_seconds": heartbeat_seconds,
               "progress_path": str(output / "progress.json")}
+    if jev_meta is not None:
+        result["jev"] = jev_meta
     if args.role == "review":
         result["review_effort"] = review_effort
         result["review_reason"] = review_reason

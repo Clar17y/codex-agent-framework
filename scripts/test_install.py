@@ -274,11 +274,12 @@ class TestInstallFramework(unittest.TestCase):
         self.assertEqual(updated_routing_2["providers"]["gemini"]["executable"], custom_gemini)
         self.assertEqual(updated_routing_2["providers"]["claude"]["executable"], custom_claude)
 
-    def test_jev_defaults_upgrade_without_enabling_or_overwriting_settings(self):
+    def test_jev_defaults_and_preserving_explicit_settings(self):
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         routing = self.dest_root / 'agent-framework/routing.json'
         original = json.loads(routing.read_text(encoding='utf-8'))
-        self.assertFalse(original['capabilities']['jev']['enabled'])
+        self.assertTrue(original['capabilities']['jev']['enabled'])
+        self.assertEqual(original['capabilities']['jev']['authorization_mode'], 'all_workspaces')
         self.assertEqual(original['capabilities']['jev']['allowed_roots'], [])
         old = dict(original)
         old.pop('capabilities')
@@ -291,11 +292,28 @@ class TestInstallFramework(unittest.TestCase):
         routing.write_text(json.dumps(original), encoding='utf-8')
         self.assertEqual(resolve_routing(self.source_root, self.dest_root), original)
 
+    def test_jev_preserves_disabled_and_legacy_allowlist(self):
+        install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / 'agent-framework/routing.json'
+        original = json.loads(routing_path.read_text(encoding='utf-8'))
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                jev = original['capabilities']['jev']
+                jev.pop('authorization_mode', None)
+                jev.update(enabled=enabled, allowed_roots=['C:/authorized/project'])
+                routing_path.write_text(json.dumps(original), encoding='utf-8')
+                result = resolve_routing(self.source_root, self.dest_root)['capabilities']['jev']
+                self.assertIs(result['enabled'], enabled)
+                self.assertEqual(result['authorization_mode'], 'allowed_roots')
+                self.assertEqual(result['allowed_roots'], ['C:/authorized/project'])
+
     def test_malformed_jev_capability_is_not_silently_replaced(self):
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         routing = self.dest_root / 'agent-framework/routing.json'
         original = json.loads(routing.read_text(encoding='utf-8'))
-        for bad in ([], {'jev': False}):
+        for bad in ([], {'jev': False}, {'jev': {'enabled': 'true'}},
+                    {'jev': {'authorization_mode': None}},
+                    {'jev': {'authorization_mode': 'all'}}):
             with self.subTest(capabilities=bad):
                 original['capabilities'] = bad
                 routing.write_text(json.dumps(original), encoding='utf-8')
@@ -905,6 +923,71 @@ class TestInstallFramework(unittest.TestCase):
 
         # 4. Verify no mutation occurred on target
         self.assertEqual(routing_path.read_bytes(), original_routing_bytes)
+
+    def test_workflow_default_merged_on_upgrade(self):
+        """Ordinary install merges missing workflow.require_jev_evidence=true default while preserving config."""
+        # 1. Install initially
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        # Strip workflow to simulate legacy pre-workflow configuration
+        routing.pop("workflow", None)
+        routing["capabilities"]["jev"]["enabled"] = True
+        routing["capabilities"]["jev"]["allowed_roots"] = ["C:/dev/test"]
+        routing_path.write_text(json.dumps(routing, indent=2), encoding="utf-8")
+
+        # 2. Upgrade without refresh_routing
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+
+        # 3. Verify workflow.require_jev_evidence merged, Jev enabled/allowed_roots preserved
+        upgraded = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertIn("workflow", upgraded)
+        self.assertIs(upgraded["workflow"].get("require_jev_evidence"), True)
+        self.assertIs(upgraded["capabilities"]["jev"]["enabled"], True)
+        self.assertEqual(upgraded["capabilities"]["jev"]["allowed_roots"], ["C:/dev/test"])
+
+    def test_workflow_explicit_false_and_true_preserved_on_upgrade(self):
+        """Explicit operator workflow settings (true/false) and custom fields are preserved on upgrade."""
+        for explicit_value in (False, True):
+            with self.subTest(explicit_value=explicit_value):
+                install_framework(str(self.dest_root), source=str(self.source_root))
+                routing_path = self.dest_root / "agent-framework/routing.json"
+                routing = json.loads(routing_path.read_text(encoding="utf-8"))
+                routing["workflow"] = {
+                    "require_jev_evidence": explicit_value,
+                    "custom_unrelated_setting": "preserved_value",
+                }
+                routing_path.write_text(json.dumps(routing, indent=2), encoding="utf-8")
+
+                install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+
+                upgraded = json.loads(routing_path.read_text(encoding="utf-8"))
+                self.assertIs(upgraded["workflow"].get("require_jev_evidence"), explicit_value)
+                self.assertEqual(upgraded["workflow"].get("custom_unrelated_setting"), "preserved_value")
+
+    def test_workflow_validation_rejects_invalid_types(self):
+        """Non-dict workflow or non-boolean require_jev_evidence raises PreflightError."""
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework/routing.json"
+
+        # Non-dict workflow
+        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        routing["workflow"] = "not_a_dict"
+        routing_path.write_text(json.dumps(routing, indent=2), encoding="utf-8")
+        with self.assertRaises(PreflightError):
+            install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+
+        # Non-bool require_jev_evidence (string)
+        routing["workflow"] = {"require_jev_evidence": "true"}
+        routing_path.write_text(json.dumps(routing, indent=2), encoding="utf-8")
+        with self.assertRaises(PreflightError):
+            install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+
+        # Non-bool require_jev_evidence (int)
+        routing["workflow"] = {"require_jev_evidence": 1}
+        routing_path.write_text(json.dumps(routing, indent=2), encoding="utf-8")
+        with self.assertRaises(PreflightError):
+            install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
 
 
 if __name__ == "__main__":

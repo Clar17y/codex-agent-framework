@@ -302,11 +302,53 @@ def provider_lock(directory, timeout, name="gemini.lock"):
             release()
 
 
+def validate_coverage_task(task):
+    """Validate optional coverage bookkeeping, never the truth/completeness of claims."""
+    if "coverage" not in task:
+        return
+    coverage = task["coverage"]
+    if not isinstance(coverage, dict):
+        raise ValueError("Task coverage must be an object")
+    required = coverage.get("required", False)
+    if not isinstance(required, bool):
+        raise ValueError("Task coverage.required must be a boolean")
+    items = coverage.get("items")
+    if not isinstance(items, list):
+        raise ValueError("Task coverage.items must be a list")
+    if required and not items:
+        raise ValueError("Task coverage.required requires non-empty coverage.items")
+    for index, item in enumerate(items):
+        label = f"Task coverage.items[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{label} must be an object")
+        for field in ("invariant", "check"):
+            value = item.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{label}.{field} must be a non-empty string")
+        cases = item.get("cases")
+        if not isinstance(cases, list) or not cases or any(
+                not isinstance(case, str) or not case.strip() for case in cases):
+            raise ValueError(f"{label}.cases must be a non-empty list of non-empty strings")
+        status = item.get("status")
+        if status not in ("planned", "proved", "unproved"):
+            raise ValueError(f"{label}.status must be 'planned', 'proved' or 'unproved'")
+        for field in ("evidence", "limitation"):
+            if field in item and (not isinstance(item[field], str) or not item[field].strip()):
+                raise ValueError(f"{label}.{field} must be a non-empty string when supplied")
+        if status == "proved" and "evidence" not in item:
+            raise ValueError(f"{label} with status 'proved' requires evidence")
+        if status == "unproved" and "limitation" not in item:
+            raise ValueError(f"{label} with status 'unproved' requires a limitation")
+        if status == "planned" and "evidence" in item:
+            raise ValueError(f"{label} with status 'planned' cannot claim execution evidence")
+
+
 def prompt_for(workspace, task_path, task=None):
     task = read_json(task_path) if task is None else task
     for field in ("objective", "acceptance_criteria", "owned_paths", "validation", "instructions_files"):
         if field not in task:
             raise ValueError("Missing task contract field: " + field)
+    validate_coverage_task(task)
     paths = list(task["instructions_files"])
     for name in ("AGENTS.md", "CLAUDE.md"):
         if (workspace / name).is_file() and name not in paths:
@@ -326,7 +368,10 @@ def prompt_for(workspace, task_path, task=None):
             "Complete only the supplied task. Follow applicable repository instructions. "
             "Preserve unrelated changes. Do not commit, push, reset, or delete work. "
             "Read nearest scoped CLAUDE.md for every area touched. "
-            "Report changes, checks, unresolved issues and evidence.\nTASK CONTRACT\n"
+            "Report changes, checks, unresolved issues and evidence. "
+            "When coverage is supplied, distinguish planned checks from proved cases with concrete "
+            "candidate-specific evidence/results; identify missing or unproved cases and limitations "
+            "in the handoff. Structural validation does not prove semantic completeness.\nTASK CONTRACT\n"
             + json.dumps(task, indent=2) + "\nREPOSITORY INSTRUCTIONS\n" + "\n".join(instructions))
 
 

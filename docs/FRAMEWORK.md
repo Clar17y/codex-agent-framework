@@ -24,9 +24,54 @@ Before assigning files or editing, treat the reported example as evidence, not n
 
 Substantial delegated workers own the complete bounded outcome: local investigation, implementation, focused validation, routine repairs, command waiting and interpretation, and self-review. Implementers confirm the proposed scope and resolve ordinary implementation and design decisions autonomously within the contract. They escalate material product or architectural decisions, ownership conflicts, missing authorization or unavailable prerequisites, and repeated failures requiring reassessment. The primary remains responsible for scope, architecture, decomposition, ownership boundaries, material decisions, integration, risk assessment, and final acceptance; it does not duplicate the worker's routine execution.
 
+### Coverage map
+
+The [central coverage policy](../GLOBAL_POLICY.md) requires critical invariants, relevant transitions and boundary cases in the existing contract before substantial stateful, concurrency, cancellation or accounting work. Use the same convention for provider-adapter and native-worker assignments; a native contract may express the fields below as a compact table. Small, understood fixes keep proportional checks without a mandatory map or extra report.
+
+`task-template.json` adds one optional `coverage` object. Existing ordinary contracts may omit it. Set `required: true` for an explicit coverage requirement and fill `items` before implementation. Otherwise `required` defaults to false and an empty `items` list is allowed. The populated template entry is guidance to replace, not completed coverage.
+
+| Field | Meaning |
+| --- | --- |
+| `items[].invariant` | Non-empty statement of the behavior that must hold. |
+| `items[].cases` | Non-empty list of transitions, boundaries or input/state combinations. Group only cases sharing the check, status and evidence; split entries otherwise. |
+| `items[].check` | Non-empty planned test/check and what it must establish. |
+| `items[].status` | `planned` before evidence is available; `proved` is a claim backed by evidence; `unproved` explicitly records a gap or failed check. |
+| `items[].evidence` | Non-empty candidate-specific command/test, result and useful log/assertion reference. Required for `proved`, optional for `unproved`, absent for `planned`. |
+| `items[].limitation` | Non-empty explanation of missing coverage, failure, unavailable prerequisites or deliberate exclusions. Required for `unproved`; optional otherwise. |
+
+The adapter validates supplied maps for both implementation and review at the existing prompt boundary, before dry-run invocation or launch. It rejects malformed objects, lists, fields and statuses, non-boolean `required`, empty explicitly required maps, proved claims without evidence, and unproved entries without limitations. It never runs the planned checks, reads coverage evidence references or promotes a plan to proved. Structural validation does not prove semantic completeness, the truth of an evidence claim, or that all necessary cases have been listed. Instruction-level policy governs native assignments without claiming runtime interception. Jev accounting, ownership, model pins, quota, credential controls and release gates remain independent requirements.
+
+For example, an accounting map should consider zero, positive and unknown cost; matching, conflicting, missing and invalid currency; finite and unbounded reservations; and unsettled and genuinely settled processes. Select relevant combinations rather than assuming separate checks of each dimension prove their interactions. These two entries deliberately remain planned until their checks produce evidence:
+
+```json
+{
+  "coverage": {
+    "required": true,
+    "items": [
+      {
+        "invariant": "A zero report alone does not establish settlement or release a reservation.",
+        "cases": ["Unsettled process; zero cost; conflicting currency; finite reservation remains."],
+        "check": "Assert unsettled state and retained reservation despite reported zero.",
+        "status": "planned"
+      },
+      {
+        "invariant": "Settlement and reservation release require validated process and monetary state.",
+        "cases": ["Genuinely settled process; zero cost; matching valid currency; no reservation remains."],
+        "check": "Establish actual settlement and correct reservation release for validated zero.",
+        "status": "planned"
+      }
+    ]
+  }
+}
+```
+
+An unsettled zero with conflicting currency and a remaining reservation is a separate case from a proved settled zero. Passing the latter check does not prove the former, or cover unknown cost, missing/invalid currency or unbounded reservations. This is an illustrative contract, not an application change.
+
 ## Implementation handoff
 
 Before handing over implementation, inspect your changes for reuse, clarity, and unnecessary work. Apply justified simplifications within your ownership, preserve observable behavior and others' edits, and rerun affected checks if needed. Perform this pass yourself; separate review or verification is chosen by the primary according to risk. Return a concise handoff including completion or blocker status, changed paths within assigned ownership, key design decisions, candidate identity (e.g. HEAD plus scoped diff/status), exact checks and results, residual concerns, and useful log locations, without routine status chatter or raw command dumps.
+
+Update or report the coverage map with evidence/results or explicit limitations, identifying missing and still-planned or unproved cases. The primary must inspect claimed coverage against concrete evidence for those cases and the candidate before acceptance; a test count, provider completion or review verdict alone does not establish coverage.
 
 ## Invocation
 
@@ -99,9 +144,11 @@ The primary can run checks directly. Delegate verification when it adds useful i
 
 ### Review and repair batches
 
-Follow the mandatory [review and handoff discipline](../GLOBAL_POLICY.md#review-and-handoff-discipline). The unit of repair is an affected behavior or invariant, including its relevant callers and failure paths. Collect and adjudicate available findings before returning one batch to its owner. A second cycle exposing another related defect triggers a component-level reassessment before another patch; it is not a limit on fixing bugs.
+Follow the mandatory [review and handoff discipline](../GLOBAL_POLICY.md#review-and-handoff-discipline). The unit of repair is an affected behavior or invariant, including its relevant callers and failure paths. Collect and adjudicate available findings before returning one batch to its owner. A second related defect, including one found during implementation or validation, triggers a component-level reassessment and one complete repair batch before another patch; it does not wait for another review cycle or limit fixing bugs.
 
 The usual shape is one complete implementation/validation handoff, one integrated review when warranted, then targeted repair checks. A follow-up contract carries the original findings, changed candidate, affected invariants and reusable evidence. Whole-change reviews, extra gates and broad reruns need a specific remaining question or explicit requirement. For example, several findings about start, retry and cleanup belong in one lifecycle repair; they should not each start a fresh reviewer/gate/verifier chain.
+
+For complex repairs, an interim checkpoint can precede expensive broad reruns: the same repair owner reaches an identified candidate with passing focused tests, inspects it against the coverage map and related findings, and uses the self-review or integrated review already chosen. Related repairs and remaining validation stay with that worker unless an explicit ownership change is necessary. After stabilization, run required broad checks on the stable final candidate and retain credible matching evidence for unchanged inputs. A checkpoint is not final acceptance and introduces no universal extra reviewer, approval gate or mandatory agent sequence.
 
 Workers return immediately when their assigned outcome is complete. Recover a delayed report from existing command results instead of repeating completed work. Local and hosted work may overlap after their prerequisites are satisfied; required CI and release gates still determine final acceptance.
 

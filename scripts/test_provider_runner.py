@@ -19,6 +19,165 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import provider_runner as runner
 
 
+class CoverageContractTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).resolve().parent.parent / ".llm-output" / str(uuid.uuid4())
+        self.root.mkdir(parents=True)
+        self.task_path = self.root / "task.json"
+        self.config_path = self.root / "config.json"
+        self.task = {"objective": "Coverage contract", "acceptance_criteria": ["Compatible"],
+                     "owned_paths": [], "validation": [], "instructions_files": []}
+        self.config = {"providers": {
+            "gemini": {"executable": "not-a-real-program", "model": "gemini-3.8-flash-medium"},
+            "claude": {"executable": "not-a-real-program", "model": "claude-opus-5-5"}}}
+
+    def item(self, **updates):
+        return {"invariant": "A plan is not execution evidence",
+                "cases": ["unsettled zero with conflicting currency and remaining reservation"],
+                "check": "Focused test asserts reservation remains while process is unsettled",
+                "status": "planned", **updates}
+
+    def execute(self, role="implement", dry_run=True):
+        runner.write_json(self.task_path, self.task)
+        runner.write_json(self.config_path, self.config)
+        return runner.execute(argparse.Namespace(
+            role=role, workspace=str(self.root), task_file=str(self.task_path),
+            config=str(self.config_path), state_dir=str(self.root / "state"), dry_run=dry_run))
+
+    def prompt(self):
+        return runner.prompt_for(self.root, self.task_path, self.task)
+
+    def test_legacy_contract_without_coverage_remains_usable_for_both_roles(self):
+        for role in ("implement", "review"):
+            with self.subTest(role=role):
+                result, code = self.execute(role)
+                self.assertEqual((result["status"], code), ("dry_run", 0))
+                self.assertNotIn("coverage", self.task)
+
+    def test_optional_empty_coverage_is_usable(self):
+        for coverage in ({"items": []}, {"required": False, "items": []}):
+            with self.subTest(coverage=coverage):
+                self.task["coverage"] = coverage
+                self.assertIn('"items": []', self.prompt())
+
+    def test_required_planned_coverage_is_accepted_without_promoting_it(self):
+        self.task["coverage"] = {"required": True, "items": [self.item()]}
+        original = json.dumps(self.task, sort_keys=True)
+        for role in ("implement", "review"):
+            with self.subTest(role=role):
+                result, code = self.execute(role)
+                self.assertEqual((result["status"], code), ("dry_run", 0))
+                self.assertIn('"status": "planned"', self.prompt())
+                self.assertEqual(json.dumps(self.task, sort_keys=True), original)
+                self.assertNotIn("coverage_proved", result)
+
+    def test_required_and_supplied_structure_is_validated(self):
+        malformed = [None, False, [], "coverage", {}, {"required": True},
+                     {"required": True, "items": []}, {"items": None}, {"items": {}},
+                     {"items": "cases"}, {"items": [None]}, {"items": [[]]}, {"items": [{}]}]
+        malformed.extend({"required": value, "items": [self.item()]}
+                         for value in (None, "true", 0, 1, []))
+        for coverage in malformed:
+            with self.subTest(coverage=coverage):
+                self.task["coverage"] = coverage
+                with self.assertRaisesRegex(ValueError, "coverage"):
+                    self.prompt()
+
+    def test_item_fields_and_cases_reject_missing_empty_or_malformed_values(self):
+        for field in ("invariant", "check", "cases", "status"):
+            bad_items = []
+            missing = self.item()
+            del missing[field]
+            bad_items.append(missing)
+            bad_items.extend(self.item(**{field: value}) for value in (None, "", "  ", 1, {}, []))
+            if field == "cases":
+                bad_items.extend(self.item(cases=value) for value in ("one", [""], [" "], [1], ["valid", None]))
+            if field == "status":
+                bad_items.extend(self.item(status=value) for value in ("passed", "complete", "Planned"))
+            for item in bad_items:
+                with self.subTest(field=field, item=item):
+                    self.task["coverage"] = {"items": [item]}
+                    with self.assertRaisesRegex(ValueError, "coverage"):
+                        self.prompt()
+
+    def test_proved_requires_evidence_and_unproved_requires_explicit_limitation(self):
+        for status, field in (("proved", "evidence"), ("unproved", "limitation")):
+            for updates in ({}, *({field: value} for value in (None, "", " ", 1, []))):
+                with self.subTest(status=status, updates=updates):
+                    self.task["coverage"] = {"items": [self.item(status=status, **updates)]}
+                    with self.assertRaisesRegex(ValueError, "coverage"):
+                        self.prompt()
+
+    def test_optional_evidence_and_limitations_must_be_nonempty_strings(self):
+        for field in ("evidence", "limitation"):
+            for value in (None, "", " ", False, [], {}):
+                with self.subTest(field=field, value=value):
+                    self.task["coverage"] = {"items": [self.item(**{
+                        "status": "unproved", "limitation": "Missing environment", field: value})]}
+                    with self.assertRaisesRegex(ValueError, "coverage"):
+                        self.prompt()
+
+    def test_planned_case_cannot_claim_execution_evidence(self):
+        self.task["coverage"] = {"items": [self.item(evidence="Claimed pass without running it")]}
+        with self.assertRaisesRegex(ValueError, "coverage"):
+            self.prompt()
+
+    def test_mixed_statuses_and_failed_check_evidence_are_preserved(self):
+        self.task["coverage"] = {"required": True, "items": [
+            self.item(),
+            self.item(cases=["settled zero with matching currency and no reservation"],
+                      status="proved", evidence="test_settled_zero: passed on candidate abc"),
+            self.item(status="unproved", evidence="focused check failed on candidate abc",
+                      limitation="Unsettled transition still fails; remaining reservation unproved")
+        ]}
+        prompt = self.prompt()
+        serialized = prompt.split("TASK CONTRACT\n", 1)[1].split("\nREPOSITORY INSTRUCTIONS\n", 1)[0]
+        self.assertEqual(json.loads(serialized), self.task)
+        self.assertIn("missing or unproved cases", prompt)
+
+    def test_evidence_claim_is_not_read_executed_or_semantically_certified(self):
+        self.task["coverage"] = {"items": [self.item(
+            status="proved", evidence="claimed pass; missing.log; unrelated candidate") ]}
+        # Structural validation cannot determine whether this claim proves the cases.
+        with mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("must not execute")):
+            self.assertIn("does not prove semantic completeness", self.prompt())
+
+    def test_invalid_coverage_fails_before_launch_logs_or_state_changes(self):
+        self.task["coverage"] = {"required": True, "items": []}
+        for role in ("implement", "review"):
+            for dry_run in (False, True):
+                with self.subTest(role=role, dry_run=dry_run):
+                    with mock.patch.object(runner.subprocess, "Popen") as launch:
+                        with self.assertRaisesRegex(ValueError, "coverage"):
+                            self.execute(role, dry_run)
+                        launch.assert_not_called()
+                    self.assertFalse((self.root / "state").exists())
+                    self.assertFalse((self.root / ".llm-output").exists())
+
+    def test_valid_coverage_does_not_waive_jev_ownership_or_provider_controls(self):
+        self.task["coverage"] = {"required": True, "items": [self.item()]}
+        self.config["workflow"] = {"require_jev_evidence": True}
+        for role in ("implement", "review"):
+            with self.subTest(role=role):
+                with self.assertRaisesRegex(ValueError, "jev"):
+                    self.execute(role)
+        self.config["workflow"]["require_jev_evidence"] = False
+        self.task["owned_paths"] = ["../outside.py"]
+        with self.assertRaisesRegex(ValueError, "[Oo]wned paths"):
+            self.execute()
+        self.task["owned_paths"] = []
+        result, code = self.execute("review")
+        self.assertEqual(code, 0)
+        command = result["command"]
+        self.assertEqual(command[command.index("--model") + 1], "claude-opus-5-5")
+        self.assertEqual(command[command.index("--tools") + 1], "Read,Glob,Grep")
+        self.assertIn("--strict-mcp-config", command)
+        self.assertIn("--dangerously-skip-permissions", command)
+        self.config["providers"]["claude"]["model"] = "sonnet"
+        with self.assertRaisesRegex(ValueError, "pinned model"):
+            self.execute("review")
+
+
 class ProviderTests(unittest.TestCase):
     def setUp(self):
         # Scratch is retained for inspection; never delete repository scratch files.

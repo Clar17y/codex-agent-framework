@@ -16,12 +16,25 @@
     "For implementation or verification tasks authorized to run commands: Own running and interpreting required focused commands and repair routine failures before handoff.",
     "Reuse credible matching evidence. Tasks authorized to run checks rerun them only when inputs change, evidence is missing or unreliable, repository policy requires it, or a specific concern warrants it (worker claims alone are not test evidence)."
   ],
+  "coverage": {
+    "required": false,
+    "items": [
+      {
+        "invariant": "For substantial stateful, concurrency, cancellation or accounting changes, fill this map before implementation under GLOBAL_POLICY.md; use the same convention for provider-adapter and native-worker assignments. Otherwise omit coverage or use empty items with required false.",
+        "cases": [
+          "Relevant transition or boundary combination; split entries when checks, status or evidence differ."
+        ],
+        "check": "Planned test/check and the behavior it must establish.",
+        "status": "planned"
+      }
+    ]
+  },
   "instructions_files": [
     "AGENTS.md",
     "CLAUDE.md"
   ],
   "known_partial_work": "Prior baseline, existing diffs, or evidence context if continuing or repairing; omit when starting fresh.",
-  "handoff": "Return immediately when the assigned outcome and checks finish, or a concrete blocker is established. Include completion or blocker status, candidate identity, key decisions or findings, checks or evidence assessed, residual concerns, and useful log locations without chatter or raw dumps. For implementation tasks, also include owned changed paths. Do not hold completed results for optional work or wait for permission to report.",
+  "handoff": "Return immediately when the assigned outcome and checks finish, or a concrete blocker is established. Include completion or blocker status, candidate identity, key decisions or findings, checks or evidence assessed, residual concerns, and useful log locations without chatter or raw dumps. For implementation tasks, also include owned changed paths. For coverage entries, distinguish planned from proved: proved requires concrete evidence/results for the candidate and cases, unproved requires an explicit limitation. Identify missing or unproved cases explicitly; structural validation does not prove semantic completeness. Do not hold completed results for optional work or wait for permission to report.",
   "risk": "ordinary",
   "risk_reason": "Briefly explain risk and the chosen check/review depth; no separate risk record is needed.",
   "scope": "State the affected uses or feature flow, existing reusable components, chosen owning layer, and deliberate exclusions as applicable. Keep this concise; do not create a separate scope report.",

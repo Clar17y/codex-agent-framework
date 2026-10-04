@@ -131,6 +131,17 @@ class TestInstallFramework(unittest.TestCase):
         self.assertIn(END_MARKER, agents_content)
         self.assertIn(dest_posix, agents_content)
 
+        # The installed policy is generated from this package, not a separate rule copy.
+        expected_policy = (self.source_root / 'GLOBAL_POLICY.md').read_text(encoding='utf-8').replace(
+            '{{CODEX_ROOT}}', dest_posix)
+        self.assertEqual(policy_content, expected_policy)
+        self.assertIn(expected_policy.strip(), agents_content)
+        source_task = json.loads((self.source_root / 'task-template.json').read_text(encoding='utf-8'))
+        installed_task = json.loads((af_dir / 'task-template.json').read_text(encoding='utf-8'))
+        self.assertEqual(installed_task, source_task)
+        self.assertFalse(installed_task['coverage']['required'])
+        self.assertEqual(installed_task['coverage']['items'][0]['status'], 'planned')
+
         # Check manifest contents
         manifest = json.loads((af_dir / "install-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest.get("version"), 5)

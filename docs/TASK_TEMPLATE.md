@@ -59,6 +59,14 @@ For implementation or verification tasks authorized to run commands, own running
 - repair routine failures before handoff;
 - reuse credible matching evidence; tasks authorized to run checks rerun them only when inputs change, evidence is missing/unreliable, repository policy requires it, or a specific concern warrants it (worker claims alone are not test evidence).
 
+## Coverage (when applicable)
+
+Use the framework's [coverage map convention](FRAMEWORK.md#coverage-map) in this contract for provider-adapter and native-worker assignments. Omit for small, understood fixes under the central policy. Record relevant transitions and boundary combinations before implementation; update evidence or explicit limitations at handoff.
+
+| Invariant | Relevant cases | Planned test/check | Status: planned, proved or unproved | Evidence/result or limitation |
+| --- | --- | --- | --- | --- |
+| | | | planned | |
+
 ## Handoff
 
 Return a concise report without routine status chatter or raw command dumps:
@@ -67,6 +75,7 @@ Return a concise report without routine status chatter or raw command dumps:
 - concise design rationale and key decisions;
 - candidate identity (e.g. HEAD plus scoped diff/status);
 - exact commands run and results, or evidence assessed for read-only tasks;
+- missing or unproved coverage cases and explicit limitations;
 - residual concerns and useful log locations;
 - for review repairs: finding IDs, original findings, repair diff, affected behavior, and round number.
 ```

@@ -1,6 +1,6 @@
 # Codex Agent Framework
 
-Multi-provider orchestration framework coordinating Gemini Flash and Claude Code under OpenAI Codex with fail-closed fallback routing, live quota caching, and process isolation.
+Multi-provider orchestration framework coordinating Gemini Flash, optional Muse Code, and Claude Code under OpenAI Codex with fail-closed fallback routing, local quota caching, and process isolation.
 
 [![CI](https://github.com/Clar17y/codex-agent-framework/actions/workflows/tests.yml/badge.svg)](https://github.com/Clar17y/codex-agent-framework/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -97,6 +97,8 @@ No `pip install` is needed. You can install from a cloned repository or from a r
 
 The framework installs twelve roles (see [Repository layout](#repository-layout)). Custom role discovery depends on the Codex host; see [OpenAI's custom-agent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents). A host without custom-role support must explicitly pass the role's model, effort, and instructions when spawning.
 
+The optional `ask-muse` skill and routing entry are installed even when the Muse CLI is absent. Install [Muse Code](https://dev.meta.ai/docs/muse-code) separately, open `muse` and complete its browser sign-in with the account holding the Power subscription. The CLI subscription is separate from pay-as-you-go API keys. A stored API key can override browser login; resolve account selection in Muse before running subscription work. The adapter removes known API-key environment overrides from external children and does not inspect or alter stored authentication files. Use `python install.py --muse <executable>` if Muse is outside PATH.
+
 The default installation destination is `~/.codex` (honoring `CODEX_HOME` or `--codex-home /path/to/codex`). Existing files replaced during installation are backed up under `agent-framework/backups/`, and `agent-framework/install-manifest.json` records file hashes and backup paths. Unrelated configurations, roles, skills, and credentials are preserved.
 
 The installer enforces lexical path checks, refusing linked source or target paths (including symlinks and NTFS reparse points) to prevent circular links or synced-folder collisions. If a macOS source directory has a symlinked ancestor, supply its physical path: `python3 install.py --source "$(pwd -P)"`. Choose a physical destination path as well; symlinks inside the Codex directory are prohibited. The installer also inspects `AGENTS.md` before modification, refusing ambiguous, malformed, or reversed policy markers. Installation is not a filesystem-wide transaction and there is no automatic uninstaller; restore from `agent-framework/backups/` if manual recovery is required. An existing `.agent-framework-install.lock` prevents concurrent installations and dry runs. **Stop active framework jobs before upgrading.**
@@ -158,11 +160,13 @@ python3 install.py --gemini "$HOME/.local/bin/agy" --claude "$HOME/.local/bin/cl
 
 DeepSeek has been retired from active framework routing in v9. Any preexisting user Codex profiles (`deepseek.config.toml`) or environment credentials (`DEEPSEEK_API_KEY`) on your machine remain untouched. Legacy adapter internals and balance verification logic are retained for compatibility, but DeepSeek is no longer configured, offered, or automatically recommended for active tasks.
 
-The installed routing preserves Gemini `gemini-3.8-flash-medium` as primary implementer, falling back directly to native Luna medium (`gpt-6-luna`), Claude `claude-opus-5-5` with medium review effort by default, and native fallback roles (Astra low for review). Installation does not guarantee that these models are activated on your external accounts.
+The installed routing preserves Gemini `gemini-3.8-flash-medium` as the implicit implementer, falling back directly to native Luna medium (`gpt-6-luna`), Claude `claude-opus-5-5` with medium review effort by default, and native fallback roles (Astra low for review). Muse is selected explicitly with `--provider muse`; its packaged model is `muse-wonder-1.0`, and `providers.muse.model: "cli-default"` uses the selection in Muse settings when a subscription-only model's CLI ID is not documented. Installation does not guarantee model or subscription access. Muse also has explicit profiles: `--muse-profile routine` (default, regular Wonder `muse-wonder-1.0` medium), `--muse-profile complex` (Wonder Full `muse-wonder-full-1.0` medium) and `--muse-profile escalation` (Wonder Full `muse-wonder-full-1.0` high), configured under `providers.muse.profiles` (routing v11).
 
 ## Command reference and usage
 
 ### Provider availability status
+
+For an explicitly chosen Muse implementation, run `python "<codex-root>/agent-framework/scripts/provider_runner.py" status --provider muse --config "<codex-root>/agent-framework/routing.json"`, then `python "<codex-root>/agent-framework/scripts/provider_runner.py" implement --provider muse --workspace "<workspace>" --task-file "<contract.json>" --config "<codex-root>/agent-framework/routing.json"`, adding `--muse-profile complex` or `--muse-profile escalation` when the primary deliberately selects Wonder Full. The status command reads the local `muse-quota.json` cache and never contacts Muse. Terminal quota exhaustion and established CLI failures route to native Luna medium; timeouts and uncertain output retain the pending ownership claim. A live signed-in Power subscription run remains necessary to validate actual entitlement and model access.
 
 Check provider availability and cached quota state without invoking models or creating task contracts:
 

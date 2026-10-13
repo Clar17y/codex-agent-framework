@@ -45,6 +45,7 @@ OpenAI separately reports Luna 6 max at 66.6% on DeepSWE v1.1 in its own evaluat
 | `planner`, `test_engineer` | GPT-6 Sol medium | Planning and adversarial test design require judgment; start at Sol 6's documented default. |
 | `correctness_gate`, `security_reviewer` | GPT-6 Sol high | Spend additional reasoning on a concrete correctness or security question. |
 | Independent external review | Opus 5.5 medium; high with a reason | Use the new Opus in a fresh, read-only review. Medium is its new default. |
+| Explicit Muse implementation (opt-in) | `routine` Wonder medium; `complex` Wonder Full medium; `escalation` Wonder Full high | Selected per run with `--muse-profile`; routine framework implementation remains Gemini, and Muse profiles never serve review. |
 | `reviewer` fallback | GPT-6 Astra low | Retain the existing independent native fallback when Claude cannot run. |
 | `quality_gate_max` | GPT-6 Sol max | Exceptional, explicitly requested deep audit moves from Luna to the model assigned complex judgment. |
 
@@ -57,6 +58,8 @@ Claude Code must be at least **2.1.280** for Opus 5.5. Pin the full model ID; th
 Opus 5.5 requires adaptive thinking and rejects forced tool selection. This framework delegates API conversation handling to Claude Code, starts fresh reviews, and exposes only read/search tools. It does not construct those incompatible API parameters. Progress tracking uses tool lifecycle metadata, so hidden inter-tool prose is not required for liveness. Confirm terminal completion and actual model usage when validating the live route. [Migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide)
 
 The v9 installer removes the pre-v9 DeepSeek routing entry and no longer installs one. Gemini fallback goes directly to Luna even when an old configuration still contains DeepSeek. Existing provider state, backups, external Codex profiles and credentials are retained. Custom credential environment names remain as filtering metadata, without enabling a provider route. Legacy direct-provider internals remain for compatibility; active policy and setup no longer use them. Earlier migrations, including the exact pre-v8 packaged Opus 5 pin, remain in place. The installer refreshes owned role files and the managed policy and preserves unrelated settings and provider-wide quota state. A custom Claude model remains an operator override; the runner still requires the supported exact review pin. A new Codex task is needed to discover updated native role definitions. Do not infer that an already-running task's role catalog has changed.
+
+Muse profile details: routine uses the base `providers.muse` model/effort (packaged `muse-wonder-1.0`, medium); `providers.muse.profiles.complex` is `muse-wonder-full-1.0` at medium and `providers.muse.profiles.escalation` is `muse-wonder-full-1.0` at high (routing v11). Profiles override only model/effort and share the single Muse quota cache and ownership claims. No capability equivalence or usage weight between regular Wonder and Wonder Full is claimed here; that requires measured evidence. Escalation is an explicit primary decision after a prior writer has stopped, never an automatic retry.
 
 ## Validation limits
 

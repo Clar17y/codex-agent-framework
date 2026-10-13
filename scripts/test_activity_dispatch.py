@@ -23,7 +23,7 @@ class ActivityDispatchTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.config = json.loads((ROOT / "routing.example.json").read_text())
         self.config_path = self.root / "routing.json"
         self.config_path.write_text(json.dumps(self.config))
@@ -417,6 +417,27 @@ print(json.dumps({"type":"turn.completed","thread_id":"child"}), flush=True)
         self.assertEqual(runner.operator_resolve_orchestration(state_dir, self.root, run_id,
                                                                "parent stopped")["status"], "resolved")
 
+    def test_operator_recovery_canonical_alias_and_mismatch(self):
+        run_id = "12345678-1234-1234-1234-123456789abc"
+        state_dir = self.root / "state"
+        parent_path = runner.orchestration_path(state_dir, self.root, run_id)
+        alias = Path(str(self.root).swapcase()) if os.name == "nt" else self.root
+        runner.write_json(parent_path, {"status":"uncertain_exit", "workspace":str(alias),
+                                        "owned_paths":["src"], "run_id":run_id})
+        state_alias = (Path(str(state_dir).swapcase()) if os.name == "nt" else
+                       Path(os.path.relpath(state_dir, Path.cwd())))
+        result = runner.operator_resolve_orchestration(state_alias, self.root, run_id,
+                                                       "confirmed stopped")
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(Path(result["orchestration_pending_path"]), parent_path)
+        other = self.root / "different-workspace"
+        other.mkdir()
+        runner.write_json(parent_path, {"status":"uncertain_exit", "workspace":str(other),
+                                        "owned_paths":["src"], "run_id":run_id})
+        with self.assertRaisesRegex(ValueError, "workspace does not match"):
+            runner.operator_resolve_orchestration(state_alias, self.root, run_id,
+                                                  "must reject different workspace")
+
     def test_post_launch_parent_metadata_failure_and_timeout_keep_claim(self):
         fake = self.root / "slow_parent.py"
         fake.write_text("import time\ntime.sleep(3)\n")
@@ -565,7 +586,8 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
                 self.assertIn("features.multi_agent=false", argv)
                 self.assertIn("features.apps=false", argv)
                 self.assertIn("agents.enabled=false", argv)
-                self.assertIn('windows.sandbox="mxc"', argv)
+                if os.name == "nt":
+                    self.assertIn('windows.sandbox="mxc"', argv)
                 self.assertIn('approval_policy="never"', argv)
             elif provider_name == "claude":
                 self.assertIn("Read,Glob,Grep", argv)
@@ -618,7 +640,7 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
         binary.write_bytes(b"fixture")
         with mock.patch.object(runner.shutil, "which", return_value=str(launcher)):
             argv = runner.direct_windows_muse_config_command([str(launcher), "exec", "-c", 'run.toolset=["read_file"]'], "nt")
-        self.assertEqual(argv, [str(binary), "exec", "-c", 'run.toolset=["read_file"]'])
+        self.assertEqual(argv, [str(binary.resolve()), "exec", "-c", 'run.toolset=["read_file"]'])
         binary.unlink()
         with mock.patch.object(runner.shutil, "which", return_value=str(launcher)):
             with self.assertRaises(ValueError):
@@ -637,7 +659,7 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
         with (mock.patch.object(runner.shutil, "which", return_value=str(launcher)),
               mock.patch.object(runner.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=str(posix_shim)))):
             argv = runner.direct_windows_codex_command([str(launcher), "exec"], "nt")
-        self.assertEqual(argv, [str(node), str(entry), "exec"])
+        self.assertEqual(argv, [str(node.resolve()), str(entry.resolve()), "exec"])
         with (mock.patch.object(runner.shutil, "which", return_value=str(launcher)),
               mock.patch.object(runner.subprocess, "run", side_effect=runner.subprocess.TimeoutExpired("volta", 5))):
             with self.assertRaisesRegex(ValueError, "discovery timed out"):

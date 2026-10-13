@@ -36,6 +36,11 @@ class TestInstallFramework(unittest.TestCase):
         SCRATCH_BASE.mkdir(parents=True, exist_ok=True)
         self.test_dir = SCRATCH_BASE / uuid.uuid4().hex[:12]
         self.test_dir.mkdir(parents=True, exist_ok=True)
+        self.fake_home = (self.test_dir / 'user_home').resolve()
+        self.fake_home.mkdir()
+        home_patch = mock.patch.object(Path, 'home', return_value=self.fake_home)
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
         self.dest_root = self.test_dir / "target_codex"
         self.source_root = self.test_dir / "source"
         self.source_root.mkdir()
@@ -64,7 +69,7 @@ class TestInstallFramework(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before_bad)
 
     def test_v12_reader_collision_and_missing_source_fail_preflight(self):
-        helper = self.dest_root.parent / '.gemini/config/agents/framework-reader.md'
+        helper = self.fake_home / '.gemini/config/agents/framework-reader.md'
         helper.parent.mkdir(parents=True)
         helper.write_text('unrelated custom agent')
         with self.assertRaises(PreflightError):
@@ -78,7 +83,7 @@ class TestInstallFramework(unittest.TestCase):
 
     def test_reader_manifest_owned_upgrade_and_operator_edit_collision(self):
         install_framework(str(self.dest_root), source=str(self.source_root))
-        helper = self.dest_root.parent / '.gemini/config/agents/framework-reader.md'
+        helper = self.fake_home / '.gemini/config/agents/framework-reader.md'
         packaged = self.source_root / 'agents/framework-reader.md'
         packaged.write_bytes(packaged.read_bytes() + b'\n# packaged revision\n')
         config_path = self.dest_root / 'agent-framework/routing.json'
@@ -99,6 +104,32 @@ class TestInstallFramework(unittest.TestCase):
         with self.assertRaises(PreflightError):
             install_framework(str(self.dest_root), source=str(self.source_root))
         self.assertEqual(helper.read_text(), 'operator edit')
+
+    def test_custom_codex_home_reader_uses_actual_home_for_flag_env_and_upgrade(self):
+        from scripts import provider_runner as runner
+        helper = self.fake_home / '.gemini/config/agents/framework-reader.md'
+        custom_root = self.test_dir / 'nested' / 'profiles' / 'codex-home'
+        install_framework(codex_home=str(custom_root), source=str(self.source_root))
+        config_path = custom_root / 'agent-framework/routing.json'
+        config = json.loads(config_path.read_text())
+        self.assertEqual(config['providers']['gemini']['reader_agent_file'], str(helper))
+        self.assertEqual(helper.read_bytes(), (self.source_root / 'agents/framework-reader.md').read_bytes())
+        runner.validate_gemini_reader(config['providers']['gemini'], custom_root)
+        self.assertFalse((custom_root.parent / '.gemini/config/agents/framework-reader.md').exists())
+
+        # An earlier v12 install could have saved the wrong generated path.
+        config['providers']['gemini']['reader_agent_file'] = str(custom_root.parent / '.gemini/config/agents/framework-reader.md')
+        config_path.write_text(json.dumps(config))
+        install_framework(codex_home=str(custom_root), source=str(self.source_root))
+        migrated = json.loads(config_path.read_text())
+        self.assertEqual(migrated['providers']['gemini']['reader_agent_file'], str(helper))
+
+        env_root = self.test_dir / 'another' / 'nested' / 'codex-home'
+        with mock.patch.dict(os.environ, {'CODEX_HOME': str(env_root)}):
+            install_framework(source=str(self.source_root))
+        env_config = json.loads((env_root / 'agent-framework/routing.json').read_text())
+        self.assertEqual(env_config['providers']['gemini']['reader_agent_file'], str(helper))
+        runner.validate_gemini_reader(env_config['providers']['gemini'], env_root)
 
     def test_fresh_install(self):
         """Exercise fresh install into clean target codex root."""
@@ -125,7 +156,7 @@ class TestInstallFramework(unittest.TestCase):
             self.assertTrue((af_dir / 'scripts' / name).is_file())
         self.assertTrue((af_dir / "docs" / "FRAMEWORK.md").exists())
         self.assertTrue((af_dir / "scripts" / "test_activity_dispatch.py").exists())
-        self.assertEqual((self.dest_root.parent / '.gemini/config/agents/framework-reader.md').read_bytes(),
+        self.assertEqual((self.fake_home / '.gemini/config/agents/framework-reader.md').read_bytes(),
                          (self.source_root / 'agents/framework-reader.md').read_bytes())
         self.assertEqual(len(json.loads((af_dir / 'routing.json').read_text())['activities']), 15)
 

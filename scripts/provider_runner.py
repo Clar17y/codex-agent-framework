@@ -364,10 +364,14 @@ def operator_resolve_orchestration(state_dir, workspace, run_id, reason, child_i
     """Record an operator's explicit cessation confirmation without losing run evidence."""
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("A cessation reason is required")
+    state_dir = Path(state_dir).resolve()
+    workspace = Path(workspace).resolve()
     parent_path = orchestration_path(state_dir, workspace, run_id)
     with provider_lock(state_dir, 30, "orchestration.lock"):
         parent = read_json(parent_path)
-        if parent.get("workspace") != str(workspace):
+        recorded_workspace = parent.get("workspace")
+        if (not isinstance(recorded_workspace, str) or not Path(recorded_workspace).is_absolute() or
+                os.path.normcase(str(Path(recorded_workspace).resolve())) != os.path.normcase(str(workspace))):
             raise ValueError("Orchestration workspace does not match")
         target = parent_path
         if child_id:

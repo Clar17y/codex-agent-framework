@@ -240,8 +240,9 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
                 print(f'Warning: {command} not found on PATH; retaining command name.')
     gemini_entry = config['providers'].get('gemini')
     if isinstance(gemini_entry, dict):
-        reader_path = str(root.parent / '.gemini/config/agents/framework-reader.md')
-        if gemini_entry.get('reader_agent_file') in (None, '~/.gemini/config/agents/framework-reader.md'):
+        reader_path = str(Path.home().resolve() / '.gemini/config/agents/framework-reader.md')
+        previous_default = str(root.parent / '.gemini/config/agents/framework-reader.md')
+        if gemini_entry.get('reader_agent_file') in (None, '~/.gemini/config/agents/framework-reader.md', previous_default):
             gemini_entry['reader_agent_file'] = reader_path
 
     if preserving:
@@ -389,7 +390,7 @@ def build_plan(source, root, gemini_override=None, claude_override=None, refresh
     # Antigravity discovers reader agents in its own global config directory.
     # Upgrade only a definition whose bytes still match our previous manifest;
     # an operator edit or unowned collision must remain untouched.
-    reader = root.parent / '.gemini/config/agents/framework-reader.md'
+    reader = Path.home().resolve() / '.gemini/config/agents/framework-reader.md'
     check_path(reader)
     content = (source / 'agents/framework-reader.md').read_bytes()
     if reader.exists():

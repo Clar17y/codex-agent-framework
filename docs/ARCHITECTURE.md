@@ -19,6 +19,8 @@ Implement a deterministic fail-closed fallback hierarchy for code implementation
 
 Independent code reviews follow a dedicated review route: Anthropic Claude Code CLI (`claude`) running `claude-opus-5-5` (default medium effort; high effort requires a documented reason), falling back directly to native Astra low (`reviewer`) upon quota exhaustion. DeepSeek is excluded from the review path.
 
+The opt-in Muse implementation route resolves one explicit profile per run through `resolve_muse_profile()`: `routine` (base regular Wonder, medium), `complex` (Wonder Full `muse-wonder-full-1.0`, medium) or `escalation` (Wonder Full, high). Resolution copies the base provider and overrides only model/effort, so executable, timing, secret filtering, the single `muse-quota.json` cache and cross-provider ownership claims stay shared; quota evidence records the actually selected model/profile. Profile flags are rejected for other providers and for review, and no outcome automatically escalates.
+
 The routing engine fails closed:
 - **Exit 0 (success)**: Provider executed and completed successfully (`available_to_try` is the status subcommand's verdict when no cached block is active, rather than a runner execution exit code).
 - **Exit 20 (`fallback_required`)**: Confirmed quota exhaustion; signals the orchestrator to advance immediately to the fallback without launching the exhausted CLI again.
@@ -41,7 +43,7 @@ Invoking rate-limited providers such as Gemini or Claude repeatedly after quota 
 ### Decision
 Enforce atomic local quota caching across providers, combined with retained monetary-balance preflight checks for legacy compatibility:
 
-1. **Atomic Quota Caching**: Confirmed terminal quota errors are recorded in shared JSON cache files (`gemini-quota.json` and `claude-quota.json`; legacy `deepseek-balance.json` stores a separate balance snapshot) in the framework `state/` directory. Updates are guarded by cross-process file locks (`provider_lock`) and written via atomic file replacement. Cached entries record exact provider reset timestamps when available, or apply a bounded probe cooldown (`quota_probe_seconds`, default 3600s). Status checks inspect these local caches without network overhead.
+1. **Atomic Quota Caching**: Confirmed terminal quota errors are recorded in shared JSON cache files (`gemini-quota.json`, `claude-quota.json`, and optional `muse-quota.json`; legacy `deepseek-balance.json` stores a separate balance snapshot) in the framework `state/` directory. Updates are guarded by cross-process file locks (`provider_lock`) and written via atomic file replacement. Cached entries record exact provider reset timestamps when available, or apply a bounded probe cooldown (`quota_probe_seconds`, default 3600s). Status checks inspect these local caches without network overhead.
 2. **Legacy Monetary Preflight**: DeepSeek direct-invocation internals are retained for backward compatibility, including preflight `GET /user/balance` checks via standard library `urllib.request` with redirect rejection.
 
 ### Why It Matters

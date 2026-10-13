@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Install the framework using Python 3.11+ and the standard library only."""
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -85,11 +86,12 @@ def collect_sources(source):
     """Explicit core files make incomplete source packages fail before mutation."""
     names = ['GLOBAL_POLICY.md', 'task-template.json', 'README.md',
              'routing.example.json', 'install.py', 'scripts/provider_runner.py',
-             'scripts/test_provider_runner.py', 'scripts/test_install.py', 'docs/FRAMEWORK.md',
+             'scripts/test_provider_runner.py', 'scripts/test_install.py',
+             'scripts/test_muse_provider.py', 'docs/FRAMEWORK.md',
              'scripts/jev_client.py', 'scripts/jev_search.py', 'scripts/jev_review.py',
              'scripts/test_jev_client.py', 'scripts/test_jev_search.py', 'scripts/test_jev_review.py']
     names += [f'agents/{name}.toml' for name in ROLE_FILES]
-    names += [f'skills/{name}/SKILL.md' for name in ('ask-gemini', 'ask-claude', 'simplify',
+    names += [f'skills/{name}/SKILL.md' for name in ('ask-gemini', 'ask-claude', 'ask-muse', 'simplify',
                                                   'jev-search', 'jev-review')]
     # Optional maintained templates, never recursive installation of state or logs.
     names += [p.relative_to(source).as_posix() for p in (source / 'docs').glob('*')
@@ -103,7 +105,50 @@ def collect_sources(source):
     return files
 
 
-def resolve_routing(source, root, gemini_override=None, claude_override=None, refresh_routing=False):
+MUSE_PROFILE_DEFAULTS = {
+    'complex': {'model': 'muse-wonder-full-1.0', 'effort': 'medium'},
+    'escalation': {'model': 'muse-wonder-full-1.0', 'effort': 'high'},
+}
+MUSE_EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+
+
+def merge_muse_profiles(entry, source_defaults):
+    """Fill missing Muse profile defaults; reject malformed saved profiles.
+
+    Profiles override only model/effort. Explicit operator values win;
+    invalid shapes raise PreflightError before any file is written.
+    """
+    defaults = source_defaults.get('muse', {}).get('profiles') if isinstance(source_defaults.get('muse'), dict) else None
+    if not isinstance(defaults, dict):
+        defaults = MUSE_PROFILE_DEFAULTS
+    profiles = entry.get('profiles')
+    if profiles is None:
+        entry['profiles'] = copy.deepcopy(defaults)
+        return
+    if not isinstance(profiles, dict):
+        raise PreflightError('Invalid routing entry: muse profiles must be an object. Repair providers.muse.profiles or use --refresh-routing.')
+    unknown = sorted(set(profiles) - set(MUSE_PROFILE_DEFAULTS))
+    if unknown:
+        raise PreflightError(f'Invalid routing entry: unknown muse profiles {unknown}; expected complex/escalation.')
+    for name, fallback in MUSE_PROFILE_DEFAULTS.items():
+        profile = profiles.get(name)
+        if profile is None:
+            profiles[name] = copy.deepcopy(defaults.get(name, fallback))
+            continue
+        if not isinstance(profile, dict):
+            raise PreflightError(f'Invalid routing entry: muse profile {name} must be an object.')
+        extra = sorted(set(profile) - {'model', 'effort'})
+        if extra:
+            raise PreflightError(f'Invalid routing entry: muse profile {name} may only set model/effort; got {extra}.')
+        if 'model' in profile and (not isinstance(profile['model'], str) or not profile['model'].strip()):
+            raise PreflightError(f'Invalid routing entry: muse profile {name} model must be a nonempty string.')
+        if 'effort' in profile and profile['effort'] not in MUSE_EFFORTS:
+            raise PreflightError(f'Invalid routing entry: muse profile {name} effort is unsupported: {profile["effort"]!r}.')
+        for key, value in defaults.get(name, fallback).items():
+            profile.setdefault(key, copy.deepcopy(value))
+
+
+def resolve_routing(source, root, gemini_override=None, claude_override=None, refresh_routing=False, muse_override=None):
     target = root / 'agent-framework/routing.json'
     preserving = target.exists() and not refresh_routing
     config_path = target if preserving else source / 'routing.example.json'
@@ -125,22 +170,23 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
             raise PreflightError(f'Source routing file {source_example_path} must contain a providers object.')
         source_defaults = source_example['providers']
 
-    target_version = config.get('version', 1) if preserving else 9
+    target_version = config.get('version', 1) if preserving else 11
     if isinstance(target_version, bool) or not isinstance(target_version, int):
         raise PreflightError('Routing configuration version must be an integer.')
 
     providers_info = [
         ('gemini', 'agy', gemini_override),
-        ('claude', 'claude', claude_override)
+        ('claude', 'claude', claude_override),
+        ('muse', 'muse', muse_override)
     ]
     for provider, command, override in providers_info:
         entry = config['providers'].get(provider)
         if entry is None and preserving:
             default_entry = source_defaults.get(provider, {
                 'executable': command,
-                'model': 'gemini-3.8-flash-medium' if provider == 'gemini' else 'claude-opus-5-5'
+                'model': {'gemini': 'gemini-3.8-flash-medium', 'claude': 'claude-opus-5-5', 'muse': 'muse-wonder-1.0'}[provider]
             })
-            entry = dict(default_entry)
+            entry = copy.deepcopy(default_entry)
             config['providers'][provider] = entry
             if override is None:
                 discovered = shutil.which(command)
@@ -150,6 +196,12 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
 
         if entry is None:
             continue
+
+        if preserving and provider == 'muse' and isinstance(entry, dict):
+            for key, value in source_defaults.get('muse', {}).items():
+                if key != 'profiles':
+                    entry.setdefault(key, copy.deepcopy(value))
+            merge_muse_profiles(entry, source_defaults)
 
         if not isinstance(entry, dict) or not entry.get('model') or not entry.get('executable'):
             raise PreflightError(f'Invalid routing entry: {provider}')
@@ -170,7 +222,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
         # Stream telemetry is universal in v7. Make the effective default
         # visible in preserved routing files while retaining every explicit
         # operator value, including zero (disabled).
-        for provider_name in ('gemini', 'claude'):
+        for provider_name in ('gemini', 'claude', 'muse'):
             entry = config['providers'].get(provider_name)
             provider_defaults = source_defaults.get(provider_name, {})
             if (isinstance(entry, dict) and 'heartbeat_seconds' not in entry and
@@ -210,9 +262,12 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
                     raise PreflightError('retired_secret_env_vars must be a list of environment variable names.')
                 if env_name not in names:
                     names.append(env_name)
-            config['version'] = 9
+            config['version'] = 11
+        else:
+            # v11 only adds Muse complex/escalation profiles (merged above).
+            config['version'] = max(target_version, 11)
     else:
-        config['version'] = 9
+        config['version'] = 11
     # Merge capability defaults without overwriting saved operator choices.
     defaults = source_example if preserving else config
     capabilities = config.setdefault('capabilities', {})
@@ -246,7 +301,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
     return config
 
 
-def build_plan(source, root, gemini_override=None, claude_override=None, refresh_routing=False):
+def build_plan(source, root, gemini_override=None, claude_override=None, refresh_routing=False, muse_override=None):
     files = collect_sources(source)
     plan = {}
     for name in files:
@@ -267,6 +322,7 @@ def build_plan(source, root, gemini_override=None, claude_override=None, refresh
         root=root,
         gemini_override=gemini_override,
         claude_override=claude_override,
+        muse_override=muse_override,
         refresh_routing=refresh_routing,
     )
     plan[routing] = (json.dumps(data, indent=2) + '\n').encode('utf-8')
@@ -274,7 +330,7 @@ def build_plan(source, root, gemini_override=None, claude_override=None, refresh
 
 
 def install_framework(codex_home=None, dry_run=False, gemini_override=None,
-                      claude_override=None, refresh_routing=False, source=None):
+                      claude_override=None, refresh_routing=False, source=None, muse_override=None):
     if sys.version_info < (3, 11):
         raise PreflightError('Python 3.11 or newer is required.')
     source_root = Path(source or Path(__file__).absolute().parent).expanduser().absolute()
@@ -299,6 +355,7 @@ def install_framework(codex_home=None, dry_run=False, gemini_override=None,
         root=root,
         gemini_override=gemini_override,
         claude_override=claude_override,
+        muse_override=muse_override,
         refresh_routing=refresh_routing,
     )
     if dry_run:
@@ -325,6 +382,7 @@ def install_framework(codex_home=None, dry_run=False, gemini_override=None,
             root=root,
             gemini_override=gemini_override,
             claude_override=claude_override,
+            muse_override=muse_override,
             refresh_routing=refresh_routing,
         )
         backup_dir.mkdir(parents=True, exist_ok=False)
@@ -360,6 +418,7 @@ def main(argv=None):
     parser.add_argument('--dry-run', action='store_true', help='Validate and list destinations without writes.')
     parser.add_argument('--gemini', help='Override Gemini executable.')
     parser.add_argument('--claude', help='Override Claude executable.')
+    parser.add_argument('--muse', help='Override Muse executable.')
     parser.add_argument('--refresh-routing', action='store_true', help='Reset routing to package defaults and rediscover CLIs.')
     parser.add_argument('--source', help='Use another complete source package.')
     args = parser.parse_args(argv)
@@ -369,6 +428,7 @@ def main(argv=None):
             dry_run=args.dry_run,
             gemini_override=args.gemini,
             claude_override=args.claude,
+            muse_override=args.muse,
             refresh_routing=args.refresh_routing,
             source=args.source,
         )

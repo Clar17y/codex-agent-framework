@@ -1,6 +1,7 @@
-"""Bounded external provider execution with shared Gemini/Claude quota preflight."""
+"""Bounded external provider execution with shared subscription quota preflight."""
 import argparse
 import contextlib
+import copy
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -35,6 +36,73 @@ CODEX_TOOL_ITEM_TYPES = frozenset(("command_execution", "file_change", "mcp_tool
 GEMINI_STREAM_POLL_SECONDS = STREAM_POLL_SECONDS
 GEMINI_PROGRESS_EMIT_SECONDS = STREAM_PROGRESS_EMIT_SECONDS
 MAX_EVIDENCE_BYTES = 1024 * 1024
+MUSE_PROFILE_NAMES = ("routine", "complex", "escalation")
+MUSE_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def resolve_muse_profile(config, profile_name=None):
+    """Return a copy of the Muse provider with the selected profile applied.
+
+    The base entry supplies routine model/effort plus all shared controls
+    (executable, timing, credentials, steps). Named profiles under
+    ``providers.muse.profiles`` override only model/effort. The input
+    config is never mutated.
+    """
+    selected = profile_name or "routine"
+    if selected not in MUSE_PROFILE_NAMES:
+        raise ValueError(
+            f"Unsupported Muse profile '{selected}'; expected one of {', '.join(MUSE_PROFILE_NAMES)}")
+    providers = config.get("providers") if isinstance(config, dict) else None
+    base = providers.get("muse") if isinstance(providers, dict) else None
+    if not isinstance(base, dict):
+        raise ValueError("Provider 'muse' is missing from config")
+    profiles = base.get("profiles")
+    if profiles is not None and not isinstance(profiles, dict):
+        raise ValueError("providers.muse.profiles must be an object")
+    effective = copy.deepcopy(base)
+    effective.pop("profiles", None)
+    if selected != "routine":
+        profile = profiles.get(selected) if isinstance(profiles, dict) else None
+        if profile is None:
+            raise ValueError(
+                f"Muse profile '{selected}' is not configured under providers.muse.profiles")
+        if not isinstance(profile, dict):
+            raise ValueError(f"providers.muse.profiles.{selected} must be an object")
+        unknown = sorted(set(profile) - {"model", "effort"})
+        if unknown:
+            raise ValueError(
+                f"providers.muse.profiles.{selected} may only override model/effort; got {unknown}")
+        if "model" in profile:
+            if not isinstance(profile["model"], str) or not profile["model"].strip():
+                raise ValueError(f"providers.muse.profiles.{selected}.model must be a nonempty string")
+            effective["model"] = profile["model"]
+        if "effort" in profile:
+            if profile["effort"] not in MUSE_EFFORTS:
+                raise ValueError(f"providers.muse.profiles.{selected}.effort is unsupported: {profile['effort']!r}")
+            effective["effort"] = profile["effort"]
+    model = effective.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("Muse model must be a nonempty CLI model ID or cli-default")
+    effort = effective.get("effort", "medium")
+    if effort not in MUSE_EFFORTS:
+        raise ValueError(f"Unsupported Muse reasoning effort: {effort!r}")
+    effective["effort"] = effort
+    effective["muse_profile"] = selected
+    meta = {"muse_profile": selected, "model": model, "effort": effort}
+    return effective, meta
+
+
+def require_muse_profile_allowed(profile_name, provider_name, role=None):
+    """Reject an explicit Muse profile on any non-Muse route or review."""
+    if profile_name is None:
+        return
+    if profile_name not in MUSE_PROFILE_NAMES:
+        raise ValueError(
+            f"Unsupported Muse profile '{profile_name}'; expected one of {', '.join(MUSE_PROFILE_NAMES)}")
+    if role == "review":
+        raise ValueError("Muse profiles are not permitted for review; review is Claude-only")
+    if provider_name != "muse":
+        raise ValueError("--muse-profile is only permitted with --provider muse")
 
 def safe_regular_file(path, workspace):
     """Load the shared Jev path checks only when evidence validation needs them."""
@@ -552,6 +620,20 @@ def direct_windows_codex_command(command, platform_name=None):
     return [str(Path(node).resolve()), str(codex_js), *command[1:]]
 
 
+def direct_windows_muse_command(command, platform_name=None):
+    """Run the native Muse PowerShell launcher as argv, without cmd.exe."""
+    if (platform_name or os.name) != "nt":
+        return command
+    launcher = Path(shutil.which(command[0]) or command[0])
+    if launcher.suffix.lower() not in (".cmd", ".bat"):
+        return command
+    script = launcher.resolve().with_name(".muse-launcher.ps1")
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if not script.is_file() or not powershell:
+        raise ValueError("Muse's Windows batch launcher requires its sibling .muse-launcher.ps1 and PowerShell")
+    return [powershell, "-NoProfile", "-NonInteractive", "-File", str(script), *command[1:]]
+
+
 def command_for(role, provider, prompt, timeout, workspace, effort="medium", provider_name=None, output_dir=None):
     executable = provider["executable"]
     command = [executable] if isinstance(executable, str) else list(executable)
@@ -568,6 +650,8 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
 
     if provider_name == "deepseek":
         command = direct_windows_codex_command(command)
+    elif provider_name == "muse":
+        command = direct_windows_muse_command(command)
 
     model = provider["model"]
     if role == "review":
@@ -609,6 +693,24 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
                               "--json",
                               "--output-schema", str(schema_file),
                               "--output-last-message", last_msg, "--ephemeral", prompt]
+        elif provider_name == "muse":
+            if output_dir is None:
+                raise ValueError("Muse requires an output directory for its prompt file")
+            if model != "cli-default" and (not isinstance(model, str) or not model.strip()):
+                raise ValueError("Muse model must be a nonempty CLI model ID or cli-default")
+            effort = provider.get("effort", "medium")
+            if effort not in MUSE_EFFORTS:
+                raise ValueError("Unsupported Muse reasoning effort")
+            steps = provider.get("max_model_steps", 100)
+            if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+                raise ValueError("Muse max_model_steps must be a positive integer")
+            args = ["exec", "--json", "--prompt-file", str(output_dir / "prompt.txt"),
+                    "--workspace", str(workspace), "--reasoning-effort", effort,
+                    "--disable-approval", "--trust-workspace", "--no-session-log",
+                    "--disable-reminders", "--max-model-steps", str(steps)]
+            if model != "cli-default":
+                args += ["--model", model]
+            return command + args
         raise ValueError(f"Unsupported implementation provider: {provider_name}")
 
     raise ValueError(f"Unsupported role: {role}")
@@ -903,6 +1005,8 @@ def plain_terminal_error(stderr, exit_code):
     if len(lines) != 1:
         return None  # Mixed output cannot establish a terminal launch failure.
     line = lines[0]
+    if re.fullmatch(r"missing meta credentials: run `muse login` or set META_API_KEY, or save credentials at .+", line):
+        return {"code": "CLI_SETUP_ERROR", "message": "Muse login required", "source": "terminal_stderr"}
     if terminal_quota_message(line):
         return {"code": "QUOTA_EXHAUSTED", "message": line, "source": "terminal_stderr"}
     if re.fullmatch(r"Error: (?:not logged in|authentication required|invalid model|model not found)[.!]?", line, re.IGNORECASE):
@@ -997,6 +1101,20 @@ def quota_error(errors, provider="gemini"):
     return None
 
 
+def muse_quota_error(terminal):
+    """Accept only native root failure with a tagged subscription limit reason."""
+    if not isinstance(terminal, dict) or terminal.get("terminal") != "failed":
+        return None
+    reason = terminal.get("reason")
+    if not isinstance(reason, str):
+        return None
+    match = re.fullmatch(r"API error (\d{3}): (.+) \(quota_exhausted\)", reason.strip(), re.I)
+    if not match or match.group(1) != "403" or not terminal_quota_message(match.group(2), "muse"):
+        return None
+    return {"code": "QUOTA_EXHAUSTED", "message": match.group(2),
+            "source": "muse_root_terminal", "http_status": int(match.group(1))}
+
+
 def retry_at(error, cooldown, observed=None):
     observed = time.time() if observed is None else observed
     if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
@@ -1056,7 +1174,7 @@ def luna_fallback():
 
 
 def quota_fallback(provider, config=None):
-    if provider == "gemini":
+    if provider in ("gemini", "muse"):
         return luna_fallback()
     if provider == "deepseek":
         return luna_fallback()
@@ -1140,9 +1258,19 @@ def deepseek_secrets(config):
     return [(name, os.environ[name]) for name in names if os.environ.get(name) and os.environ[name].strip()]
 
 
+def muse_secrets(config):
+    """Known Muse API-key overrides are excluded from every external child."""
+    names = {"META_API_KEY", "MUSE_API_KEY", "META_MODEL_API_KEY"}
+    providers = config.get("providers", {}) if isinstance(config, dict) else {}
+    muse = providers.get("muse", {}) if isinstance(providers, dict) else {}
+    if isinstance(muse, dict) and isinstance(muse.get("api_key_env"), str):
+        names.add(muse["api_key_env"])
+    return [(name, os.environ[name]) for name in names if os.environ.get(name) and os.environ[name].strip()]
+
+
 def framework_secrets(config):
     """Credentials used by framework helpers, never by execution-provider children."""
-    secrets = dict(deepseek_secrets(config))
+    secrets = dict(deepseek_secrets(config) + muse_secrets(config))
     if os.environ.get("TYPESAFE_API_KEY", "").strip():
         secrets["TYPESAFE_API_KEY"] = os.environ["TYPESAFE_API_KEY"]
     return list(secrets.items())
@@ -1152,6 +1280,12 @@ def child_environment(config, provider_name, checked_deepseek_key=None):
     """Keep helper credentials out of external execution-provider environments."""
     env = dict(os.environ)
     env.pop("TYPESAFE_API_KEY", None)
+    for name in ("META_API_KEY", "MUSE_API_KEY", "META_MODEL_API_KEY"):
+        env.pop(name, None)
+    providers = config.get("providers", {}) if isinstance(config, dict) else {}
+    muse = providers.get("muse", {}) if isinstance(providers, dict) else {}
+    if isinstance(muse, dict) and isinstance(muse.get("api_key_env"), str):
+        env.pop(muse["api_key_env"], None)
     for name, _ in framework_secrets(config):
         env.pop(name, None)
     if provider_name == "deepseek" and checked_deepseek_key:
@@ -1519,16 +1653,22 @@ def quota_state(state_dir, provider):
         return None, str(exc)
 
 
-def quota_record(provider, error, state_dir, logs, config):
+def quota_record(provider, error, state_dir, logs, config, model=None, muse_profile=None, effort=None):
     observed = time.time()
     retry, reason = retry_at(error, quota_cooldown(config), observed)
     reset = retry if reason == "provider_reset" else None
-    state = {"version": 1, "provider": provider, "model": config["providers"][provider].get("model"),
+    if model is None:
+        model = config["providers"][provider].get("model")
+    state = {"version": 1, "provider": provider, "model": model,
              "observed_at": dt.datetime.fromtimestamp(observed, UTC).isoformat().replace("+00:00", "Z"),
              "retry_at": retry, "retry_at_iso": dt.datetime.fromtimestamp(retry, UTC).isoformat().replace("+00:00", "Z"),
              "reset_at": dt.datetime.fromtimestamp(reset, UTC).isoformat().replace("+00:00", "Z") if reset else None,
              "reason": reason, "provenance": "operator_report" if logs == "operator" else ("provider_reset" if reason == "provider_reset" else "probe_cooldown"),
              "source_logs": str(logs), "confirmed_error": error, "error": error}
+    if provider == "muse" and muse_profile is not None:
+        state["muse_profile"] = muse_profile
+    if provider == "muse" and effort is not None:
+        state["effort"] = effort
     existing, state_error = quota_state(state_dir, provider)
     if state_error:
         raise ValueError("Refusing to overwrite malformed quota state: " + state_error)
@@ -1586,6 +1726,9 @@ def new_progress_state(provider_name="gemini"):
         "last_error": None,
         "discarding_oversize_line": False,
         "last_emitted_monotonic": None,
+        "muse_root_run_id": None,
+        "muse_session_id": None,
+        "muse_terminal": None,
     }
 
 
@@ -1901,12 +2044,59 @@ def update_deepseek_progress(state, value, observed_at):
 
 def update_progress(state, value, observed_at):
     provider = state.get("provider", "gemini")
-    if provider == "claude":
+    if provider == "muse":
+        update_muse_progress(state, value, observed_at)
+    elif provider == "claude":
         update_claude_progress(state, value, observed_at)
     elif provider == "deepseek":
         update_deepseek_progress(state, value, observed_at)
     else:
         update_gemini_progress(state, value, observed_at)
+
+
+def update_muse_progress(state, value, observed_at):
+    """Retain only root-run evidence from native Muse exec JSONL v1."""
+    state["event_count"] += 1
+    event = value.get("payload_type")
+    state["last_event"] = {"event": event, "summary": compact_label(event, default="unknown", limit=80)}
+    state["last_event_at"] = observed_at
+    if type(value.get("schema_version")) is not int or value["schema_version"] != 1 or not isinstance(value.get("payload"), dict):
+        return
+    stream = value.get("stream")
+    if not isinstance(stream, dict) or stream.get("kind") != "session":
+        return
+    payload = value["payload"]
+    run_stream = payload.get("run_stream")
+    run_id = run_stream.get("id") if isinstance(run_stream, dict) and run_stream.get("kind") == "run" else None
+    command_id = payload.get("command_id")
+    if event == "session.run.linked" and payload.get("kind") == "session_run_linked":
+        if (type(value.get("payload_schema_version")) is int and value["payload_schema_version"] == 1 and
+                isinstance(stream.get("id"), str) and stream["id"] and
+                isinstance(run_id, str) and run_id and run_id == command_id and state["muse_root_run_id"] is None):
+            state["muse_root_run_id"] = run_id
+            state["muse_session_id"] = stream["id"]
+        return
+    if not isinstance(event, str) or not event.startswith("run.terminal."):
+        return
+    if (not state["muse_root_run_id"] or stream.get("id") != state["muse_session_id"] or
+            run_id != state["muse_root_run_id"] or
+            command_id != state["muse_root_run_id"] or payload.get("kind") != "run_terminal"):
+        return
+    terminal = payload.get("terminal")
+    if (terminal not in ("completed", "failed", "cancelled") or event != "run.terminal." + terminal or
+            type(value.get("payload_schema_version")) is not int or value["payload_schema_version"] != 1 or
+            not isinstance(payload.get("text"), str) or
+            "reason" not in payload or (payload["reason"] is not None and not isinstance(payload["reason"], str))):
+        return
+    text_value = payload.get("text")
+    reason_value = payload.get("reason")
+    if isinstance(reason_value, str) and len(reason_value) > 4096:
+        return
+    state["muse_terminal"] = {"terminal": terminal,
+                              "text": text_value[:4096] if isinstance(text_value, str) else "",
+                              "response_nonempty": bool(text_value.strip()),
+                              "reason": reason_value or ""}
+    state["terminal"] = {"status": terminal, "summary": "root " + terminal}
 
 
 def progress_snapshot(state, started_wall, started_monotonic, adapter_state):
@@ -1929,6 +2119,10 @@ def progress_snapshot(state, started_wall, started_monotonic, adapter_state):
         "usage": state["usage"],
         "conversation_id": state["conversation_id"],
     }
+    if state.get("provider") == "muse":
+        for key in ("muse_profile", "model", "effort"):
+            if state.get(key) is not None:
+                snapshot[key] = state[key]
     return snapshot
 
 
@@ -2081,9 +2275,10 @@ def maybe_emit_gemini_progress(result, state, snapshot, force=False):
     maybe_emit_progress(result, state, snapshot, force=force)
 
 
-def provider_timing(config, provider_name):
+def provider_timing(config, provider_name, provider=None):
     """Resolve a provider soft timeout and its adapter-owned termination grace."""
-    provider = config["providers"][provider_name]
+    if provider is None:
+        provider = config["providers"][provider_name]
     default_timeout = 3600 if provider_name == "gemini" else 1800
     timeout = provider.get("timeout_seconds", config.get("timeout_seconds", default_timeout))
     grace_default = 120 if provider_name == "gemini" else 0
@@ -2106,7 +2301,12 @@ def heartbeat(output, provider_name, provider, process, state, started_wall, sta
               progress=None):
     """Write diagnostic liveness only; process/log activity is not task progress."""
     now = time.time()
-    data = {"provider": provider_name, "model": provider["model"], "pid": process.pid,
+    muse_meta = {}
+    if provider_name == "muse":
+        if provider.get("muse_profile"):
+            muse_meta["muse_profile"] = provider["muse_profile"]
+        muse_meta["effort"] = provider.get("effort", "medium")
+    data = {"provider": provider_name, "model": provider["model"], "pid": process.pid, **muse_meta,
             "state": state, "started_at": dt.datetime.fromtimestamp(started_wall, UTC).isoformat().replace("+00:00", "Z"),
             "updated_at": dt.datetime.fromtimestamp(now, UTC).isoformat().replace("+00:00", "Z"),
             "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
@@ -2196,12 +2396,18 @@ def execute(args):
     provider_name = getattr(args, "provider", None) or ("gemini" if args.role == "implement" else "claude")
     if args.role == "review" and provider_name != "claude":
         raise ValueError(f"Review role is Claude-only; got {provider_name}")
-    if args.role == "implement" and provider_name not in ("gemini", "deepseek"):
+    if args.role == "implement" and provider_name not in ("gemini", "deepseek", "muse"):
         raise ValueError(f"Implement role does not support provider {provider_name}")
     if provider_name not in config.get("providers", {}):
         raise ValueError(f"Provider '{provider_name}' is missing from config")
-    provider = config["providers"][provider_name]
-    timeout, termination_grace, heartbeat_seconds = provider_timing(config, provider_name)
+    muse_profile_arg = getattr(args, "muse_profile", None)
+    require_muse_profile_allowed(muse_profile_arg, provider_name, role=args.role)
+    muse_meta = {}
+    if provider_name == "muse":
+        provider, muse_meta = resolve_muse_profile(config, muse_profile_arg)
+    else:
+        provider = config["providers"][provider_name]
+    timeout, termination_grace, heartbeat_seconds = provider_timing(config, provider_name, provider=provider)
     review_effort_arg = getattr(args, "review_effort", None)
     review_reason_arg = getattr(args, "review_reason", None)
     if args.role == "implement":
@@ -2234,8 +2440,10 @@ def execute(args):
     prompt = prompt_for(workspace, args.task_file, task)
     state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
     if args.dry_run:
-        command = command_for(args.role, provider, prompt, timeout, workspace, review_effort or "medium", provider_name=provider_name)
+        command = command_for(args.role, provider, prompt, timeout, workspace, review_effort or "medium", provider_name=provider_name,
+                              output_dir=workspace / ".llm-output")
         dry_run_meta = {"status": "dry_run", "provider": provider_name, "model": provider["model"],
+                        **muse_meta,
                         "cwd": str(workspace), "command": command, "state_dir": str(state_dir),
                         "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace,
                         "outer_timeout_seconds": timeout + termination_grace,
@@ -2310,6 +2518,8 @@ def execute(args):
         (output / "output_schema.json").write_text(json.dumps(DEEPSEEK_OUTPUT_SCHEMA, indent=2), encoding="utf-8")
     # Avoid Windows' command-line length limit; providers have a Read tool.
     prompt_path = output / "prompt.txt"
+    if provider_name == "muse":
+        prompt += "\nExecute this bounded task yourself. Do not spawn subagents or invoke another AI provider.\n"
     prompt_path.write_text(prompt, encoding="utf-8")
     run_prompt = (
         f"Read the complete task contract and instructions in {prompt_path} and follow them. "
@@ -2322,7 +2532,7 @@ def execute(args):
         )
     command = command_for(args.role, provider, run_prompt,
                           timeout, workspace, review_effort or "medium", provider_name=provider_name, output_dir=output)
-    result = {"provider": provider_name, "model": provider["model"], "logs": str(output),
+    result = {"provider": provider_name, "model": provider["model"], **muse_meta, "logs": str(output),
               "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace,
               "outer_timeout_seconds": timeout + termination_grace,
               "heartbeat_seconds": heartbeat_seconds,
@@ -2363,7 +2573,7 @@ def execute(args):
                                           error="An unresolved provider run owns overlapping paths. Confirm it stopped, then mark its pending record resolved before retrying.")
                             release_claim_lock()
                             return finish(result, output, workspace, 1, secrets=secrets)
-            if provider_name in ("gemini", "claude"):
+            if provider_name in ("gemini", "claude", "muse"):
                 state, state_error = quota_state(state_dir, provider_name)
                 if state_error:
                     result.update(status="state_error", fallback=luna_fallback() if provider_name == "gemini" else quota_fallback(provider_name, config),
@@ -2380,12 +2590,14 @@ def execute(args):
                 release_claim_lock()
             with (output / "stdout.log").open("wb") as stdout, (output / "stderr.log").open("wb") as stderr:
                 if args.role == "implement":
-                    write_json(pending_path, {"status": "launching", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "provider": provider_name})
+                    write_json(pending_path, {"status": "launching", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "provider": provider_name, **muse_meta})
                     result["_claim_unresolved"] = True
                 process = None
                 started_wall = None
                 started_monotonic = None
                 stream_state = new_progress_state(provider_name)
+                if muse_meta:
+                    stream_state.update(muse_meta)
                 progress_snapshot = None
                 try:
                     process = subprocess.Popen(command, cwd=workspace, shell=False, stdout=stdout, stderr=stderr,
@@ -2393,7 +2605,7 @@ def execute(args):
                                                start_new_session=os.name != "nt")
                     started_wall, started_monotonic = time.time(), time.monotonic()
                     if args.role == "implement":
-                        write_json(pending_path, {"status": "running", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "pid": process.pid, "provider": provider_name,
+                        write_json(pending_path, {"status": "running", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "pid": process.pid, "provider": provider_name, **muse_meta,
                                                   "started_at": started_wall, "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace})
                         release_claim_lock()
                     progress_snapshot, _ = safe_refresh_progress(
@@ -2476,7 +2688,7 @@ def execute(args):
                             try:
                                 write_json(pending_path, {"status": "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "interrupted",
                                                           "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "pid": process.pid,
-                                                          "provider": provider_name, "started_at": started_wall,
+                                                          "provider": provider_name, **muse_meta, "started_at": started_wall,
                                                           "duration_seconds": round(time.monotonic() - started_monotonic, 3) if started_monotonic else None,
                                                           "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace,
                                                           "cleanup": result["cleanup"], "fallback_authorized": False,
@@ -2485,7 +2697,7 @@ def execute(args):
                                 result["pending_write_error"] = str(pending_exc)
                     elif args.role == "implement" and isinstance(exc, OSError):
                         # Popen raised before returning a process: no writer was launched.
-                        write_json(pending_path, {"status": "resolved", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "launch_error": str(exc), "provider": provider_name})
+                        write_json(pending_path, {"status": "resolved", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "launch_error": str(exc), "provider": provider_name, **muse_meta})
                         result.pop("_claim_unresolved", None)
                     raise
 
@@ -2507,6 +2719,8 @@ def execute(args):
             ds_output = None
             gemini_output = None
             claude_output = None
+            muse_terminal = None
+            muse_terminal_coherent = False
             gemini_result_event = False
             claude_result_event = False
             stream_errors = []
@@ -2526,12 +2740,34 @@ def execute(args):
                 provider_output_text = json.dumps(claude_output) if claude_output is not None else ""
                 valid_success = successful_response(provider_output_text, args.role)
                 terminal_turn, has_terminal_402 = None, False
+            elif provider_name == "muse":
+                muse_terminal = stream_state.get("muse_terminal")
+                if muse_terminal:
+                    muse_terminal = {**muse_terminal,
+                                     "text": _sanitize_all_secrets(muse_terminal["text"], secrets),
+                                     "reason": _sanitize_all_secrets(muse_terminal["reason"], secrets)}
+                muse_terminal_coherent = bool(muse_terminal and
+                    ((muse_terminal.get("terminal") == "completed" and code == 0) or
+                     (muse_terminal.get("terminal") in ("failed", "cancelled") and code != 0)))
+                if muse_terminal_coherent:
+                    if muse_terminal.get("terminal") == "completed":
+                        provider_output_text = json.dumps({"status": "SUCCESS", "response": muse_terminal.get("text", "")})
+                        valid_success = muse_terminal.get("response_nonempty") is True and code == 0
+                    else:
+                        provider_output_text = json.dumps({"status": "FAILED", "error": {
+                            "message": muse_terminal.get("reason") or muse_terminal.get("text") or "Muse run failed"}})
+                        valid_success = False
+                else:
+                    provider_output_text = ""
+                    valid_success = False
+                terminal_turn, has_terminal_402 = None, False
             else:
                 valid_success = successful_response(stdout_text, args.role)
                 terminal_turn, has_terminal_402 = None, False
 
             errors = error_objects(provider_output_text)
-            errors += error_objects(stderr_text)
+            if provider_name != "muse":
+                errors += error_objects(stderr_text)
             if provider_name in ("gemini", "claude") and (gemini_output is None if provider_name == "gemini" else claude_output is None):
                 errors.extend(error for error in stream_errors if isinstance(error, dict))
             # A truncated stderr suffix cannot prove that its remaining line
@@ -2539,12 +2775,17 @@ def execute(args):
             # terminal event. Either case prevents stderr from establishing a
             # standalone terminal failure.
             plain_error = None if stderr_truncated or stdout_truncated else plain_terminal_error(stderr_text, code)
+            if provider_name == "muse" and plain_error and plain_error.get("code") != "CLI_SETUP_ERROR":
+                plain_error = None
             provider_without_terminal = (
                 (provider_name == "gemini" and gemini_output is None and not gemini_result_event) or
-                (provider_name == "claude" and claude_output is None and not claude_result_event)
+                (provider_name == "claude" and claude_output is None and not claude_result_event) or
+                (provider_name == "muse" and not muse_terminal_coherent)
             )
             plain_error_applies = plain_error
-            if provider_name in ("gemini", "claude") and stdout_text.strip() and not provider_without_terminal:
+            if provider_name == "muse" and stdout_text.strip():
+                plain_error_applies = None
+            if provider_name in ("gemini", "claude", "muse") and stdout_text.strip() and not provider_without_terminal:
                 # A malformed event=result is not repaired by unrelated stderr;
                 # keep ownership unresolved instead of authorizing a fallback.
                 plain_error_applies = None
@@ -2553,13 +2794,16 @@ def execute(args):
             raw_stdout_is_partial = provider_name == "deepseek" and stdout_truncated
             denied = [] if raw_stdout_is_partial else permission_denials(provider_output_text)
             complete_failure = False if raw_stdout_is_partial else complete_terminal_failure(provider_output_text)
-            if ((not stdout_text.strip() or provider_without_terminal) and
+            if (provider_name != "muse" and (not stdout_text.strip() or provider_without_terminal) and
                     not stderr_truncated and not stdout_truncated):
                 complete_failure = complete_failure or complete_terminal_failure(stderr_text)
             terminal_established = (denied or valid_success or plain_error_applies is not None or
                                     (provider_name in ("gemini", "claude") and complete_failure) or
+                                    (provider_name == "muse" and muse_terminal_coherent) or
                                     (provider_name == "deepseek" and (is_terminal or terminal_turn == "failed")))
-            if provider_name in ("gemini", "claude"):
+            if provider_name == "muse":
+                result["stream_terminal_seen"] = muse_terminal is not None
+            elif provider_name in ("gemini", "claude"):
                 result["stream_terminal_seen"] = gemini_result_event if provider_name == "gemini" else claude_result_event
             elif provider_name == "deepseek":
                 # turn.completed alone does not validate the required final
@@ -2567,7 +2811,7 @@ def execute(args):
                 # terminal result.
                 result["stream_terminal_seen"] = is_terminal or terminal_turn == "failed"
             if args.role == "implement":
-                pending_data = {"status": "resolved" if terminal_established else "uncertain_exit", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "exit_code": code, "provider": provider_name,
+                pending_data = {"status": "resolved" if terminal_established else "uncertain_exit", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "exit_code": code, "provider": provider_name, **muse_meta,
                                 "started_at": started_wall, "finished_at": time.time(), "duration_seconds": result.get("duration_seconds"),
                                 "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace}
                 if not terminal_established:
@@ -2631,10 +2875,14 @@ def execute(args):
                                        else f"DeepSeek returned terminal non-success status: {ds_output.get('status') if ds_output else 'UNKNOWN'}")
                 return finish(result, output, workspace, 1, secrets=secrets)
 
-            quota = quota_error(errors, provider_name) if terminal_established and not valid_success else None
+            quota = (muse_quota_error(muse_terminal) if provider_name == "muse" and muse_terminal_coherent else
+                     quota_error(errors, provider_name) if terminal_established and not valid_success else None)
             if quota:
                 with provider_lock(state_dir, float(config.get("lock_timeout_seconds", 30)), "quota.lock"):
-                    state = quota_record(provider_name, quota, state_dir, output, config)
+                    state = quota_record(provider_name, quota, state_dir, output, config,
+                                         model=provider["model"],
+                                         muse_profile=muse_meta.get("muse_profile"),
+                                         effort=muse_meta.get("effort"))
                 result.update(status="fallback_required", fallback=quota_fallback(provider_name, config), quota=state, cached=False)
                 return finish(result, output, workspace, 20, secrets=secrets)
             result.update(status="completed" if code == 0 and not errors and valid_success else "provider_error", exit_code=code)
@@ -2717,7 +2965,9 @@ def cli_quota_status(args):
     config = read_json(args.config)
     if not isinstance(config, dict) or not isinstance(config.get("providers"), dict):
         raise ValueError("Routing configuration must contain a providers object")
-    providers = [args.provider] if args.provider else [p for p in ("gemini", "deepseek", "claude") if p in config["providers"]]
+    muse_profile_arg = getattr(args, "muse_profile", None)
+    require_muse_profile_allowed(muse_profile_arg, getattr(args, "provider", None))
+    providers = [args.provider] if args.provider else [p for p in ("gemini", "deepseek", "claude", "muse") if p in config["providers"]]
     state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
     output = {}
     code = 0
@@ -2801,11 +3051,21 @@ def cli_quota_status(args):
             output[provider] = item
             continue
 
+        muse_meta = {}
+        if provider == "muse":
+            try:
+                _, muse_meta = resolve_muse_profile(config, muse_profile_arg)
+            except ValueError as exc:
+                output[provider] = {"provider": provider, "status": "state_error", "available_to_try": 0,
+                                    "fallback": quota_fallback(provider, config), "error": str(exc)}
+                code = 1
+                continue
         state, error = quota_state(state_dir, provider)
-        item = {"provider": provider, "model": config["providers"][provider].get("model"),
+        item = {"provider": provider, "model": muse_meta.get("model", config["providers"][provider].get("model")),
+                **muse_meta,
                 "quota_path": str(quota_path(state_dir, provider)), "available_to_try": 1}
         if error:
-            fallback = luna_fallback() if provider == "gemini" else quota_fallback(provider, config)
+            fallback = quota_fallback(provider, config)
             item.update(status="state_error", available_to_try=0, fallback=fallback, error="Malformed or unreadable quota state: " + error)
             code = 1
         elif state:
@@ -2832,14 +3092,20 @@ def cli_quota_set(args):
     config = read_json(args.config)
     quota_cooldown(config)
     provider = args.provider
-    if provider not in ("gemini", "claude"):
-        raise ValueError(f"quota-set only supports subscription quota providers ('gemini', 'claude'); '{provider}' uses monetary balance preflight")
+    if provider not in ("gemini", "claude", "muse"):
+        raise ValueError(f"quota-set only supports subscription quota providers ('gemini', 'claude', 'muse'); '{provider}' uses monetary balance preflight")
     if provider not in config.get("providers", {}):
         raise ValueError("Provider is missing from config")
+    muse_profile_arg = getattr(args, "muse_profile", None)
+    require_muse_profile_allowed(muse_profile_arg, provider)
+    muse_meta = {}
+    if provider == "muse":
+        _, muse_meta = resolve_muse_profile(config, muse_profile_arg)
     reason = args.reason.strip() if isinstance(args.reason, str) else ""
     if not reason:
         raise ValueError("reason must be non-empty")
-    error = {"code": "QUOTA_EXHAUSTED", "message": reason, "source": "operator"}
+    secret_values = [value.strip() for _, value in framework_secrets(config)]
+    error = {"code": "QUOTA_EXHAUSTED", "message": _sanitize_all_secrets(reason, secret_values), "source": "operator"}
     if args.reset_at:
         try:
             parsed = dt.datetime.fromisoformat(args.reset_at.replace("Z", "+00:00"))
@@ -2850,8 +3116,11 @@ def cli_quota_set(args):
         error["reset_at"] = parsed.isoformat()
     state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
     with provider_lock(state_dir, float(config.get("lock_timeout_seconds", 30)), "quota.lock"):
-        state = quota_record(provider, error, state_dir, "operator", config)
-    return {"status": "recorded", "provider": provider, "quota": state, "quota_path": str(quota_path(state_dir, provider))}, 0
+        state = quota_record(provider, error, state_dir, "operator", config,
+                             model=muse_meta.get("model"),
+                             muse_profile=muse_meta.get("muse_profile"),
+                             effort=muse_meta.get("effort"))
+    return {"status": "recorded", "provider": provider, **muse_meta, "quota": state, "quota_path": str(quota_path(state_dir, provider))}, 0
 
 
 def main():
@@ -2861,10 +3130,12 @@ def main():
         parser.add_argument("--config", required=True)
         parser.add_argument("--state-dir")
         if command == "status":
-            parser.add_argument("--provider", choices=("gemini", "deepseek", "claude"))
+            parser.add_argument("--provider", choices=("gemini", "deepseek", "claude", "muse"))
+            parser.add_argument("--muse-profile", choices=MUSE_PROFILE_NAMES, default=None)
             parser.add_argument("--check-live", "--live", dest="check_live", action="store_true")
         if command == "quota-set":
-            parser.add_argument("--provider", choices=("gemini", "claude"), required=True)
+            parser.add_argument("--provider", choices=("gemini", "claude", "muse"), required=True)
+            parser.add_argument("--muse-profile", choices=MUSE_PROFILE_NAMES, default=None)
             parser.add_argument("--reason", required=True)
             parser.add_argument("--reset-at")
         args = argparse.Namespace(provider=None)
@@ -2874,18 +3145,19 @@ def main():
         except (OSError, ValueError, KeyError, TypeError) as exc:
             result = {"status": "state_error", "available_to_try": 0, "error": str(exc)}
             if getattr(args, "provider", None):
-                result["fallback"] = luna_fallback() if args.provider in ("gemini", "deepseek") else {"model": "gpt-6-astra", "effort": "low"}
+                result["fallback"] = luna_fallback() if args.provider in ("gemini", "deepseek", "muse") else {"model": "gpt-6-astra", "effort": "low"}
             code = 1
         print(json.dumps(result, indent=2))
         return code
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("role", choices=("implement", "review"))
-    parser.add_argument("--provider", choices=("gemini", "deepseek", "claude"), default=None)
+    parser.add_argument("--provider", choices=("gemini", "deepseek", "claude", "muse"), default=None)
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--task-file", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--state-dir")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--muse-profile", choices=MUSE_PROFILE_NAMES, default=None)
     parser.add_argument("--review-effort", choices=("medium", "high"), default=None)
     parser.add_argument("--review-reason", default=None)
     args = parser.parse_args()

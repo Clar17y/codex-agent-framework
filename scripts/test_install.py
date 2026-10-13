@@ -62,6 +62,10 @@ class TestInstallFramework(unittest.TestCase):
         self.assertTrue((af_dir / "routing.example.json").exists())
         self.assertTrue((af_dir / "install.py").exists())
         self.assertTrue((af_dir / "scripts" / "provider_runner.py").exists())
+        self.assertEqual(
+            (af_dir / "scripts" / "test_muse_provider.py").read_bytes(),
+            (self.source_root / "scripts" / "test_muse_provider.py").read_bytes(),
+        )
         for name in ('jev_client.py', 'jev_search.py', 'jev_review.py'):
             self.assertTrue((af_dir / 'scripts' / name).is_file())
         self.assertTrue((af_dir / "docs" / "FRAMEWORK.md").exists())
@@ -825,7 +829,8 @@ class TestInstallFramework(unittest.TestCase):
         self.assertFalse((framework / 'backups').exists())
 
     def test_missing_runner_and_role_preflight(self):
-        for relative in ('scripts/provider_runner.py', 'agents/implementer.toml', 'skills/simplify/SKILL.md'):
+        for relative in ('scripts/provider_runner.py', 'scripts/test_muse_provider.py',
+                         'agents/implementer.toml', 'skills/simplify/SKILL.md'):
             path = self.source_root / relative
             retained = path.with_suffix('.retained')
             path.rename(retained)

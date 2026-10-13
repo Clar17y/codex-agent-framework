@@ -86,7 +86,8 @@ def collect_sources(source):
     """Explicit core files make incomplete source packages fail before mutation."""
     names = ['GLOBAL_POLICY.md', 'task-template.json', 'README.md',
              'routing.example.json', 'install.py', 'scripts/provider_runner.py',
-             'scripts/test_provider_runner.py', 'scripts/test_install.py', 'docs/FRAMEWORK.md',
+             'scripts/test_provider_runner.py', 'scripts/test_install.py',
+             'scripts/test_muse_provider.py', 'docs/FRAMEWORK.md',
              'scripts/jev_client.py', 'scripts/jev_search.py', 'scripts/jev_review.py',
              'scripts/test_jev_client.py', 'scripts/test_jev_search.py', 'scripts/test_jev_review.py']
     names += [f'agents/{name}.toml' for name in ROLE_FILES]

@@ -3,7 +3,7 @@ name: route-activity
 description: Route a bounded coding activity across Codex, Claude, Gemini and Muse using editable subscription priority chains and shared ownership.
 ---
 
-Use `{{CODEX_ROOT}}/agent-framework/scripts/provider_runner.py` with the installed `routing.json`. Read [FRAMEWORK.md](../../docs/FRAMEWORK.md) for contract fields, activity names and command examples.
+Use `{{CODEX_ROOT}}/agent-framework/scripts/provider_runner.py` with the installed `routing.json`. Read [FRAMEWORK.md]({{CODEX_ROOT}}/agent-framework/docs/FRAMEWORK.md) for contract fields, activity names and command examples.
 
 Check `status --activity ACTIVITY --config ROUTING` locally, then run `dispatch --activity ACTIVITY --workspace WORKSPACE --task-file TASK --config ROUTING`. The dispatcher chooses an ordered profile from `routing.json`. Use `--profile NAME` or `--provider NAME` only for an explicit override. The host primary model stays as selected. Each writing task needs explicit nonoverlapping owned paths. Static roles get enforced read/search capabilities and fresh context. Review uses a stable candidate and Jev diff binding; high/deep review needs `--review-reason`.
 

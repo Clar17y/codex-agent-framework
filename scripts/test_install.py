@@ -68,6 +68,53 @@ class TestInstallFramework(unittest.TestCase):
             install_framework(str(self.dest_root), source=str(self.source_root))
         self.assertEqual(path.read_bytes(), before_bad)
 
+    def test_unknown_activity_keys_fail_preflight_before_mutation(self):
+        source_path = self.source_root / 'routing.example.json'
+        source_config = json.loads(source_path.read_text())
+        source_config['activities']['unsupported'] = ['openai-sol']
+        source_path.write_text(json.dumps(source_config))
+        with self.assertRaisesRegex(PreflightError, 'Unsupported routing activity: unsupported'):
+            install_framework(str(self.dest_root), source=str(self.source_root))
+        self.assertFalse(self.dest_root.exists())
+
+        source_config['activities'].pop('unsupported')
+        source_path.write_text(json.dumps(source_config))
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        framework = self.dest_root / 'agent-framework'
+        routing_path = framework / 'routing.json'
+        manifest_path = framework / 'install-manifest.json'
+        sentinel = framework / 'README.md'
+        saved = json.loads(routing_path.read_text())
+        saved['activities']['unsupported'] = ['openai-sol']
+        routing_path.write_text(json.dumps(saved))
+        before = (routing_path.read_bytes(), manifest_path.read_bytes(), sentinel.read_bytes())
+        with self.assertRaisesRegex(PreflightError, 'Unsupported routing activity: unsupported'):
+            install_framework(str(self.dest_root), source=str(self.source_root))
+        self.assertEqual((routing_path.read_bytes(), manifest_path.read_bytes(), sentinel.read_bytes()), before)
+
+        saved['activities'].pop('unsupported')
+        saved['activities']['planning'] = ['gemini-flash', 'openai-sol']
+        routing_path.write_text(json.dumps(saved))
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        self.assertEqual(json.loads(routing_path.read_text())['activities']['planning'],
+                         ['gemini-flash', 'openai-sol'])
+        stable = routing_path.read_bytes()
+        source_config['activities']['unsupported'] = ['openai-sol']
+        source_path.write_text(json.dumps(source_config))
+        with self.assertRaisesRegex(PreflightError, 'Unsupported routing activity: unsupported'):
+            install_framework(str(self.dest_root), source=str(self.source_root))
+        self.assertEqual(routing_path.read_bytes(), stable)
+        source_config['activities'].pop('unsupported')
+        source_path.write_text(json.dumps(source_config))
+        for bad_chain in ([], ['openai-sol', 'openai-sol'], ['absent-profile']):
+            with self.subTest(chain=bad_chain):
+                saved['activities']['planning'] = bad_chain
+                routing_path.write_text(json.dumps(saved))
+                before_bad = routing_path.read_bytes()
+                with self.assertRaisesRegex(PreflightError, 'Invalid routing activity chain: planning'):
+                    install_framework(str(self.dest_root), source=str(self.source_root))
+                self.assertEqual(routing_path.read_bytes(), before_bad)
+
     def test_v12_reader_collision_and_missing_source_fail_preflight(self):
         helper = self.fake_home / '.gemini/config/agents/framework-reader.md'
         helper.parent.mkdir(parents=True)
@@ -116,6 +163,10 @@ class TestInstallFramework(unittest.TestCase):
         self.assertEqual(helper.read_bytes(), (self.source_root / 'agents/framework-reader.md').read_bytes())
         runner.validate_gemini_reader(config['providers']['gemini'], custom_root)
         self.assertFalse((custom_root.parent / '.gemini/config/agents/framework-reader.md').exists())
+        custom_guide = custom_root / 'agent-framework/docs/FRAMEWORK.md'
+        self.assertIn(f'[FRAMEWORK.md]({custom_guide.resolve().as_posix()})',
+                      (custom_root / 'skills/route-activity/SKILL.md').read_text())
+        self.assertTrue(custom_guide.is_file())
 
         # An earlier v12 install could have saved the wrong generated path.
         config['providers']['gemini']['reader_agent_file'] = str(custom_root.parent / '.gemini/config/agents/framework-reader.md')
@@ -130,6 +181,10 @@ class TestInstallFramework(unittest.TestCase):
         env_config = json.loads((env_root / 'agent-framework/routing.json').read_text())
         self.assertEqual(env_config['providers']['gemini']['reader_agent_file'], str(helper))
         runner.validate_gemini_reader(env_config['providers']['gemini'], env_root)
+        env_guide = env_root / 'agent-framework/docs/FRAMEWORK.md'
+        self.assertIn(f'[FRAMEWORK.md]({env_guide.resolve().as_posix()})',
+                      (env_root / 'skills/route-activity/SKILL.md').read_text())
+        self.assertTrue(env_guide.is_file())
 
     def test_fresh_install(self):
         """Exercise fresh install into clean target codex root."""
@@ -191,7 +246,11 @@ class TestInstallFramework(unittest.TestCase):
         self.assertTrue(claude_skill.exists())
         muse_skill = skills_dir / "ask-muse" / "SKILL.md"
         self.assertTrue(muse_skill.exists())
-        self.assertTrue((skills_dir / 'route-activity/SKILL.md').exists())
+        route_skill = skills_dir / 'route-activity/SKILL.md'
+        self.assertTrue(route_skill.exists())
+        guide = af_dir / 'docs/FRAMEWORK.md'
+        self.assertIn(f'[FRAMEWORK.md]({guide.resolve().as_posix()})', route_skill.read_text())
+        self.assertTrue(guide.is_file())
         simplify = skills_dir / 'simplify/SKILL.md'
         self.assertTrue(simplify.exists())
         simplify_text = simplify.read_text(encoding='utf-8')

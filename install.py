@@ -13,6 +13,8 @@ import stat
 import sys
 import uuid
 
+from scripts.provider_runner import READ_ACTIVITIES, WRITE_ACTIVITIES
+
 BEGIN_MARKER = '<!-- BEGIN CODEX MULTI-PROVIDER FRAMEWORK -->'
 END_MARKER = '<!-- END CODEX MULTI-PROVIDER FRAMEWORK -->'
 ROLE_FILES = (
@@ -326,6 +328,8 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
         if not isinstance(profile, dict) or set(profile) - {'provider', 'model', 'effort', 'enabled'} or profile.get('provider') not in ACTIVITY_EFFORTS or profile.get('provider') not in config['providers'] or not isinstance(profile.get('model'), str) or not profile['model'].strip() or profile.get('effort', 'medium') not in ACTIVITY_EFFORTS[profile['provider']] or not isinstance(profile.get('enabled', True), bool):
             raise PreflightError(f'Invalid routing profile: {name}')
     for name, chain in activities.items():
+        if name not in READ_ACTIVITIES | WRITE_ACTIVITIES | {'orchestration'}:
+            raise PreflightError(f'Unsupported routing activity: {name}')
         if not isinstance(chain, list) or not chain or len(chain) != len(set(chain)) or any(p not in profiles or profiles[p].get('enabled') is False for p in chain):
             raise PreflightError(f'Invalid routing activity chain: {name}')
     # Merge capability defaults without overwriting saved operator choices.

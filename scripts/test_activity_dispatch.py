@@ -10,6 +10,7 @@ import io
 import os
 import sys
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -39,6 +40,15 @@ class ActivityDispatchTests(unittest.TestCase):
                     muse_profile=None, review_effort=None)
         data.update(updates)
         return argparse.Namespace(**data)
+
+    @contextmanager
+    def fixture_cwd(self):
+        previous = Path.cwd()
+        os.chdir(self.root)
+        try:
+            yield
+        finally:
+            os.chdir(previous)
 
     def test_all_activities_have_four_providers_and_registry_is_immutable(self):
         original = copy.deepcopy(self.config)
@@ -366,9 +376,10 @@ print(json.dumps({"type":"turn.completed","thread_id":"child"}), flush=True)
         external, _ = runner.execute(args)
         self.assertEqual(external["status"], "blocked_pending_run")
         self.assertEqual(external["pending_path"], str(parent_path))
-        child, _ = runner.dispatch_activity(self.args("implementation", profile="openai-sol",
-                                                      parent_run_id=run_id,
-                                                      state_dir=os.path.relpath(state_dir, Path.cwd())))
+        with self.fixture_cwd():
+            child, _ = runner.dispatch_activity(self.args("implementation", profile="openai-sol",
+                                                          parent_run_id=run_id,
+                                                          state_dir=os.path.relpath(state_dir, Path.cwd())))
         self.assertEqual(child["status"], "completed")
         self.assertEqual(runner.orchestration_children(parent_path)[0]["status"], "completed")
         disjoint_task = self.root / "disjoint.json"
@@ -424,19 +435,41 @@ print(json.dumps({"type":"turn.completed","thread_id":"child"}), flush=True)
         alias = Path(str(self.root).swapcase()) if os.name == "nt" else self.root
         runner.write_json(parent_path, {"status":"uncertain_exit", "workspace":str(alias),
                                         "owned_paths":["src"], "run_id":run_id})
-        state_alias = (Path(str(state_dir).swapcase()) if os.name == "nt" else
-                       Path(os.path.relpath(state_dir, Path.cwd())))
-        result = runner.operator_resolve_orchestration(state_alias, self.root, run_id,
-                                                       "confirmed stopped")
+        with self.fixture_cwd():
+            state_alias = Path(os.path.relpath(state_dir, Path.cwd()))
+            result = runner.operator_resolve_orchestration(state_alias, self.root, run_id,
+                                                           "confirmed stopped")
         self.assertEqual(result["status"], "resolved")
         self.assertEqual(Path(result["orchestration_pending_path"]), parent_path)
+        if os.name == "nt":
+            runner.write_json(parent_path, {"status":"uncertain_exit", "workspace":str(alias),
+                                            "owned_paths":["src"], "run_id":run_id})
+            self.assertEqual(runner.operator_resolve_orchestration(Path(str(state_dir).swapcase()),
+                                                                    self.root, run_id,
+                                                                    "confirmed stopped")["status"], "resolved")
         other = self.root / "different-workspace"
         other.mkdir()
         runner.write_json(parent_path, {"status":"uncertain_exit", "workspace":str(other),
                                         "owned_paths":["src"], "run_id":run_id})
-        with self.assertRaisesRegex(ValueError, "workspace does not match"):
-            runner.operator_resolve_orchestration(state_alias, self.root, run_id,
-                                                  "must reject different workspace")
+        with self.fixture_cwd():
+            with self.assertRaisesRegex(ValueError, "workspace does not match"):
+                runner.operator_resolve_orchestration(state_alias, self.root, run_id,
+                                                      "must reject different workspace")
+
+    def test_relative_state_fixture_uses_same_drive_and_restores_cwd(self):
+        original_cwd = Path.cwd()
+        real_relpath = os.path.relpath
+
+        def reject_checkout_cwd(path, start=None):
+            if Path(start).resolve() != self.root:
+                raise ValueError("simulated cross-drive relative path")
+            return real_relpath(path, start)
+
+        with self.assertRaisesRegex(ValueError, "simulated cross-drive"):
+            reject_checkout_cwd(self.root / "state", original_cwd)
+        with self.fixture_cwd(), mock.patch.object(os.path, "relpath", side_effect=reject_checkout_cwd):
+            self.assertEqual(Path(os.path.relpath(self.root / "state", Path.cwd())), Path("state"))
+        self.assertEqual(Path.cwd(), original_cwd)
 
     def test_post_launch_parent_metadata_failure_and_timeout_keep_claim(self):
         fake = self.root / "slow_parent.py"

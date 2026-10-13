@@ -86,12 +86,14 @@ def collect_sources(source):
     """Explicit core files make incomplete source packages fail before mutation."""
     names = ['GLOBAL_POLICY.md', 'task-template.json', 'README.md',
              'routing.example.json', 'install.py', 'scripts/provider_runner.py',
+             'agents/framework-reader.md',
              'scripts/test_provider_runner.py', 'scripts/test_install.py',
+             'scripts/test_activity_dispatch.py',
              'scripts/test_muse_provider.py', 'docs/FRAMEWORK.md',
              'scripts/jev_client.py', 'scripts/jev_search.py', 'scripts/jev_review.py',
              'scripts/test_jev_client.py', 'scripts/test_jev_search.py', 'scripts/test_jev_review.py']
     names += [f'agents/{name}.toml' for name in ROLE_FILES]
-    names += [f'skills/{name}/SKILL.md' for name in ('ask-gemini', 'ask-claude', 'ask-muse', 'simplify',
+    names += [f'skills/{name}/SKILL.md' for name in ('ask-gemini', 'ask-claude', 'ask-muse', 'route-activity', 'simplify',
                                                   'jev-search', 'jev-review')]
     # Optional maintained templates, never recursive installation of state or logs.
     names += [p.relative_to(source).as_posix() for p in (source / 'docs').glob('*')
@@ -110,6 +112,8 @@ MUSE_PROFILE_DEFAULTS = {
     'escalation': {'model': 'muse-wonder-full-1.0', 'effort': 'high'},
 }
 MUSE_EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+ACTIVITY_EFFORTS = {'gemini': ('low', 'medium', 'high'), 'claude': ('medium', 'high'),
+                    'openai': MUSE_EFFORTS, 'muse': MUSE_EFFORTS}
 
 
 def merge_muse_profiles(entry, source_defaults):
@@ -170,21 +174,22 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
             raise PreflightError(f'Source routing file {source_example_path} must contain a providers object.')
         source_defaults = source_example['providers']
 
-    target_version = config.get('version', 1) if preserving else 11
+    target_version = config.get('version', 1) if preserving else 12
     if isinstance(target_version, bool) or not isinstance(target_version, int):
         raise PreflightError('Routing configuration version must be an integer.')
 
     providers_info = [
         ('gemini', 'agy', gemini_override),
         ('claude', 'claude', claude_override),
-        ('muse', 'muse', muse_override)
+        ('muse', 'muse', muse_override),
+        ('openai', 'codex', None)
     ]
     for provider, command, override in providers_info:
         entry = config['providers'].get(provider)
         if entry is None and preserving:
             default_entry = source_defaults.get(provider, {
                 'executable': command,
-                'model': {'gemini': 'gemini-3.8-flash-medium', 'claude': 'claude-opus-5-5', 'muse': 'muse-wonder-1.0'}[provider]
+                'model': {'gemini': 'gemini-3.8-flash-medium', 'claude': 'claude-opus-5-5', 'muse': 'muse-wonder-1.0', 'openai': 'gpt-6.1-sol'}[provider]
             })
             entry = copy.deepcopy(default_entry)
             config['providers'][provider] = entry
@@ -202,9 +207,25 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
                 if key != 'profiles':
                     entry.setdefault(key, copy.deepcopy(value))
             merge_muse_profiles(entry, source_defaults)
+        if preserving and provider == 'gemini' and isinstance(entry, dict):
+            entry.setdefault('reader_agent', 'framework-reader')
+        if preserving and provider == 'openai' and isinstance(entry, dict):
+            entry.setdefault('windows_sandbox', source_defaults.get('openai', {}).get('windows_sandbox', 'mxc'))
+            entry.setdefault('orchestration_windows_sandbox',
+                             source_defaults.get('openai', {}).get('orchestration_windows_sandbox', entry['windows_sandbox']))
+            entry.setdefault('orchestration_writable_roots',
+                             copy.deepcopy(source_defaults.get('openai', {}).get('orchestration_writable_roots', [])))
 
         if not isinstance(entry, dict) or not entry.get('model') or not entry.get('executable'):
             raise PreflightError(f'Invalid routing entry: {provider}')
+        if provider == 'openai' and entry.get('windows_sandbox') not in ('mxc', 'elevated', 'unelevated'):
+            raise PreflightError('Invalid routing entry: openai windows_sandbox must be mxc, elevated, or unelevated.')
+        if provider == 'openai' and entry.get('orchestration_windows_sandbox') not in ('mxc', 'elevated', 'unelevated'):
+            raise PreflightError('Invalid routing entry: openai orchestration_windows_sandbox must be mxc, elevated, or unelevated.')
+        if provider == 'openai' and (not isinstance(entry.get('orchestration_writable_roots', []), list) or
+                                     not all(isinstance(path, str) and path.strip()
+                                             for path in entry.get('orchestration_writable_roots', []))):
+            raise PreflightError('Invalid routing entry: openai orchestration_writable_roots must be paths.')
         if override is not None:
             if not override.strip():
                 raise PreflightError(f'Empty executable override: {provider}')
@@ -217,6 +238,11 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
             entry['executable'] = os.path.abspath(discovered) if discovered else command
             if not discovered:
                 print(f'Warning: {command} not found on PATH; retaining command name.')
+    gemini_entry = config['providers'].get('gemini')
+    if isinstance(gemini_entry, dict):
+        reader_path = str(root.parent / '.gemini/config/agents/framework-reader.md')
+        if gemini_entry.get('reader_agent_file') in (None, '~/.gemini/config/agents/framework-reader.md'):
+            gemini_entry['reader_agent_file'] = reader_path
 
     if preserving:
         # Stream telemetry is universal in v7. Make the effective default
@@ -262,12 +288,45 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
                     raise PreflightError('retired_secret_env_vars must be a list of environment variable names.')
                 if env_name not in names:
                     names.append(env_name)
-            config['version'] = 11
+            config['version'] = 12
         else:
-            # v11 only adds Muse complex/escalation profiles (merged above).
-            config['version'] = max(target_version, 11)
+            config['version'] = max(target_version, 12)
     else:
-        config['version'] = 11
+        config['version'] = 12
+    # v12 adds editable activity chains. Retain explicit operator choices and
+    # carry forward legacy provider pin customizations into the routine profile.
+    defaults = json.loads((source / 'routing.example.json').read_text(encoding='utf-8-sig'))
+    default_profiles = defaults.get('profiles', {})
+    profiles = config.setdefault('profiles', {})
+    activities = config.setdefault('activities', {})
+    if not isinstance(profiles, dict) or not isinstance(activities, dict):
+        raise PreflightError('Routing profiles and activities must be objects.')
+    if preserving and target_version < 12:
+        mappings = {'gemini': 'gemini-flash', 'claude': 'claude-opus', 'muse': 'muse-wonder', 'openai': 'openai-sol'}
+        for provider, profile_name in mappings.items():
+            entry = config['providers'].get(provider, {})
+            if isinstance(entry, dict) and profile_name not in profiles:
+                profile = copy.deepcopy(default_profiles[profile_name])
+                source_entry = source_defaults.get(provider, {})
+                if entry.get('model') != source_entry.get('model'):
+                    profile['model'] = entry['model']
+                if entry.get('effort', 'medium') != source_entry.get('effort', 'medium'):
+                    profile['effort'] = entry['effort']
+                profiles[profile_name] = profile
+        muse_profiles = config['providers'].get('muse', {}).get('profiles', {})
+        for old, new in (('complex', 'muse-full'), ('escalation', 'muse-full-high')):
+            if new not in profiles and old in muse_profiles:
+                profiles[new] = {'provider': 'muse', **copy.deepcopy(muse_profiles[old])}
+    for name, value in default_profiles.items():
+        profiles.setdefault(name, copy.deepcopy(value))
+    for name, value in defaults.get('activities', {}).items():
+        activities.setdefault(name, copy.deepcopy(value))
+    for name, profile in profiles.items():
+        if not isinstance(profile, dict) or set(profile) - {'provider', 'model', 'effort', 'enabled'} or profile.get('provider') not in ACTIVITY_EFFORTS or profile.get('provider') not in config['providers'] or not isinstance(profile.get('model'), str) or not profile['model'].strip() or profile.get('effort', 'medium') not in ACTIVITY_EFFORTS[profile['provider']] or not isinstance(profile.get('enabled', True), bool):
+            raise PreflightError(f'Invalid routing profile: {name}')
+    for name, chain in activities.items():
+        if not isinstance(chain, list) or not chain or len(chain) != len(set(chain)) or any(p not in profiles or profiles[p].get('enabled') is False for p in chain):
+            raise PreflightError(f'Invalid routing activity chain: {name}')
     # Merge capability defaults without overwriting saved operator choices.
     defaults = source_example if preserving else config
     capabilities = config.setdefault('capabilities', {})
@@ -305,7 +364,8 @@ def build_plan(source, root, gemini_override=None, claude_override=None, refresh
     files = collect_sources(source)
     plan = {}
     for name in files:
-        target = root / (name if name.startswith(('agents/', 'skills/')) else 'agent-framework/' + name)
+        target = root / (name if name.startswith('skills/') or
+                         (name.startswith('agents/') and name.endswith('.toml')) else 'agent-framework/' + name)
         check_path(target)
         content = (source / name).read_bytes()
         if name == 'GLOBAL_POLICY.md' or name.startswith('skills/'):
@@ -326,6 +386,26 @@ def build_plan(source, root, gemini_override=None, claude_override=None, refresh
         refresh_routing=refresh_routing,
     )
     plan[routing] = (json.dumps(data, indent=2) + '\n').encode('utf-8')
+    # Antigravity discovers reader agents in its own global config directory.
+    # Upgrade only a definition whose bytes still match our previous manifest;
+    # an operator edit or unowned collision must remain untouched.
+    reader = root.parent / '.gemini/config/agents/framework-reader.md'
+    check_path(reader)
+    content = (source / 'agents/framework-reader.md').read_bytes()
+    if reader.exists():
+        existing = reader.read_bytes()
+        if existing != content:
+            manifest_path = root / 'agent-framework/install-manifest.json'
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+                owned = any(Path(entry['path']).resolve() == reader.resolve() and
+                            entry['sha256'].upper() == hashlib.sha256(existing).hexdigest().upper()
+                            for entry in manifest['files'])
+            except (OSError, ValueError, KeyError, TypeError):
+                owned = False
+            if not owned:
+                raise PreflightError(f'Existing Gemini reader agent differs: {reader}')
+    plan[reader] = content
     return plan
 
 
@@ -389,7 +469,8 @@ def install_framework(codex_home=None, dry_run=False, gemini_override=None,
         backups = {}
         for target in [*plan, manifest_path]:
             if target.exists():
-                backup = backup_dir / target.relative_to(root)
+                backup = backup_dir / (target.relative_to(root) if target.is_relative_to(root)
+                                       else Path('external-gemini-reader.md'))
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(target, backup)
                 backups[target] = str(backup)

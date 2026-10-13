@@ -45,6 +45,61 @@ class TestInstallFramework(unittest.TestCase):
             shutil.copytree(REPO_ROOT / name, self.source_root / name,
                             ignore=shutil.ignore_patterns('__pycache__'))
 
+    def test_v12_custom_profile_and_chain_preserved_and_bad_reference_rejected(self):
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        path = self.dest_root / 'agent-framework/routing.json'
+        config = json.loads(path.read_text())
+        config['profiles']['openai-sol']['model'] = 'operator-sol'
+        config['activities']['planning'] = ['openai-sol', 'gemini-flash']
+        path.write_text(json.dumps(config))
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        persisted = json.loads(path.read_text())
+        self.assertEqual(persisted['profiles']['openai-sol']['model'], 'operator-sol')
+        self.assertEqual(persisted['activities']['planning'], ['openai-sol', 'gemini-flash'])
+        persisted['activities']['planning'] = ['absent-profile']
+        path.write_text(json.dumps(persisted))
+        before_bad = path.read_bytes()
+        with self.assertRaises(PreflightError):
+            install_framework(str(self.dest_root), source=str(self.source_root))
+        self.assertEqual(path.read_bytes(), before_bad)
+
+    def test_v12_reader_collision_and_missing_source_fail_preflight(self):
+        helper = self.dest_root.parent / '.gemini/config/agents/framework-reader.md'
+        helper.parent.mkdir(parents=True)
+        helper.write_text('unrelated custom agent')
+        with self.assertRaises(PreflightError):
+            install_framework(str(self.dest_root), source=str(self.source_root))
+        self.assertFalse((self.dest_root / 'agent-framework/routing.json').exists())
+        helper.unlink()
+        (self.source_root / 'scripts/test_activity_dispatch.py').unlink()
+        with self.assertRaises(PreflightError):
+            install_framework(str(self.dest_root), source=str(self.source_root))
+        self.assertFalse((self.dest_root / 'agent-framework/routing.json').exists())
+
+    def test_reader_manifest_owned_upgrade_and_operator_edit_collision(self):
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        helper = self.dest_root.parent / '.gemini/config/agents/framework-reader.md'
+        packaged = self.source_root / 'agents/framework-reader.md'
+        packaged.write_bytes(packaged.read_bytes() + b'\n# packaged revision\n')
+        config_path = self.dest_root / 'agent-framework/routing.json'
+        config = json.loads(config_path.read_text())
+        config['providers']['openai']['windows_sandbox'] = 'unelevated'
+        config['providers']['openai']['orchestration_windows_sandbox'] = 'mxc'
+        config_path.write_text(json.dumps(config))
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        self.assertEqual(helper.read_bytes(), packaged.read_bytes())
+        self.assertEqual(json.loads(config_path.read_text())['providers']['openai']['windows_sandbox'],
+                         'unelevated')
+        self.assertEqual(json.loads(config_path.read_text())['providers']['openai']['orchestration_windows_sandbox'],
+                         'mxc')
+        manifest = json.loads((self.dest_root / 'agent-framework/install-manifest.json').read_text())
+        entry = next(entry for entry in manifest['files'] if Path(entry['path']) == helper)
+        self.assertTrue(Path(entry['backup']).is_file())
+        helper.write_text('operator edit')
+        with self.assertRaises(PreflightError):
+            install_framework(str(self.dest_root), source=str(self.source_root))
+        self.assertEqual(helper.read_text(), 'operator edit')
+
     def test_fresh_install(self):
         """Exercise fresh install into clean target codex root."""
         install_framework(
@@ -69,6 +124,10 @@ class TestInstallFramework(unittest.TestCase):
         for name in ('jev_client.py', 'jev_search.py', 'jev_review.py'):
             self.assertTrue((af_dir / 'scripts' / name).is_file())
         self.assertTrue((af_dir / "docs" / "FRAMEWORK.md").exists())
+        self.assertTrue((af_dir / "scripts" / "test_activity_dispatch.py").exists())
+        self.assertEqual((self.dest_root.parent / '.gemini/config/agents/framework-reader.md').read_bytes(),
+                         (self.source_root / 'agents/framework-reader.md').read_bytes())
+        self.assertEqual(len(json.loads((af_dir / 'routing.json').read_text())['activities']), 15)
 
         # Check agents
         agents_dir = self.dest_root / "agents"
@@ -80,13 +139,13 @@ class TestInstallFramework(unittest.TestCase):
             "docs-researcher": ("gpt-6-luna", "medium"),
             "refactor-auditor": ("gpt-6-luna", "medium"),
             "verifier": ("gpt-6-luna", "medium"),
-            "complex-implementer": ("gpt-6-sol", "medium"),
-            "planner": ("gpt-6-sol", "medium"),
-            "test-engineer": ("gpt-6-sol", "medium"),
-            "correctness-gate": ("gpt-6-sol", "high"),
-            "security-reviewer": ("gpt-6-sol", "high"),
-            "quality-gate-max": ("gpt-6-sol", "max"),
-            "reviewer": ("gpt-6-astra", "low"),
+            "complex-implementer": ("gpt-6.1-sol", "medium"),
+            "planner": ("gpt-6.1-sol", "medium"),
+            "test-engineer": ("gpt-6.1-sol", "medium"),
+            "correctness-gate": ("gpt-6.1-sol", "high"),
+            "security-reviewer": ("gpt-6.1-sol", "high"),
+            "quality-gate-max": ("gpt-6.1-sol", "max"),
+            "reviewer": ("gpt-6.1-sol", "medium"),
         }
         for role, expected in expected_roles.items():
             with self.subTest(role=role):
@@ -101,6 +160,7 @@ class TestInstallFramework(unittest.TestCase):
         self.assertTrue(claude_skill.exists())
         muse_skill = skills_dir / "ask-muse" / "SKILL.md"
         self.assertTrue(muse_skill.exists())
+        self.assertTrue((skills_dir / 'route-activity/SKILL.md').exists())
         simplify = skills_dir / 'simplify/SKILL.md'
         self.assertTrue(simplify.exists())
         simplify_text = simplify.read_text(encoding='utf-8')
@@ -165,7 +225,7 @@ class TestInstallFramework(unittest.TestCase):
 
         # Check routing.json
         routing = json.loads((af_dir / "routing.json").read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 11)
+        self.assertEqual(routing.get("version"), 12)
         self.assertIn("providers", routing)
         self.assertIn("gemini", routing["providers"])
         self.assertNotIn("deepseek", routing["providers"])
@@ -308,7 +368,7 @@ class TestInstallFramework(unittest.TestCase):
         expected_quota = quota.read_bytes()
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         resolved = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(resolved["version"], 11)
+        self.assertEqual(resolved["version"], 12)
         self.assertEqual(resolved["providers"]["muse"]["executable"], "custom-muse")
         self.assertEqual(resolved["providers"]["muse"]["model"], "cli-default")
         self.assertEqual(resolved["providers"]["muse"]["effort"], "high")
@@ -334,7 +394,7 @@ class TestInstallFramework(unittest.TestCase):
         with mock.patch("install.shutil.which", return_value=None):
             install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         resolved = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(resolved["version"], 11)
+        self.assertEqual(resolved["version"], 12)
         self.assertEqual(resolved["providers"]["muse"]["executable"], "muse")
         self.assertEqual(resolved["providers"]["muse"]["model"], "muse-wonder-1.0")
         self.assertEqual(resolved["providers"]["gemini"]["heartbeat_seconds"], 0)
@@ -344,7 +404,7 @@ class TestInstallFramework(unittest.TestCase):
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         routing_path = self.dest_root / "agent-framework/routing.json"
         fresh = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(fresh["version"], 11)
+        self.assertEqual(fresh["version"], 12)
         self.assertEqual(fresh["providers"]["muse"]["profiles"], {
             "complex": {"model": "muse-wonder-full-1.0", "effort": "medium"},
             "escalation": {"model": "muse-wonder-full-1.0", "effort": "high"}})
@@ -360,14 +420,14 @@ class TestInstallFramework(unittest.TestCase):
         quota.parent.mkdir(parents=True, exist_ok=True)
         quota.write_bytes(b'{"retry_at":4070908800}')
         resolved = resolve_routing(self.source_root, self.dest_root)
-        self.assertEqual(resolved["version"], 11)
+        self.assertEqual(resolved["version"], 12)
         muse = resolved["providers"]["muse"]
         self.assertEqual((muse["executable"], muse["model"], muse["effort"], muse["timeout_seconds"], muse["custom"]),
                          ("custom-muse", "cli-default", "low", 123, "keep"))
         self.assertEqual(muse["profiles"]["complex"], {"model": "muse-wonder-full-1.0", "effort": "medium"})
         self.assertEqual(quota.read_bytes(), b'{"retry_at":4070908800}')
         # Positional calling convention still works.
-        self.assertEqual(resolve_routing(self.source_root, self.dest_root, None, None, False)["version"], 11)
+        self.assertEqual(resolve_routing(self.source_root, self.dest_root, None, None, False)["version"], 12)
 
     def test_muse_profiles_partial_custom_and_repeat(self):
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
@@ -502,7 +562,7 @@ class TestInstallFramework(unittest.TestCase):
         role.write_text('model = "gpt-5.6-luna"\n', encoding="utf-8")
 
         install_framework(str(self.dest_root), source=str(self.source_root))
-        data["version"] = 11
+        data["version"] = 12
         data["providers"]["claude"]["model"] = "claude-opus-5-5"
         data["providers"].pop("deepseek", None)
         self.assertEqual(json.loads(routing_path.read_text(encoding="utf-8")), data)
@@ -530,7 +590,7 @@ class TestInstallFramework(unittest.TestCase):
                 data["providers"]["claude"]["model"] = before
                 routing_path.write_text(json.dumps(data), encoding="utf-8")
                 resolved = resolve_routing(self.source_root, self.dest_root)
-                data["version"] = max(version, 11)
+                data["version"] = max(version, 12)
                 data["providers"]["claude"]["model"] = after
                 self.assertEqual(resolved, data)
 
@@ -546,7 +606,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(data), encoding="utf-8")
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         migrated = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 11)
+        self.assertEqual(migrated["version"], 12)
         self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 3600)
         self.assertEqual(migrated["providers"]["gemini"]["termination_grace_seconds"], 120)
 
@@ -559,7 +619,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(data), encoding="utf-8")
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         migrated = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 11)
+        self.assertEqual(migrated["version"], 12)
         self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 3600)
 
     def test_v6_custom_gemini_timeout_is_preserved(self):
@@ -571,7 +631,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(data), encoding="utf-8")
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         migrated = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 11)
+        self.assertEqual(migrated["version"], 12)
         self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 2700)
 
     def test_preserved_routing_fills_missing_universal_heartbeats_only(self):
@@ -907,7 +967,7 @@ class TestInstallFramework(unittest.TestCase):
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         routing_path = self.dest_root / "agent-framework" / "routing.json"
         routing = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 11)
+        self.assertEqual(routing.get("version"), 12)
         self.assertIn("gemini", routing["providers"])
         self.assertIn("claude", routing["providers"])
         self.assertNotIn("deepseek", routing["providers"])
@@ -934,7 +994,7 @@ class TestInstallFramework(unittest.TestCase):
 
         install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
         upgraded_v4 = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(upgraded_v4.get("version"), 11)
+        self.assertEqual(upgraded_v4.get("version"), 12)
         self.assertNotIn("deepseek", upgraded_v4["providers"])
         self.assertEqual(upgraded_v4["providers"]["gemini"]["model"], "gemini-custom-ultra")
         self.assertEqual(upgraded_v4["providers"]["claude"]["model"], "claude-opus-5-5")
@@ -954,7 +1014,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(v8_data, indent=2), encoding="utf-8")
         install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
         upgraded_v8 = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(upgraded_v8.get("version"), 11)
+        self.assertEqual(upgraded_v8.get("version"), 12)
         self.assertNotIn("deepseek", upgraded_v8["providers"])
         self.assertEqual(upgraded_v8["providers"]["gemini"]["model"], "gemini-2.5-pro")
         self.assertEqual(upgraded_v8["providers"]["claude"]["executable"], "/custom/claude")
@@ -972,7 +1032,7 @@ class TestInstallFramework(unittest.TestCase):
         second_installed_bytes = routing_path.read_bytes()
         self.assertEqual(first_installed_bytes, second_installed_bytes)
         routing = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 11)
+        self.assertEqual(routing.get("version"), 12)
         self.assertNotIn("deepseek", routing["providers"])
 
     def test_retired_custom_credential_stays_filtered_after_upgrade(self):
@@ -1038,7 +1098,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path = self.dest_root / "agent-framework/routing.json"
         self.assertTrue(routing_path.exists())
         routing = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 11)
+        self.assertEqual(routing.get("version"), 12)
         self.assertNotIn("deepseek", routing["providers"])
         self.assertIn("gemini", routing["providers"])
         self.assertIn("claude", routing["providers"])

@@ -5,6 +5,8 @@ description: Simplify recently changed code through reuse, quality, and efficien
 
 # Simplify
 
+For a delegated simplification audit use the canonical `refactor_audit` activity with `status --activity refactor_audit` and `dispatch --activity refactor_audit` through the installed framework. For an authorized writing pass, use an explicit owned implementation task. Provider-specific legacy commands remain available only when deliberately selected. Activity routing preserves quota and ownership across providers.
+
 Make the selected code easier to maintain without changing its observable behavior. Honor additional focus supplied with `$simplify`, such as a directory or performance concern. A review-only request authorizes findings, not edits.
 
 ## Implementer self-check

@@ -1,295 +1,33 @@
-# Codex Agent Framework
+# Multi-provider activity routing
 
-Multi-provider orchestration framework coordinating Gemini Flash, optional Muse Code, and Claude Code under OpenAI Codex with fail-closed fallback routing, local quota caching, and process isolation.
+This package routes bounded coding activities across OpenAI Codex CLI, Claude Code, Google Antigravity (`agy`) and Muse Code. The primary host model remains the user's selection. An explicitly chosen CLI agent can orchestrate by calling the same dispatcher for child tasks; the framework does not run a separate autonomous pipeline.
 
-[![CI](https://github.com/Clar17y/codex-agent-framework/actions/workflows/tests.yml/badge.svg)](https://github.com/Clar17y/codex-agent-framework/actions/workflows/tests.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+Install with `python install.py` (Python 3.11+). The additive v12 installer preserves saved provider executables, timing, custom model/profile/chain choices, quota state and credentials. It registers a narrowly named Antigravity reader agent and rejects a conflicting definition. Use `--dry-run` to inspect planned changes; actual signed-in provider access must be checked separately.
 
-## What this is
-
-This framework integrates external AI developer CLI tools—Google Antigravity (`agy`) and Anthropic Claude Code CLI (`claude`)—into an OpenAI Codex development environment. It routes implementation tasks primarily through Gemini Flash falling back directly to native Luna medium (`gpt-6-luna`), and independent code reviews through Claude Opus 5.5 with native Astra low fallback (restricted to read and search tools, with shell execution, file edits, and MCP excluded). All execution runs through a local Python orchestration runner that coordinates file-level concurrency, caches terminal quota exhaustion, and isolates credentials across child subprocesses. Ownership coordination and quota state are local to one machine and do not coordinate writers across separate computers or network-mounted workspaces.
-
-## Design highlights
-
-- **Deterministic fail-closed fallback chain**: Implementation tasks route primarily to Gemini Flash (`gemini-3.8-flash-medium`) and fall back directly upon quota exhaustion or non-quota failure to native Luna medium (`gpt-6-luna`).
-- **Atomic quota caching**: Gemini and Claude quota states are cached atomically with provider reset times or cooldowns. Legacy DeepSeek balance preflight and caching internals are retained for backward compatibility.
-- **Subprocess credential isolation**: Credential isolation and artifact redaction are defense in depth, not a hard same-user process-containment boundary.
-- **Retained-artifact secret redaction**: Retained execution logs (`prompt.txt`, `stdout.log`, `stderr.log`, `last_message.txt`, `provider.log`, `progress.json`, `heartbeat.json`, `status.txt`, `diff.txt`, `head.txt`) in workspace `.llm-output/` are scanned via full-file memory maps (`mmap`) and rewritten using bounded 64 KB copy chunks with atomic replacement (falling back to single-link in-place rewriting for locked Windows file handles). `result.json` is sanitized separately in memory before being written to disk.
-- **Granular path-ownership claims and pending-run locking**: Cooperating implementation workers register hierarchical file or directory paths under a short coordination lock, preventing concurrent conflicting writers on identical or ancestor/descendant files while preserving pending records after abnormal termination until explicit operator resolution. Coordination is local to one machine and does not coordinate writers across computers or network-mounted workspaces.
-- **Bounded-memory stream telemetry parsing**: CLI lifecycle events across Gemini (`stream-json`) and Claude (`stream-json`) are parsed using an incremental raw-byte reader in 64 KB chunks up to 1 MB per line, emitting rate-limited stderr progress and evaluating terminal success from a bounded tail buffer without accumulating multi-megabyte transcripts in memory.
-
-## Provider routing chain
-
-The installed [review and handoff discipline](GLOBAL_POLICY.md#review-and-handoff-discipline) requires related findings to be repaired as one batch, a stated reason for repeat review or verification, and immediate completion handoffs. The `simplify` skill covers reuse, quality and efficiency without forcing a reviewer/gate/verifier chain. These are instruction-level constraints; the adapter does not impose a runtime review-count limit or waive required checks.
-
-```mermaid
-flowchart TD
-    subgraph Implementation["Implementation Chain"]
-        Start["Task: Routine Implementation"] --> PendingCheck{"Unresolved pending run<br/>on claimed paths?"}
-        PendingCheck -- "Yes" --> Blocked["Blocked (exit 1 / blocked_pending_run)<br/>Halts until operator resolution"]
-        PendingCheck -- "No" --> GeminiCheck{"Check local quota cache"}
-        GeminiCheck -- "Available" --> Gemini["Primary: gemini-3.8-flash-medium"]
-        GeminiCheck -- "Quota exhausted" --> Luna["Native fallback: native Luna medium (gpt-6-luna)"]
-
-        Gemini -- "Success" --> Done["Done"]
-        Gemini -- "Terminal quota exhaustion" --> RecordGemini["Record quota in gemini-quota.json"] --> Luna
-        Gemini -- "Non-quota error / failure" --> Luna
-
-        Luna --> Done
-    end
-
-    subgraph Review["Review Chain"]
-        ReviewStart["Task: Independent Review"] --> ClaudeCheck{"Check local quota cache"}
-        ClaudeCheck -- "Available" --> Claude["Primary: claude-opus-5-5"]
-        ClaudeCheck -- "Quota exhausted" --> Astra["Native fallback: native Astra low (reviewer)"]
-
-        Claude -- "Success" --> ReviewDone["Done"]
-        Claude -- "Terminal quota exhaustion" --> RecordClaude["Record quota in claude-quota.json"] --> Astra
-        Claude -- "Non-quota error / failure" --> Astra
-
-        Astra --> ReviewDone
-    end
-```
-
-## Evidence
-
-The current native roles use GPT-6 Luna for focused work and GPT-6 Sol for complex implementation, planning and correctness checks. Independent review uses Claude Opus 5.5. See the [dated model routing rationale](docs/MODEL_ROUTING.md) for sources, effort choices and evaluation limits.
-
-- **Offline test suite**: Provider, installer and Jev helper tests use temporary installation roots, mock CLI processes and fake HTTP transports without consuming provider tokens or live credentials. These offline checks do not prove provider authentication, retrieval quality, probability calibration, pinned-model availability, or role discovery in a live Codex host.
-- **Continuous integration matrix**: Multi-platform GitHub Actions workflow at [`.github/workflows/tests.yml`](.github/workflows/tests.yml) executing test discovery and git patch whitespace validation across three platforms: `ubuntu-latest`, `windows-latest`, and `macos-latest` on Python 3.11.
-- **Release history**: Existing release tags present in the repository include `v4.1.0`, `v4.1.1`, `v4.1.2`, `v4.2.0`, and `v5.0.0`.
-- **Historical benchmarks**: Supplied evaluation data from the v3 architecture is preserved in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) as historical reference data; it does not represent measurements of current Gemini or Claude models.
-
-## Install
-
-The Opus 5.5 review route requires **Claude Code 2.1.280 or later**. Check `claude --version`; use `claude update` or the package manager reported by that command to upgrade. If the supported executable is outside PATH, pass its path with the installer's `--claude` option.
-
-Ordinary installation migrates the exact pre-v8 packaged `claude-opus-5` pin to `claude-opus-5-5` while preserving unrelated routing settings and quota state. The v9 migration removes pre-v9 DeepSeek provider entries and retains custom credential names only as filtering metadata. Custom Claude model values remain intact; the review runner requires the exact supported pin and rejects other models. A current-version override is not silently migrated again.
-
-You need **Python 3.11+**, Git, and Codex signed into your account. If Python is missing or older, install a current version from [python.org](https://www.python.org/downloads/) and reopen your terminal.
-
-No `pip install` is needed. You can install from a cloned repository or from a release archive:
-
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/Clar17y/codex-agent-framework.git
-   cd codex-agent-framework
-   ```
-   Alternatively, download the ZIP archive from [Releases](https://github.com/Clar17y/codex-agent-framework/releases), extract it, and open a terminal in the extracted folder.
-
-2. **Execute installation**:
-   - **macOS / Linux**:
-     ```bash
-     python3 --version
-     python3 install.py --dry-run
-     python3 install.py
-     ```
-   - **Windows (PowerShell)**:
-     ```powershell
-     python --version
-     python install.py --dry-run
-     python install.py
-     ```
-     Use an explicit Python executable path if `python` does not identify the target 3.11+ interpreter.
-
-3. **Verify installation**:
-   Start a **new Codex task after installing**. Ask it to list the available custom agents and confirm that `ask-gemini`, `ask-claude`, and `simplify` are available.
-
-The framework installs twelve roles (see [Repository layout](#repository-layout)). Custom role discovery depends on the Codex host; see [OpenAI's custom-agent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents). A host without custom-role support must explicitly pass the role's model, effort, and instructions when spawning.
-
-The optional `ask-muse` skill and routing entry are installed even when the Muse CLI is absent. Install [Muse Code](https://dev.meta.ai/docs/muse-code) separately, open `muse` and complete its browser sign-in with the account holding the Power subscription. The CLI subscription is separate from pay-as-you-go API keys. A stored API key can override browser login; resolve account selection in Muse before running subscription work. The adapter removes known API-key environment overrides from external children and does not inspect or alter stored authentication files. Use `python install.py --muse <executable>` if Muse is outside PATH.
-
-The default installation destination is `~/.codex` (honoring `CODEX_HOME` or `--codex-home /path/to/codex`). Existing files replaced during installation are backed up under `agent-framework/backups/`, and `agent-framework/install-manifest.json` records file hashes and backup paths. Unrelated configurations, roles, skills, and credentials are preserved.
-
-The installer enforces lexical path checks, refusing linked source or target paths (including symlinks and NTFS reparse points) to prevent circular links or synced-folder collisions. If a macOS source directory has a symlinked ancestor, supply its physical path: `python3 install.py --source "$(pwd -P)"`. Choose a physical destination path as well; symlinks inside the Codex directory are prohibited. The installer also inspects `AGENTS.md` before modification, refusing ambiguous, malformed, or reversed policy markers. Installation is not a filesystem-wide transaction and there is no automatic uninstaller; restore from `agent-framework/backups/` if manual recovery is required. An existing `.agent-framework-install.lock` prevents concurrent installations and dry runs. **Stop active framework jobs before upgrading.**
-
-## Provider setup
-
-### Jev search and review assistance
-
-The `jev-search` skill finds code by behaviour while keeping raw candidate scans out of the agent's context. Running `jev-search` is mandatory at the start of substantial coding investigations or architectural exploration before delegating implementation. The `jev-review` skill prepares an advisory focus brief from a saved diff, and is mandatory on integrated code-changing diffs before review or push. Permitted concise exemptions (e.g. exact known identifiers, tiny localized single-site fixes, or non-code diffs) require recording a concise non-empty reason. Both use the existing Python runtime, with no extra packages.
-
-The primary agent or native explorer performs remote Jev preparation before delegation; external Gemini and Claude child processes do not inherit `TYPESAFE_API_KEY`. When `workflow.require_jev_evidence=true` in `routing.json` (merged by default on installation and upgrades), `provider_runner.py` mechanically enforces `task.jev.search` accounting on implementation tasks and `task.jev.review` accounting (bound to the SHA-256 of `task.review.diff_path`) on review tasks. Instruction-level policy governs arbitrary native subagent calls.
-
-Provide `TYPESAFE_API_KEY` to the invoking process. Jev defaults to enabled with `authorization_mode: "all_workspaces"`, so coding repositories and Git worktrees need no per-workspace prompt or `--allow-remote`. Explicit opt-outs and `allowed_roots` restrictions remain available and are preserved on upgrade. Unavailable results are not a session-wide skip: reassess later applicable work and retry after readiness changes. The key is filtered from Gemini/Claude child environments and included in retained-artifact redaction. See [Jev configuration and usage](docs/JEV.md).
-
-Save each helper's JSON in the active workspace before launching the corresponding adapter task. These output paths match `task-template.json`; `task.review.diff_path` must name the same saved diff passed to the review helper. Create `.llm-output` first and save the candidate diff there before review.
-
-On macOS / Linux:
-
-```bash
-mkdir -p .llm-output
-python3 scripts/jev_search.py search --workspace . --query "Where are provider credentials filtered?" --scope scripts --top-k 6 > .llm-output/jev-search.json
-python3 scripts/jev_review.py --workspace . --diff-file .llm-output/candidate.diff > .llm-output/jev-review.json
-```
-
-On Windows (PowerShell), save UTF-8 explicitly so the gate can read the JSON:
+The canonical commands are:
 
 ```powershell
-New-Item -ItemType Directory -Force .llm-output | Out-Null
-python scripts/jev_search.py search --workspace . --query "Where are provider credentials filtered?" --scope scripts --top-k 6 | Set-Content -Encoding utf8 .llm-output/jev-search.json
-python scripts/jev_review.py --workspace . --diff-file .llm-output/candidate.diff | Set-Content -Encoding utf8 .llm-output/jev-review.json
+$framework = "$HOME/.codex/agent-framework"
+python "$framework/scripts/provider_runner.py" status --activity implementation --config "$framework/routing.json"
+python "$framework/scripts/provider_runner.py" dispatch --activity implementation --workspace "C:/path/to/repo" --task-file "C:/path/to/repo/.llm-output/task.json" --config "$framework/routing.json"
 ```
 
-### Connect external provider CLIs
+Choose from `orchestration`, `planning`, `exploration`, `implementation`, `implementation_complex`, `implementation_long_horizon`, `test_design`, `testing`, `verification`, `independent_review`, `security_review`, `refactor_audit`, `documentation`, `docs_research`, and `deep_review`. `--profile NAME` pins one eligible profile, while `--provider NAME` selects the first eligible profile on that provider. `--dry-run` shows the selected command without inference. Activity chains and profiles live in `routing.json`.
 
-Install and sign into the **Antigravity CLI (`agy`)** and **Claude Code CLI (`claude`)**, following their official documentation:
+The dispatcher shares one quota cache per account across all models and activities. It moves to the next route after a known terminal failure and resolved writer claim. Unknown completion, cancellation and timeout retain the pending claim, blocking overlapping work. An all-routes-unavailable result is not completion. File ownership and Jev evidence remain part of each task contract. See [FRAMEWORK.md](docs/FRAMEWORK.md) for details.
 
-- [Antigravity installation and authentication](https://www.antigravity.google/docs/cli/install/)
-- [Claude Code quickstart](https://code.claude.com/docs/en/quickstart)
+Static analysis activities use restricted read/search tools. Writing activities require explicit owned paths. A `verification` worker can execute checks and write generated/scratch artifacts within its contract. Independent review starts fresh against a saved candidate and Jev diff binding, and prefers a provider other than the author when one is eligible. High/deep review requires a concrete reason.
 
-The framework installer does not install provider binaries or transfer authentication credentials. Native roles can be installed even when a provider CLI is absent. Once the provider tools are installed and on your `PATH`, refresh routing:
+The legacy `implement`, `review`, `status --provider` and `quota-set` commands remain for existing scripts. Their pinned-provider fallback metadata does not define the new activity chains. Retired DeepSeek code and state remain for compatibility and audit; the v12 chain does not route to it.
 
-- **macOS / Linux**:
-  ```bash
-  command -v agy
-  command -v claude
-  python3 install.py --refresh-routing
-  ```
-- **Windows (PowerShell)**:
-  ```powershell
-  python install.py --refresh-routing
-  ```
+This is local process, cache and claim coordination on one machine. CLI permissions and secret filtering add defense in depth; they are not a cross-process security boundary. Offline fake-CLI tests establish parser and routing behavior, while live authentication, account entitlement and provider-enforced tool capabilities require bounded signed-in validation.
 
-If a CLI binary is outside your system `PATH`, supply its explicit path:
-```bash
-python3 install.py --gemini "$HOME/.local/bin/agy" --claude "$HOME/.local/bin/claude"
-```
+## Setup and operation
 
-### Legacy provider compatibility
+Install the external CLIs and sign into the intended subscription accounts before expecting any route to run. Codex uses its ChatGPT login path; a stored API key or alternate provider configuration must not be assumed to use the subscription. Muse Power needs its interactive browser sign-in and an entitled CLI model ID; regular Wonder and Wonder Full access should be checked separately. Claude and Gemini likewise need installed, signed-in CLIs. The installer discovers executable paths but does not log in, purchase a plan, redeem credits or establish model entitlement. Jev search/review evidence is prepared by the primary/native agent and referenced in task JSON; external children do not inherit its API key. See [JEV.md](docs/JEV.md).
 
-DeepSeek has been retired from active framework routing in v9. Any preexisting user Codex profiles (`deepseek.config.toml`) or environment credentials (`DEEPSEEK_API_KEY`) on your machine remain untouched. Legacy adapter internals and balance verification logic are retained for compatibility, but DeepSeek is no longer configured, offered, or automatically recommended for active tasks.
+Copy [task-template.json](task-template.json) into the active repository's `.llm-output/` and fill its objective, explicit owned paths, acceptance criteria, checks, instructions and Jev evidence. `status --activity` is a local cache read; it does not create a provider run. `dispatch --activity` executes one ordered chain. Use `--profile` or `--provider` for an explicit choice, `--dry-run` to inspect the command, and `--state-dir` only when every cooperating task deliberately shares that alternate state. The same installed state directory must govern all workspaces using an account.
 
-The installed routing preserves Gemini `gemini-3.8-flash-medium` as the implicit implementer, falling back directly to native Luna medium (`gpt-6-luna`), Claude `claude-opus-5-5` with medium review effort by default, and native fallback roles (Astra low for review). Muse is selected explicitly with `--provider muse`; its packaged model is `muse-wonder-1.0`, and `providers.muse.model: "cli-default"` uses the selection in Muse settings when a subscription-only model's CLI ID is not documented. Installation does not guarantee model or subscription access. Muse also has explicit profiles: `--muse-profile routine` (default, regular Wonder `muse-wonder-1.0` medium), `--muse-profile complex` (Wonder Full `muse-wonder-full-1.0` medium) and `--muse-profile escalation` (Wonder Full `muse-wonder-full-1.0` high), configured under `providers.muse.profiles` (routing v11).
+Results and redacted artifacts are saved under the task workspace's `.llm-output/agent-framework/`. A validated completion still needs the specified tests and primary acceptance. Exit 20 means confirmed or cached quota; `all_routes_unavailable` names attempted routes. For timeout or malformed terminal output, inspect `pending_path`, confirm the old writer and provider session have stopped, and only then resolve the pending record. Do not delete logs, clear quota files or launch an overlapping fallback to force progress. Disjoint file ownership may continue. The [operational guide](docs/FRAMEWORK.md) covers state recovery, orchestration child markers, review binding, and legacy command behavior.
 
-## Command reference and usage
-
-### Provider availability status
-
-For an explicitly chosen Muse implementation, run `python "<codex-root>/agent-framework/scripts/provider_runner.py" status --provider muse --config "<codex-root>/agent-framework/routing.json"`, then `python "<codex-root>/agent-framework/scripts/provider_runner.py" implement --provider muse --workspace "<workspace>" --task-file "<contract.json>" --config "<codex-root>/agent-framework/routing.json"`, adding `--muse-profile complex` or `--muse-profile escalation` when the primary deliberately selects Wonder Full. The status command reads the local `muse-quota.json` cache and never contacts Muse. Terminal quota exhaustion and established CLI failures route to native Luna medium; timeouts and uncertain output retain the pending ownership claim. A live signed-in Power subscription run remains necessary to validate actual entitlement and model access.
-
-Check provider availability and cached quota state without invoking models or creating task contracts:
-
-- **macOS / Linux**:
-  ```bash
-  framework_root="${CODEX_HOME:-$HOME/.codex}/agent-framework"
-  python3 "$framework_root/scripts/provider_runner.py" status --provider gemini --config "$framework_root/routing.json"
-  python3 "$framework_root/scripts/provider_runner.py" status --provider claude --config "$framework_root/routing.json"
-  ```
-- **Windows (PowerShell)**:
-  ```powershell
-  $frameworkRoot = Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }) 'agent-framework'
-  python "$frameworkRoot/scripts/provider_runner.py" status --provider gemini --config "$frameworkRoot/routing.json"
-  python "$frameworkRoot/scripts/provider_runner.py" status --provider claude --config "$frameworkRoot/routing.json"
-  ```
-
-Exit codes:
-- `0` (`available_to_try`): No cached block is active.
-- `20` (`fallback_required`): Confirmed quota exhaustion; routes to fallback.
-- `1` (`state_error`): Unreadable state; routes to fallback with error disclosed.
-
-Shared state files live in `agent-framework/state/` (`gemini-quota.json`, `claude-quota.json`; legacy `deepseek-balance.json` is retained if present). See [docs/FRAMEWORK.md](docs/FRAMEWORK.md) for details on quota caching.
-
-### Delegated implementation and review execution
-
-Execute tasks via the provider runner:
-
-```bash
-# Implementation (Gemini Flash -> Luna medium)
-python3 "$framework_root/scripts/provider_runner.py" implement \
-  --workspace "$PWD" --task-file "$PWD/.llm-output/task.json" \
-  --config "$framework_root/routing.json"
-
-# Review (Claude Opus 5.5, routine medium effort)
-python3 "$framework_root/scripts/provider_runner.py" review \
-  --workspace "$PWD" --task-file "$PWD/.llm-output/task.json" \
-  --config "$framework_root/routing.json"
-
-# Review (Claude Opus 5.5, high effort with justified reason)
-python3 "$framework_root/scripts/provider_runner.py" review \
-  --workspace "$PWD" --task-file "$PWD/.llm-output/task.json" \
-  --config "$framework_root/routing.json" \
-  --review-effort high --review-reason "Coupled state machine refactoring and security audit"
-```
-
-Review tasks execute with read-only tools: shell execution, file edits, and MCP servers are excluded. On Windows, use `python` and Windows path separators.
-
-### Manual quota entries
-
-Record manually reported quota limits or reset times:
-
-```bash
-python3 "$framework_root/scripts/provider_runner.py" quota-set --provider claude \
-  --config "$framework_root/routing.json" --reason "User reported exhausted usage"
-```
-
-To provide an exact reset time from a usage dashboard, supply `--reset-at` with an ISO-8601 timestamp including timezone offset (e.g. `--reset-at "2026-09-18T18:00:00+00:00"`).
-
-### Updates and recovery
-
-To update from source:
-
-- **macOS / Linux**:
-  ```bash
-  git pull --ff-only
-  python3 install.py --dry-run
-  python3 install.py
-  ```
-- **Windows (PowerShell)**:
-  ```powershell
-  git pull --ff-only
-  python install.py --dry-run
-  python install.py
-  ```
-
-Updates preserve custom routing configurations. Passing `--refresh-routing` resets `routing.json` from the packaged defaults and rediscovers executables; to update only a specific CLI executable while preserving the rest of your custom routing, pass `--gemini` or `--claude` with the desired path. To restore an overwritten file, look up its snapshot under `agent-framework/backups/` as recorded in `agent-framework/install-manifest.json`. Backups are never deleted automatically.
-
-### Stream telemetry and run artifacts
-
-Gemini and Claude runs stream CLI lifecycle events (`stream-json`). The adapter writes raw stream records to `stdout.log`, emits throttled step/tool transitions on stderr at 15-second intervals, updates a content-minimized `progress.json`, and records periodic `heartbeat.json` snapshots (defaulting to 60 seconds) for quiet-period liveness monitoring.
-
-Progress metadata excludes prompts, model response text, tool parameters, and tool outputs. However, raw child logs (`stdout.log` and `stderr.log`) stored under `.llm-output/agent-framework/` retain complete session streams until post-execution sanitization runs; credential isolation and redaction are defense in depth, not a hard same-user process-containment boundary.
-
-### Offline test execution
-
-Run the offline unit tests from the repository root:
-
-- **macOS / Linux**:
-  ```bash
-  python3 -m unittest discover -s scripts -p 'test_*.py'
-  ```
-- **Windows (PowerShell)**:
-  ```powershell
-  python -m unittest discover -s scripts -p 'test_*.py'
-  ```
-
-The test suite runs with simulated mock CLI processes and offline fixtures without network calls or API keys. These offline checks do not prove provider authentication, pinned-model availability, or role discovery in a live Codex host. Machine-specific onboarding, platform differences, and verification notes can be tracked in repository issues or local operational logs.
-
-## Repository layout
-
-| Path | Description |
-| --- | --- |
-| [`GLOBAL_POLICY.md`](GLOBAL_POLICY.md) | Policy instructions defining provider routing, fallback hierarchies, and agent delegation rules |
-| [`install.py`](install.py) | Standalone multi-platform installer and upgrade tool |
-| [`routing.example.json`](routing.example.json) | Package default routing template defining provider CLI executables, models, and timeouts |
-| [`task-template.json`](task-template.json) | Standard task contract template specifying objective, acceptance criteria, and path ownership |
-| `agents/` | Twelve custom agent role definitions (`implementer`, `complex-implementer`, `reviewer`, `quality-gate-max`, `correctness-gate`, `security-reviewer`, `test-engineer`, `planner`, `explorer`, `docs-researcher`, `refactor-auditor`, `verifier`) |
-| `skills/` | Provider workflows (`ask-gemini`, `ask-claude`), simplification (`simplify`), and Jev tools (`jev-search`, `jev-review`) |
-| `scripts/` | Orchestration runner ([`provider_runner.py`](scripts/provider_runner.py)) and unit tests ([`test_install.py`](scripts/test_install.py), [`test_provider_runner.py`](scripts/test_provider_runner.py)) |
-| `docs/` | Architecture rationale ([`ARCHITECTURE.md`](docs/ARCHITECTURE.md)), framework operational policy ([`FRAMEWORK.md`](docs/FRAMEWORK.md)), historical benchmarks ([`BENCHMARKS.md`](docs/BENCHMARKS.md)), and workflow templates |
-
-During installation, the installer merges one managed routing-policy block from `GLOBAL_POLICY.md` into the user's own `AGENTS.md` (bounded by `<!-- BEGIN CODEX MULTI-PROVIDER FRAMEWORK -->` and `<!-- END CODEX MULTI-PROVIDER FRAMEWORK -->`) and preserves surrounding personal instructions and configuration.
-
-## Documentation
-
-- [docs/JEV.md](docs/JEV.md): Semantic code search and advisory review helpers, workspace authorization, budgets, and evaluation limits.
-
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Comprehensive analysis of the six core architectural decisions (fail-closed routing, monetary preflights, credential isolation, artifact redaction, path ownership, and bounded stream telemetry).
-- [docs/FRAMEWORK.md](docs/FRAMEWORK.md): Complete operational routing policy, timeout configurations, and lifecycle diagnostics.
-- [docs/BENCHMARKS.md](docs/BENCHMARKS.md): Preserved historical benchmark data from v3 architecture evaluation.
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for the full license text.
-
-Copyright (c) 2026 Scott Dyer.
+After source changes, run `python -m unittest discover -s scripts -p 'test_*.py' -q`. These tests use local fake processes. Live signed-in probes and repository CI are separate acceptance gates.

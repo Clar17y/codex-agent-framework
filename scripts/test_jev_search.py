@@ -779,8 +779,10 @@ class TestInventoryAndChunkRepair(unittest.TestCase):
             def poll(self): return None
             def kill(self): event.set()
             def wait(self, timeout): raise subprocess.TimeoutExpired("rg", timeout)
-        with patch("jev_search.subprocess.Popen", return_value=Process()):
-            paths, incomplete, valid = _inventory_command(["rg"], deadline=time.monotonic() + 0.01)
+        with patch("jev_search.subprocess.Popen", return_value=Process()) as popen:
+            time.sleep(0.03)  # Setup time must not consume the command's deadline.
+            paths, incomplete, valid = _inventory_command(["rg"], deadline=time.monotonic() + 0.2)
+            popen.assert_called_once()
         self.assertEqual(paths, [])
         self.assertTrue(incomplete)
         self.assertFalse(valid)
@@ -802,8 +804,10 @@ class TestInventoryAndChunkRepair(unittest.TestCase):
         from jev_search import _inventory_command
         release = threading.Event()
         closed = threading.Event()
+        reading = threading.Event()
         class Stream:
             def read(self, size):
+                reading.set()
                 release.wait(5)
                 return b"late.py\0"
             def close(self): closed.set()
@@ -812,11 +816,14 @@ class TestInventoryAndChunkRepair(unittest.TestCase):
             def kill(self): pass
             def wait(self, timeout): return 0
         try:
-            started = time.monotonic()
-            with patch("jev_search.subprocess.Popen", return_value=Process()), \
+            with patch("jev_search.subprocess.Popen", return_value=Process()) as popen, \
                  patch("jev_search.INVENTORY_CLEANUP_SECONDS", 0.03):
-                paths, incomplete, valid = _inventory_command(["rg"], deadline=started + 0.01)
+                time.sleep(0.03)  # The deadline begins after patched process setup.
+                started = time.monotonic()
+                paths, incomplete, valid = _inventory_command(["rg"], deadline=started + 0.2)
+                popen.assert_called_once()
             self.assertLess(time.monotonic() - started, 1)
+            self.assertTrue(reading.is_set())
             self.assertEqual(paths, [])
             self.assertTrue(incomplete)
             self.assertFalse(valid)

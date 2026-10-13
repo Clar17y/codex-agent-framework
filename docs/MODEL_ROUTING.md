@@ -1,68 +1,53 @@
-# Model routing decision — 22 September 2026
+# Model routing rationale
 
-This refresh assigns focused work to GPT-6 Luna, complex native work to GPT-6 Sol, and independent external review to Claude Opus 5.5. Routine implementation uses Gemini with a direct native Luna fallback; DeepSeek is retired from active routing at the user's request. The allocation uses the official guidance and independent evaluations below. It is not a measured ranking of these models on this repository.
+The editable `profiles` and `activities` in [routing.example.json](../routing.example.json) are recommendations for balanced quality, speed and subscription usage. They are not measured performance or quota weights for this repository. All four providers are eligible for every activity by default. OpenAI Sol 6.1 handles general judgment; Gemini Flash medium starts routine implementation; Muse Full and Claude Opus appear early for complex or long-horizon work; Luna, Haiku and regular Wonder fill bounded roles; Astra is an exceptional deep-review option. Independent review prefers another provider than the author.
 
-## Evidence
+The user subscriptions are Codex Pro, Claude Pro, Google AI Pro and Muse Power. Account allowances and reset behavior differ by provider and can change. API prices are secondary and cannot be converted to subscription quota. The dispatcher conservatively treats a confirmed usage limit as provider-wide, even if the error mentions one model. It does not redeem credits or switch billing modes.
 
-OpenAI recommends Sol 6 for complex coding and agent workflows, and Luna 6 for focused, repeatable work. Its Codex documentation describes improvements in coding, factual reliability and communication, while keeping Astra as the most capable option for demanding work across tools. Availability depends on the account and client. [OpenAI model guidance](https://learn.chatgpt.com/docs/models)
+[OpenAI model guidance](https://developers.openai.com/api/docs/models/compare) describes Sol 6.1 as near Astra on complex work at a lower API price and Luna as a focused high-volume model. [Independent Sol comparison](https://artificialanalysis.ai/articles/gpt-6-1-sol-replaces-gpt-6-sol-after-just-7-days-with-near-astra-intelligence) finds Sol max close to Astra on its intelligence and coding indexes; xhigh coding can differ. Those results do not establish medium-effort performance or subscription usage here. Astra remains a current capable model, retained for exceptional depth.
 
-| Model | Exact ID | Standard API input / output per million tokens | Documented role |
-| --- | --- | --- | --- |
-| GPT-6 Luna | `gpt-6-luna` | $0.10 / $0.50 | Focused, high-volume tasks |
-| GPT-6 Sol | `gpt-6-sol` | $2 / $10 | Complex coding and agent workflows |
-| Claude Opus 5.5 | `claude-opus-5-5` | $4 / $20 | Long-running coding and knowledge work |
+[Artificial Analysis on Muse](https://artificialanalysis.ai/articles/muse-wonder/) reports strong Wonder and Wonder Full coding results in product harnesses, mostly at max effort; Wonder Full's long-horizon advantage remains provisional. [Its Wonder versus Gemini comparison](https://artificialanalysis.ai/models/comparisons/muse-wonder-vs-gemini-3-8-flash) uses Wonder max and Flash high, not medium versus medium. [Google's Flash model card](https://deepmind.google/models/model-cards/gemini-3-8-flash/) and [Anthropic's Sonnet](https://www.anthropic.com/claude-sonnet-5-5), [Opus](https://www.anthropic.com/claude-opus-5-5) and [Haiku](https://www.anthropic.com/claude-haiku-5-5) reports use different harnesses and effort settings; scores should not be treated as a universal ranking. [Independent Haiku versus Luna comparison](https://artificialanalysis.ai/models/comparisons/claude-haiku-5-5-vs-gpt-6-luna) shows meaningful differences on its max-effort tests, so the two small models are not interchangeable.
 
-Prices are uncached standard API rates, not subscription quota multipliers or measured cost per completed task. Tool charges, cache use, long-context premiums and other processing options can change the bill. Sources: [Luna](https://developers.openai.com/api/docs/models/gpt-6-luna), [Sol](https://developers.openai.com/api/docs/models/gpt-6-sol), [Opus 5.5](https://platform.claude.com/docs/en/models/opus-5-5/overview).
+The defaults should be evaluated against real tasks and account allowance. An early Muse release has limited mature firsthand evidence. Neither benchmark scores nor API prices prove the available subscription throughput, provider authentication, or live tool permissions.
 
-Anthropic reports better coding results and efficiency for Opus 5.5, including 66.4% on Terminal-Bench 4.0 and 54.4% on FrontierCode v1.1 in its headline comparison. These are vendor-reported results with different effort settings and some safeguard-triggered fallback models. The comparison includes GPT-5.6 Sol, not GPT-6 Sol or Luna. It supports evaluating Opus 5.5 for demanding review, but does not establish a head-to-head winner among the new models in this framework. [Launch evaluation and methodology](https://www.anthropic.com/claude-opus-5-5)
+## Default priority chains
 
-## Why retire the DeepSeek fallback?
+These are editable in `routing.json`; each named profile pins a model and effort. `>` means try the next profile only after a settled failure and safe ownership handoff. Every row includes all four providers, even when only the most likely routes are early.
 
-Luna 6's standard input rate is 50% below Luna 5.6's $0.20; output is about 58% below its $1.20. The current uncached rates also undercut DeepSeek V4.1 Flash, including off-peak rates. [Luna 6 pricing](https://developers.openai.com/api/docs/models/gpt-6-luna), [Luna 5.6 pricing](https://developers.openai.com/api/docs/models/gpt-5.6-luna), [DeepSeek pricing](https://api-docs.deepseek.com/quick_start/pricing/)
+| Activity | Ordered profiles |
+| --- | --- |
+| orchestration | openai-sol > claude-opus > muse-full > claude-sonnet > gemini-flash > muse-wonder |
+| planning | openai-sol > claude-opus > muse-full > claude-sonnet > gemini-flash-high |
+| exploration | openai-luna > claude-haiku > gemini-flash > muse-wonder |
+| implementation | gemini-flash > muse-wonder > claude-sonnet > openai-sol |
+| implementation_complex | openai-sol-high > muse-full > claude-opus > claude-sonnet-high > gemini-flash-high |
+| implementation_long_horizon | muse-full > claude-opus > openai-sol-high > claude-sonnet-high > gemini-flash-high |
+| test_design | openai-sol > claude-opus > muse-full > claude-sonnet > gemini-flash |
+| testing | openai-sol > claude-sonnet > gemini-flash > muse-wonder |
+| verification | openai-luna > gemini-flash > claude-haiku > muse-wonder |
+| independent_review | claude-opus > openai-sol > muse-full > claude-sonnet > gemini-flash-high > muse-wonder |
+| security_review | claude-opus-high > openai-sol-high > muse-full-high > claude-sonnet-high > gemini-flash-high |
+| refactor_audit | openai-luna > claude-sonnet > gemini-flash > muse-wonder |
+| documentation | gemini-flash > openai-luna > claude-haiku > muse-wonder |
+| docs_research | gemini-flash > openai-luna > claude-haiku > muse-wonder |
+| deep_review | openai-astra > claude-opus-high > muse-full-high > openai-sol-high > gemini-flash-high |
 
-| Standard API rate per million tokens | Luna 6 | DeepSeek V4.1 Flash off-peak | DeepSeek V4.1 Flash peak |
-| --- | --- | --- | --- |
-| Uncached input | $0.10 | $0.15 | $0.30 |
-| Cached input reads | $0.01 | $0.003 | $0.006 |
-| Output | $0.50 | $0.60 | $1.20 |
+## Model roles and evidence limits
 
-DeepSeek retains a cache-read price advantage. Luna cache writes cost $0.125 per million tokens; requests above 272K input tokens double its input/cache rates and multiply output rates by 1.5. Thus there is no universal cost winner across cache-heavy or long-context workloads. API prices also do not translate directly into Codex subscription usage. The routing choice prioritizes the requested native fallback and removes a provider handoff and its balance prerequisite.
+| User model | Default use and evidence limit |
+| --- | --- |
+| GPT-6.1 Sol | General planning, complex implementation and review fallback. Independent [v4.3.2 evaluation](https://artificialanalysis.ai/articles/gpt-6-1-sol-replaces-gpt-6-sol-after-just-7-days-with-near-astra-intelligence) puts **max** one intelligence point and two coding points below Astra; xhigh coding scores one point above Astra. These are not medium-effort measurements. |
+| GPT-6 Astra | Exceptional deep review. [OpenAI guidance](https://developers.openai.com/api/docs/models/compare) still calls it the most capable demanding-work model; it is not deprecated. |
+| GPT-6 Luna | Bounded exploration, verification and audit. Its [FrontierCode 1.1](https://artificialanalysis.ai/articles/frontiercode) max score was 42% on a common harness, with Luna medium also used as qualitative judge; task mix matters. |
+| Claude Opus 5.5 | Independent review and long-horizon alternatives. Its 52% FrontierCode max score led that common-harness set, but coding completion is not a direct review-quality test. |
+| Claude Sonnet 5.5 | Fast scoped implementation and review alternative. [Anthropic's TerminalBench 4](https://www.anthropic.com/claude-sonnet-5-5) 70.6% was a high-effort vendor setup; it does not universally outrank Opus. |
+| Claude Haiku 5.5 | Bounded research and verification. The [independent Haiku/Luna comparison](https://artificialanalysis.ai/models/comparisons/claude-haiku-5-5-vs-gpt-6-luna) shows task-dependent differences rather than interchangeable small models. |
+| Gemini 3.8 Flash | First routine implementation and documentation route for speed/subscription balance. Its [model card](https://deepmind.google/models/model-cards/gemini-3-8-flash/) reports strong DeepSWE and earlier TerminalBench results, with TB4 materially lower; harness versions cannot be mixed. |
+| Muse Wonder | Routine implementation alternative. [Independent product-harness results](https://artificialanalysis.ai/articles/muse-wonder/) are promising mostly at max effort; medium and Power-account throughput remain unmeasured here. |
+| Muse Wonder Full | Complex/long-horizon alternative. The same independent report shows a stronger product-harness coding index than regular Wonder at max, while [Meta's model card](https://research.meta.ai/static/muse-wonder-model-card) uses xhigh for SWE-Marathon. Long-horizon superiority remains provisional. |
 
-Independent benchmarks support an efficiency gain, not an unconditional capability win. Artificial Analysis reports Luna 6 max at $0.07 per Intelligence Index task versus $0.18 for Luna 5.6 max, while its Coding Agent Index falls from 43 to 41. In the Codex harness, DeepSWE falls from 66% to 64%; other evaluations improve. These are max-effort measurements, not results for our medium-effort workers. [Independent release analysis](https://artificialanalysis.ai/articles/gpt-6-sol-and-luna-push-the-cost-efficiency-frontier)
+On one independent [FrontierCode 1.1](https://artificialanalysis.ai/articles/frontiercode) common harness of 100 private maintainer tasks with three attempts each, max scores were Opus 52%, Sol 49%, Astra 47%, and Luna 42%; Muse was not evaluated there. The 58% Opus *pass rate* is a different metric. API cost per task in that setup was Sol $0.81 versus Astra $4.22, not a Codex subscription weight. Early [Techmeme-collected release-day comments](https://www.techmeme.com/?app=1) include praise for Wonder Full on hard tasks and mixed reactions; the original posts were inaccessible during research and do not establish mature consensus or any account's quota.
 
-On Artificial Analysis Intelligence Index v4.3.2, Luna 6 max scores 37 and DeepSeek V4.1 Flash max scores 39. That aggregate does not establish which model completes this framework's coding tasks better. [Luna evaluation](https://artificialanalysis.ai/models/gpt-6-luna), [DeepSeek evaluation](https://artificialanalysis.ai/models/deepseek-v4-1-flash)
+Task-specific evidence can cut against a broad model ranking. [Bug Hunt Bench](https://github.com/phuryn/bug-hunt-bench) uses 105 planted bugs in two repositories, vendor CLIs and blind grading: at max, three-run mean fixes were Sonnet 51.3, Astra 45, Sol 44.3 and Opus 41.7; at medium, Opus 30.3, Sol 29 and Sonnet 23.3. It is a bug-fixing harness, not a pure static-review test, and Muse was absent.
 
-OpenAI separately reports Luna 6 max at 66.6% on DeepSWE v1.1 in its own evaluation. Its harness differs from the independent evaluation, so these figures should not be merged or compared as if produced by one test. [OpenAI launch evaluation](https://openai.com/index/introducing-gpt-6-sol-and-luna/)
-
-## Allocation
-
-| Work / role | Model and effort | Reason for the choice |
-| --- | --- | --- |
-| Primary session | User-selected model | Scope, architecture, integration and final acceptance stay with the chosen primary. |
-| Routine implementation | Gemini Flash → GPT-6 Luna medium | Use the requested native fallback directly when Gemini is exhausted, unavailable or blocked, after resolving overlapping ownership. |
-| `explorer`, `docs_researcher`, `refactor_auditor`, `verifier` | GPT-6 Luna medium | Bounded investigation and verification match Luna's focused-work role. Escalate material ambiguity. |
-| `complex_implementer` | GPT-6 Sol medium | Complex coding merits Sol; this replaces Terra low. |
-| `planner`, `test_engineer` | GPT-6 Sol medium | Planning and adversarial test design require judgment; start at Sol 6's documented default. |
-| `correctness_gate`, `security_reviewer` | GPT-6 Sol high | Spend additional reasoning on a concrete correctness or security question. |
-| Independent external review | Opus 5.5 medium; high with a reason | Use the new Opus in a fresh, read-only review. Medium is its new default. |
-| Explicit Muse implementation (opt-in) | `routine` Wonder medium; `complex` Wonder Full medium; `escalation` Wonder Full high | Selected per run with `--muse-profile`; routine framework implementation remains Gemini, and Muse profiles never serve review. |
-| `reviewer` fallback | GPT-6 Astra low | Retain the existing independent native fallback when Claude cannot run. |
-| `quality_gate_max` | GPT-6 Sol max | Exceptional, explicitly requested deep audit moves from Luna to the model assigned complex judgment. |
-
-Effort levels are not capability equivalences across models. Raising Luna's effort does not establish that it replaces Sol on difficult contracts. Escalate based on ambiguity, coupling and unresolved failures; keep simple work bounded. The native max audit remains optional, and does not replace the ordinary Opus review route.
-
-## Compatibility and rollout
-
-Claude Code must be at least **2.1.280** for Opus 5.5. Pin the full model ID; the rolling `opus` alias changes over time. Opus 5.5 defaults to medium and can spend more thinking tokens at a given effort than Opus 5. Retain explicit medium/high review settings and assess observed results before increasing them. [Claude Code model configuration](https://code.claude.com/docs/en/model-config), [Opus behavior changes](https://platform.claude.com/docs/en/models/opus-5-5/whats-new-opus-5-5)
-
-Opus 5.5 requires adaptive thinking and rejects forced tool selection. This framework delegates API conversation handling to Claude Code, starts fresh reviews, and exposes only read/search tools. It does not construct those incompatible API parameters. Progress tracking uses tool lifecycle metadata, so hidden inter-tool prose is not required for liveness. Confirm terminal completion and actual model usage when validating the live route. [Migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide)
-
-The v9 installer removes the pre-v9 DeepSeek routing entry and no longer installs one. Gemini fallback goes directly to Luna even when an old configuration still contains DeepSeek. Existing provider state, backups, external Codex profiles and credentials are retained. Custom credential environment names remain as filtering metadata, without enabling a provider route. Legacy direct-provider internals remain for compatibility; active policy and setup no longer use them. Earlier migrations, including the exact pre-v8 packaged Opus 5 pin, remain in place. The installer refreshes owned role files and the managed policy and preserves unrelated settings and provider-wide quota state. A custom Claude model remains an operator override; the runner still requires the supported exact review pin. A new Codex task is needed to discover updated native role definitions. Do not infer that an already-running task's role catalog has changed.
-
-Muse profile details: routine uses the base `providers.muse` model/effort (packaged `muse-wonder-1.0`, medium); `providers.muse.profiles.complex` is `muse-wonder-full-1.0` at medium and `providers.muse.profiles.escalation` is `muse-wonder-full-1.0` at high (routing v11). Profiles override only model/effort and share the single Muse quota cache and ownership claims. No capability equivalence or usage weight between regular Wonder and Wonder Full is claimed here; that requires measured evidence. Escalation is an explicit primary decision after a prior writer has stopped, never an automatic retry.
-
-## Validation limits
-
-Use the offline suite to verify pins, fallback results, fresh installs, upgrade preservation and idempotence. Live model responses establish account access; a completed file-read probe additionally establishes that tool path under its tested permissions. Neither is a capability benchmark.
-
-Before a later change to provider priority, compare representative bounded fixes, coupled implementation tasks and reviews with known defects under matching inputs and harnesses. Assess accepted-task quality, missed defects, false positives, repair effort, elapsed time and usage together. Historical results in [BENCHMARKS.md](BENCHMARKS.md) remain historical and must not be relabelled as results for these new models.
+Self-selected developer reports are useful leads rather than consensus: one small [Sonnet/Opus report](https://www.reddit.com/r/ClaudeCode/comments/1x2ciix/difference_between_sonnet_55_and_opus_55_for/) found Sonnet competitive across eight implementation tasks but weaker at finding bugs; a [24-task medium-effort Sol comparison](https://www.reddit.com/r/codex/comments/1x46r64/i_ran_gpt_61_sol_against_gpt_6_sol_on_24_tasks/) reported nine wins, ten ties and five losses versus its predecessor, while [other users reported latency concerns](https://www.reddit.com/r/codex/comments/1x4br68/gpt61sol_is_slooowwww/). A [multi-file Gemini task report](https://www.reddit.com/r/google_antigravity/comments/1w6h936/google_claims_are_correct_guys/) was positive, whereas a [C++ author described false bug claims](https://www.reddit.com/r/GeminiAI/comments/1work8i/gemini_38_flash_keeps_inventing_bugs_in_real_c/). [Haiku users](https://www.reddit.com/r/ClaudeCode/comments/1x132yy/is_haiku_55_good_enough_to_be_your_main_coding/) emphasize bounded, well-specified work and latency, while noting harder integration and ambiguous tasks. None of these samples establishes a universal model order.

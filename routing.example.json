@@ -1,5 +1,5 @@
 {
-  "version": 11,
+  "version": 12,
   "workflow": {
     "require_jev_evidence": true
   },
@@ -9,7 +9,9 @@
       "model": "gemini-3.8-flash-medium",
       "timeout_seconds": 3600,
       "termination_grace_seconds": 120,
-      "heartbeat_seconds": 60
+      "heartbeat_seconds": 60,
+      "reader_agent": "framework-reader",
+      "reader_agent_file": "~/.gemini/config/agents/framework-reader.md"
     },
     "claude": {
       "executable": "claude",
@@ -35,6 +37,17 @@
           "effort": "high"
         }
       }
+    },
+    "openai": {
+      "executable": "codex",
+      "model": "gpt-6.1-sol",
+      "effort": "medium",
+      "windows_sandbox": "mxc",
+      "orchestration_windows_sandbox": "unelevated",
+      "orchestration_writable_roots": [],
+      "timeout_seconds": 3600,
+      "termination_grace_seconds": 120,
+      "heartbeat_seconds": 60
     }
   },
   "capabilities": {
@@ -54,5 +67,179 @@
   },
   "timeout_seconds": 900,
   "quota_probe_seconds": 3600,
-  "lock_timeout_seconds": 30
+  "lock_timeout_seconds": 30,
+  "profiles": {
+    "openai-sol": {
+      "provider": "openai",
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    },
+    "openai-sol-high": {
+      "provider": "openai",
+      "model": "gpt-6.1-sol",
+      "effort": "high"
+    },
+    "openai-luna": {
+      "provider": "openai",
+      "model": "gpt-6-luna",
+      "effort": "medium"
+    },
+    "openai-astra": {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "effort": "high"
+    },
+    "claude-opus": {
+      "provider": "claude",
+      "model": "claude-opus-5-5",
+      "effort": "medium"
+    },
+    "claude-opus-high": {
+      "provider": "claude",
+      "model": "claude-opus-5-5",
+      "effort": "high"
+    },
+    "claude-sonnet": {
+      "provider": "claude",
+      "model": "claude-sonnet-5-5",
+      "effort": "medium"
+    },
+    "claude-sonnet-high": {
+      "provider": "claude",
+      "model": "claude-sonnet-5-5",
+      "effort": "high"
+    },
+    "claude-haiku": {
+      "provider": "claude",
+      "model": "claude-haiku-5-5",
+      "effort": "medium"
+    },
+    "gemini-flash": {
+      "provider": "gemini",
+      "model": "gemini-3.8-flash-medium",
+      "effort": "medium"
+    },
+    "gemini-flash-high": {
+      "provider": "gemini",
+      "model": "gemini-3.8-flash-high",
+      "effort": "high"
+    },
+    "muse-wonder": {
+      "provider": "muse",
+      "model": "muse-wonder-1.0",
+      "effort": "medium"
+    },
+    "muse-full": {
+      "provider": "muse",
+      "model": "muse-wonder-full-1.0",
+      "effort": "medium"
+    },
+    "muse-full-high": {
+      "provider": "muse",
+      "model": "muse-wonder-full-1.0",
+      "effort": "high"
+    }
+  },
+  "activities": {
+    "orchestration": [
+      "openai-sol",
+      "claude-opus",
+      "muse-full",
+      "claude-sonnet",
+      "gemini-flash",
+      "muse-wonder"
+    ],
+    "planning": [
+      "openai-sol",
+      "claude-opus",
+      "muse-full",
+      "claude-sonnet",
+      "gemini-flash-high"
+    ],
+    "exploration": [
+      "openai-luna",
+      "claude-haiku",
+      "gemini-flash",
+      "muse-wonder"
+    ],
+    "implementation": [
+      "gemini-flash",
+      "muse-wonder",
+      "claude-sonnet",
+      "openai-sol"
+    ],
+    "implementation_complex": [
+      "openai-sol-high",
+      "muse-full",
+      "claude-opus",
+      "claude-sonnet-high",
+      "gemini-flash-high"
+    ],
+    "implementation_long_horizon": [
+      "muse-full",
+      "claude-opus",
+      "openai-sol-high",
+      "claude-sonnet-high",
+      "gemini-flash-high"
+    ],
+    "test_design": [
+      "openai-sol",
+      "claude-opus",
+      "muse-full",
+      "claude-sonnet",
+      "gemini-flash"
+    ],
+    "testing": [
+      "openai-sol",
+      "claude-sonnet",
+      "gemini-flash",
+      "muse-wonder"
+    ],
+    "verification": [
+      "openai-luna",
+      "gemini-flash",
+      "claude-haiku",
+      "muse-wonder"
+    ],
+    "independent_review": [
+      "claude-opus",
+      "openai-sol",
+      "muse-full",
+      "claude-sonnet",
+      "gemini-flash-high",
+      "muse-wonder"
+    ],
+    "security_review": [
+      "claude-opus-high",
+      "openai-sol-high",
+      "muse-full-high",
+      "claude-sonnet-high",
+      "gemini-flash-high"
+    ],
+    "refactor_audit": [
+      "openai-luna",
+      "claude-sonnet",
+      "gemini-flash",
+      "muse-wonder"
+    ],
+    "documentation": [
+      "gemini-flash",
+      "openai-luna",
+      "claude-haiku",
+      "muse-wonder"
+    ],
+    "docs_research": [
+      "gemini-flash",
+      "openai-luna",
+      "claude-haiku",
+      "muse-wonder"
+    ],
+    "deep_review": [
+      "openai-astra",
+      "claude-opus-high",
+      "muse-full-high",
+      "openai-sol-high",
+      "gemini-flash-high"
+    ]
+  }
 }

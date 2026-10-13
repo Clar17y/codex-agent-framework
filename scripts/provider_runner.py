@@ -38,6 +38,112 @@ GEMINI_PROGRESS_EMIT_SECONDS = STREAM_PROGRESS_EMIT_SECONDS
 MAX_EVIDENCE_BYTES = 1024 * 1024
 MUSE_PROFILE_NAMES = ("routine", "complex", "escalation")
 MUSE_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+READ_ACTIVITIES = frozenset(("planning", "exploration", "test_design", "independent_review",
+                             "security_review", "refactor_audit", "docs_research", "deep_review"))
+WRITE_ACTIVITIES = frozenset(("implementation", "implementation_complex", "implementation_long_horizon",
+                              "testing", "verification", "documentation"))
+PROVIDERS = frozenset(("openai", "claude", "gemini", "muse"))
+ACTIVITY_EFFORTS = {"gemini": frozenset(("low", "medium", "high")),
+                    "claude": frozenset(("medium", "high")),
+                    "openai": frozenset(MUSE_EFFORTS), "muse": frozenset(MUSE_EFFORTS)}
+
+
+def validate_activity_registry(config):
+    """Validate editable profiles and chains against the dispatcher's fixed activities."""
+    if not isinstance(config, dict):
+        raise ValueError("Routing requires providers, profiles and activities objects")
+    profiles, activities = config.get("profiles"), config.get("activities")
+    providers = config.get("providers")
+    if not all(isinstance(x, dict) for x in (profiles, activities, providers)):
+        raise ValueError("Routing requires providers, profiles and activities objects")
+    for name, profile in profiles.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(profile, dict):
+            raise ValueError(f"Invalid profile: {name!r}")
+        if set(profile) - {"provider", "model", "effort", "enabled"}:
+            raise ValueError(f"Unknown fields in profile {name}")
+        provider_name = profile.get("provider")
+        if not isinstance(provider_name, str) or provider_name not in PROVIDERS or provider_name not in providers:
+            raise ValueError(f"Invalid provider in profile {name}")
+        if not isinstance(profile.get("model"), str) or not profile["model"].strip():
+            raise ValueError(f"Invalid model in profile {name}")
+        effort = profile.get("effort", "medium")
+        if not isinstance(effort, str) or effort not in ACTIVITY_EFFORTS[provider_name]:
+            raise ValueError(f"Invalid effort in profile {name}")
+        if not isinstance(profile.get("enabled", True), bool):
+            raise ValueError(f"Invalid enabled flag in profile {name}")
+        entry = providers[provider_name]
+        if not isinstance(entry, dict) or not entry.get("executable"):
+            raise ValueError(f"Invalid executable for profile {name}")
+    for name, chain in activities.items():
+        if name not in READ_ACTIVITIES | WRITE_ACTIVITIES | {"orchestration"}:
+            raise ValueError(f"Unknown activity chain: {name}")
+        if (not isinstance(chain, list) or not chain or
+                any(not isinstance(profile, str) or not profile for profile in chain) or
+                len(chain) != len(set(chain))):
+            raise ValueError(f"Activity {name} requires a nonempty chain without duplicates")
+        if any(profile not in profiles or not profiles[profile].get("enabled", True) for profile in chain):
+            raise ValueError(f"Activity {name} references unknown or disabled profile")
+
+
+def activity_routes(config, activity):
+    """Validate the complete registry before selecting or launching a route."""
+    validate_activity_registry(config)
+    if not isinstance(activity, str) or activity not in READ_ACTIVITIES | WRITE_ACTIVITIES | {"orchestration"}:
+        raise ValueError(f"Unknown activity: {activity}")
+    activities = config["activities"]
+    if activity not in activities:
+        raise ValueError(f"Activity {activity} has no chain")
+    return activities[activity]
+
+
+def effective_activity_provider(config, profile_name):
+    profile = config["profiles"][profile_name]
+    provider_name = profile["provider"]
+    provider = copy.deepcopy(config["providers"][provider_name])
+    provider.pop("profiles", None)
+    provider.update(model=profile["model"], effort=profile.get("effort", "medium"))
+    return provider_name, provider
+
+
+def validate_gemini_reader(provider, workspace):
+    """Check an installed Antigravity custom agent before using its tool allowlist."""
+    name = provider.get("reader_agent")
+    path = provider.get("reader_agent_file")
+    if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+        raise ValueError("Gemini reader_agent must be a simple custom-agent name")
+    if not isinstance(path, str) or not path:
+        raise ValueError("Gemini reader_agent_file must name the installed custom-agent file")
+    expected_path = (Path.home() / ".gemini" / "config" / "agents" / f"{name}.md").resolve()
+    if Path(os.path.expanduser(path)).resolve() != expected_path:
+        raise ValueError("Gemini reader_agent_file must name the selected global custom agent")
+    workspace = Path(workspace).resolve()
+    agent_roots = (Path.home() / ".gemini" / "config" / "agents",
+                   workspace / ".agents" / "agents",
+                   Path.home() / ".gemini" / "plugins",
+                   workspace / ".agents" / "plugins")
+    for root in agent_roots:
+        if not root.exists():
+            continue
+        for shadow in root.rglob("*.md"):
+            if shadow.resolve() == expected_path:
+                continue
+            # AGY identifies agents by YAML name, not just filename. Reject
+            # aliases in any known discovery root before --agent is launched.
+            with shadow.open(encoding="utf-8") as source:
+                header = source.read(4096)
+            frontmatter = header.split("---", 2)[1] if header.startswith("---") and header.count("---") >= 2 else ""
+            declared = re.search(r"(?m)^name:\s*(.*?)\s*$", frontmatter)
+            declared_name = declared.group(1).split("#", 1)[0].strip().strip("'\"") if declared else None
+            if declared_name == name or shadow.stem == name or (
+                    shadow.name == "agent.md" and shadow.parent.name == name):
+                raise ValueError(f"Gemini agent name is ambiguous with the validated global reader: {shadow}")
+    content = expected_path.read_text(encoding="utf-8")
+    expected = ("---\nname: " + name + "\ndescription: Framework static reader.\n"
+                "tools:\n  - view_file\n  - grep_search\n"
+                "mainAgent: true\nsubagent: false\ncommandExecutionPolicy: off\n"
+                "mcpServers: []\nskills: []\nplugins: []\n---\n")
+    if not content.startswith(expected):
+        raise ValueError("Gemini reader agent does not have the enforced read/search-only capability definition")
 
 
 def resolve_muse_profile(config, profile_name=None):
@@ -141,7 +247,16 @@ def write_json(path, data):
     temporary = path.parent / (str(uuid.uuid4()) + ".tmp")
     try:
         temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.replace(temporary, path)
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except OSError as exc:
+                # Windows readers/scanners can briefly deny an atomic rename.
+                # Keep the old file intact and never retry inference or other I/O.
+                if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 4:
+                    raise
+                time.sleep(0.01 * 2 ** attempt)
     finally:
         try:
             temporary.unlink(missing_ok=True)
@@ -184,6 +299,118 @@ def read_text_tail(path, limit=FINAL_OUTPUT_TAIL_BYTES):
 def workspace_state_dir(state_dir, workspace):
     identity = os.path.normcase(str(Path(workspace).resolve()))
     return state_dir / "workspaces" / hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def orchestration_path(state_dir, workspace, run_id):
+    if not re.fullmatch(r"[0-9a-f-]{36}", run_id):
+        raise ValueError("Invalid orchestration run id")
+    return workspace_state_dir(state_dir, workspace) / "orchestrations" / f"{run_id}.json"
+
+
+def orchestration_children(path):
+    directory = path.with_suffix("") / "children"
+    if not directory.exists():
+        return []
+    children = []
+    for item in sorted(directory.glob("*.json")):
+        child = read_json(item)
+        pending_path = child.get("provider_pending_path")
+        if child.get("status") == "unresolved" and pending_path:
+            if read_json(Path(pending_path)).get("status") == "resolved":
+                child.update(status="failed", result_status="operator_resolved_child")
+                write_json(item, child)
+        children.append(child)
+    return children
+
+
+def settle_orchestration_parent(path):
+    parent = read_json(path)
+    if (parent.get("status") == "uncertain_exit" and parent.get("local_process_stopped") is True and
+            (parent.get("terminal_established") is True or parent.get("operator_confirmed_stopped") is True) and
+            all(child.get("status") in ("completed", "failed") for child in orchestration_children(path))):
+        parent["status"] = "resolved"
+        write_json(path, parent)
+    return parent
+
+
+def register_child_dispatch(state_dir, workspace, run_id, owned_paths, activity=None):
+    parent_path = orchestration_path(state_dir, workspace, run_id)
+    with provider_lock(state_dir, 30, "orchestration.lock"):
+        parent = read_json(parent_path)
+        if parent.get("status") not in ("launching", "running"):
+            raise ValueError("Parent orchestrator is no longer accepting children")
+        scope = [os.path.normcase(str((workspace / path).resolve())) for path in parent.get("owned_paths", [])]
+        child_scope = [os.path.normcase(str((workspace / path).resolve())) for path in owned_paths]
+        if scope and not child_scope and activity not in READ_ACTIVITIES:
+            raise ValueError("Writing child ownership is outside orchestrator scope")
+        if scope and child_scope and not all(any(Path(child).is_relative_to(Path(root)) for root in scope) for child in child_scope):
+            raise ValueError("Child ownership is outside orchestrator scope")
+        child_path = parent_path.with_suffix("") / "children" / (str(uuid.uuid4()) + ".json")
+        write_json(child_path, {"status": "running", "workspace": str(workspace),
+                                "owned_paths": owned_paths, "parent_run_id": run_id})
+    return child_path
+
+
+def resolve_child_dispatch(state_dir, child_path, result):
+    status = result.get("status")
+    uncertain = (status in ("blocked_pending_run", "uncertain_exit", "timeout", "cancelled", "unresolved") or
+                 result.get("fallback_blocked_by_pending") is True or
+                 result.get("fallback_authorized") is False or
+                 bool(result.get("cleanup")) or
+                 status == "provider_error" and result.get("terminal_established") is False)
+    resolution = "unresolved" if uncertain else "completed" if status == "completed" else "failed"
+    with provider_lock(state_dir, 30, "orchestration.lock"):
+        record = read_json(child_path)
+        record.update(status=resolution, result_status=status)
+        pending = result.get("pending_path")
+        if not pending and result.get("attempts"):
+            pending = result["attempts"][-1].get("pending_path")
+        if pending:
+            record["provider_pending_path"] = pending
+        write_json(child_path, record)
+        parent_path = child_path.parent.parent.with_suffix(".json")
+        settle_orchestration_parent(parent_path)
+
+
+def operator_resolve_orchestration(state_dir, workspace, run_id, reason, child_id=None):
+    """Record an operator's explicit cessation confirmation without losing run evidence."""
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("A cessation reason is required")
+    state_dir = Path(state_dir).resolve()
+    workspace = Path(workspace).resolve()
+    parent_path = orchestration_path(state_dir, workspace, run_id)
+    with provider_lock(state_dir, 30, "orchestration.lock"):
+        parent = read_json(parent_path)
+        recorded_workspace = parent.get("workspace")
+        if (not isinstance(recorded_workspace, str) or not Path(recorded_workspace).is_absolute() or
+                os.path.normcase(str(Path(recorded_workspace).resolve())) != os.path.normcase(str(workspace))):
+            raise ValueError("Orchestration workspace does not match")
+        target = parent_path
+        if child_id:
+            if not re.fullmatch(r"[0-9a-f-]{36}", child_id):
+                raise ValueError("Invalid child run id")
+            target = parent_path.with_suffix("") / "children" / f"{child_id}.json"
+            child = read_json(target)
+            if child.get("parent_run_id") != run_id:
+                raise ValueError("Child is not registered under this orchestrator")
+            pending = child.get("provider_pending_path")
+            if pending and read_json(Path(pending)).get("status") != "resolved":
+                raise ValueError("Resolve the provider pending record after cessation confirmation first")
+            if child.get("status") not in ("completed", "failed"):
+                child.update(status="failed", result_status="operator_resolved_child",
+                             operator_resolution={"reason": reason.strip(), "at": dt.datetime.now(UTC).isoformat()})
+                write_json(target, child)
+        else:
+            if any(child.get("status") not in ("completed", "failed") for child in orchestration_children(parent_path)):
+                raise ValueError("Resolve every child before confirming the parent stopped")
+            if parent.get("status") != "resolved":
+                parent.update(status="uncertain_exit", local_process_stopped=True,
+                              operator_confirmed_stopped=True,
+                              operator_resolution={"reason": reason.strip(), "at": dt.datetime.now(UTC).isoformat()})
+                write_json(parent_path, parent)
+        parent = settle_orchestration_parent(parent_path)
+    return {"status": parent.get("status"), "orchestration_pending_path": str(parent_path),
+            "resolved_record": str(target)}
 
 
 def normalized_owned_paths(workspace, owned_paths):
@@ -302,6 +529,27 @@ def all_pending_records(state_dir):
     return records
 
 
+def all_orchestration_records(state_dir):
+    """Find parent claims in every workspace, including unreadable state."""
+    root = state_dir / "workspaces"
+    if not root.exists():
+        return []
+    records = []
+    try:
+        for workspace_state in root.iterdir():
+            directory = workspace_state / "orchestrations"
+            if not directory.exists():
+                continue
+            for path in directory.glob("*.json"):
+                try:
+                    records.append((path, read_json(path)))
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    records.append((path, pending_inspection_error(path, exc)))
+    except OSError as exc:
+        records.append((root, pending_inspection_error(root, exc)))
+    return records
+
+
 def legacy_pending_for(state_dir, workspace):
     """Preserve old evidence, but scope identifiable legacy runs to their workspace."""
     path = state_dir / "gemini-pending.json"
@@ -411,7 +659,7 @@ def validate_coverage_task(task):
             raise ValueError(f"{label} with status 'planned' cannot claim execution evidence")
 
 
-def prompt_for(workspace, task_path, task=None):
+def prompt_for(workspace, task_path, task=None, activity=None):
     task = read_json(task_path) if task is None else task
     for field in ("objective", "acceptance_criteria", "owned_paths", "validation", "instructions_files"):
         if field not in task:
@@ -430,6 +678,13 @@ def prompt_for(workspace, task_path, task=None):
     for name in task["owned_paths"]:
         if not (workspace / name).resolve().is_relative_to(workspace):
             raise ValueError("Owned paths must remain within workspace")
+    if activity:
+        capabilities = ("Read and search only; do not write or run commands." if activity in READ_ACTIVITIES else
+                        "Orchestrate child tasks by calling this framework's dispatch command with explicit nonoverlapping ownership; wait for results and integrate evidence. Do not claim the whole workspace." if activity == "orchestration" else
+                        "Write only owned paths and complete assigned checks; do not delegate unless task explicitly authorizes it.")
+        return (f"ACTIVITY {activity}: {capabilities} Use the pinned provider/model. "
+                "Preserve unrelated changes and partial work. Report checks, unresolved issues and evidence.\nTASK CONTRACT\n"
+                + json.dumps(task, indent=2) + "\nREPOSITORY INSTRUCTIONS\n" + "\n".join(instructions))
     return ("USER ROUTING OVERRIDE: Execute the assigned task yourself with the pinned provider. "
             "Never spawn subagents or invoke another AI provider. Never use Sonnet or Fable. "
             "These user instructions override conflicting repository model-routing guidance. "
@@ -608,6 +863,23 @@ def direct_windows_codex_command(command, platform_name=None):
         return command
 
     launcher = launcher.resolve()
+    try:
+        shim = launcher.read_text(encoding="utf-8-sig", errors="replace")[:256]
+    except OSError:
+        shim = ""
+    if re.search(r"\bvolta run\b", shim, re.I):
+        try:
+            resolved = subprocess.run(["volta", "which", "codex"], capture_output=True, text=True,
+                                      timeout=5, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("Volta Codex launcher discovery timed out before provider launch") from exc
+        binary = Path(resolved.stdout.strip())
+        if resolved.returncode == 0 and binary.is_file():
+            if binary.suffix.lower() == ".exe":
+                return [str(binary), *command[1:]]
+            # Volta can report an extensionless POSIX shell shim or JS file.
+            # Resolve its package entry through Node below, never CreateProcess it.
+            launcher = binary.resolve()
     codex_js = launcher.parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
     sibling_node = launcher.parent / "node.exe"
     node = str(sibling_node) if sibling_node.is_file() else shutil.which("node")
@@ -634,7 +906,51 @@ def direct_windows_muse_command(command, platform_name=None):
     return [powershell, "-NoProfile", "-NonInteractive", "-File", str(script), *command[1:]]
 
 
-def command_for(role, provider, prompt, timeout, workspace, effort="medium", provider_name=None, output_dir=None):
+def direct_windows_muse_config_command(command, platform_name=None):
+    """Use the installed binary for JSON -c values; the batch/PS shim strips quotes."""
+    if (platform_name or os.name) != "nt":
+        return command
+    launcher = Path(shutil.which(command[0]) or command[0])
+    if launcher.suffix.lower() not in (".cmd", ".bat"):
+        return command
+    launcher = launcher.resolve()
+    version_file = launcher.with_name(".muse-version")
+    try:
+        version = version_file.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError("Muse JSON config requires an installed native binary") from exc
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", version):
+        raise ValueError("Muse installed version is invalid")
+    binary = launcher.with_name(f"muse-bin-{version}.exe")
+    if not binary.is_file():
+        raise ValueError("Muse JSON config requires the selected native binary")
+    return [str(binary), *command[1:]]
+
+
+def orchestration_writable_roots(provider, state_dir, workspace):
+    """Permit only the shared state and explicitly named provider cache directories."""
+    if state_dir is None:
+        raise ValueError("OpenAI orchestration requires the effective shared state directory")
+    extras = provider.get("orchestration_writable_roots", [])
+    if not isinstance(extras, list) or not all(isinstance(value, str) and value.strip() for value in extras):
+        raise ValueError("OpenAI orchestration_writable_roots must be a list of paths")
+    workspace = Path(workspace).resolve()
+    home = Path.home().resolve()
+    roots = []
+    for value in [str(state_dir), *extras]:
+        path = Path(os.path.expanduser(value))
+        if not path.is_absolute():
+            raise ValueError("OpenAI orchestration writable roots must be absolute paths")
+        path = path.resolve()
+        if (path == Path(path.anchor) or home.is_relative_to(path) or
+                workspace.is_relative_to(path) and path != workspace):
+            raise ValueError("OpenAI orchestration writable root is too broad")
+        if path not in roots:
+            roots.append(path)
+    return [str(path) for path in roots]
+
+
+def command_for(role, provider, prompt, timeout, workspace, effort="medium", provider_name=None, output_dir=None, activity=None, state_dir=None):
     executable = provider["executable"]
     command = [executable] if isinstance(executable, str) else list(executable)
     if not command or not all(isinstance(arg, str) for arg in command):
@@ -648,12 +964,81 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
         else:
             provider_name = "gemini"
 
-    if provider_name == "deepseek":
+    if provider_name in ("deepseek", "openai"):
         command = direct_windows_codex_command(command)
     elif provider_name == "muse":
-        command = direct_windows_muse_command(command)
+        command = (direct_windows_muse_config_command(command) if activity in READ_ACTIVITIES
+                   else direct_windows_muse_command(command))
 
     model = provider["model"]
+    if activity:
+        reader = activity in READ_ACTIVITIES
+        if provider_name == "openai":
+            windows = []
+            if os.name == "nt":
+                sandbox = (provider.get("orchestration_windows_sandbox", provider.get("windows_sandbox"))
+                           if activity == "orchestration" else provider.get("windows_sandbox"))
+                if sandbox not in ("mxc", "elevated", "unelevated"):
+                    raise ValueError("OpenAI on Windows requires an explicit supported windows_sandbox")
+                windows = ["-c", f'windows.sandbox="{sandbox}"']
+            orchestration = []
+            if activity == "orchestration":
+                roots = orchestration_writable_roots(provider, state_dir, workspace)
+                orchestration = ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps(roots),
+                                 "-c", "sandbox_workspace_write.network_access=true"]
+            return command + ["exec", "--ignore-user-config", "--strict-config", "--ephemeral",
+                              "-c", 'model_provider="openai"', "-c", 'forced_login_method="chatgpt"',
+                              "-c", f'model_reasoning_effort="{effort}"', "-c", "mcp_servers={}",
+                              "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
+                              "-c", "features.apps=false", "-c", "apps._default.enabled=false",
+                              "-c", "agents.enabled=false", "-c", "features.plugins=false",
+                              "-c", "features.hooks=false", "-c", "allow_login_shell=false",
+                              *windows, "-c", 'approval_policy="never"', *orchestration,
+                              "-m", model, "-s",
+                              "read-only" if reader else "workspace-write",
+                              "--json", "-C", str(workspace), prompt]
+        if provider_name == "claude":
+            base = ["-p", prompt, "--model", model, "--effort", effort,
+                    "--output-format", "stream-json", "--verbose", "--no-session-persistence",
+                    "--strict-mcp-config", "--disable-slash-commands"]
+            if reader:
+                base += ["--safe-mode", "--tools", "Read,Glob,Grep"]
+            else:
+                base += ["--dangerously-skip-permissions"]
+            return command + base
+        if provider_name == "gemini":
+            base = ["--print", prompt, "--model", model, "--effort", effort,
+                    "--output-format", "stream-json", "--print-timeout", f"{timeout}s"]
+            if reader:
+                validate_gemini_reader(provider, workspace)
+                helper = provider.get("reader_agent")
+                if not isinstance(helper, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", helper):
+                    raise ValueError("Gemini static activity requires a validated reader_agent")
+                base += ["--agent", helper]
+            else:
+                base += ["--mode", "accept-edits", "--dangerously-skip-permissions", "--add-dir", str(workspace)]
+            return command + base
+        if provider_name == "muse":
+            if output_dir is None:
+                raise ValueError("Muse requires an output directory")
+            steps = provider.get("max_model_steps", 100)
+            if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+                raise ValueError("Muse max_model_steps must be positive")
+            base = ["exec", "--json", "--prompt-file", str(output_dir / "prompt.txt"),
+                    "--workspace", str(workspace), "--reasoning-effort", effort,
+                    "--no-session-log", "--disable-reminders", "--max-model-steps", str(steps)]
+            if reader:
+                # Exact per-run selection is intended to exclude delegation/MCP;
+                # the CLI rejects unknown names before execution. Live enforcement
+                # still requires signed-in validation on the installed CLI.
+                base += ["--disable-shell", "--disable-write", "--disable-web-tools",
+                         "--no-foreign-personal-context", "-c", 'run.toolset=["read_file"]']
+            else:
+                base += ["--disable-approval", "--trust-workspace"]
+            if model != "cli-default":
+                base += ["--model", model]
+            return command + base
+        raise ValueError(f"Unsupported activity provider: {provider_name}")
     if role == "review":
         if provider_name != "claude":
             raise ValueError(f"Review role is Claude-only; got {provider_name}")
@@ -750,6 +1135,15 @@ def structured_error_message(errors):
     return None
 
 
+def account_auth_error(result):
+    """Classify account login failures without confusing throttles or model errors."""
+    codes = {str(code).upper() for code in result.get("error_codes", [])}
+    if codes & {"UNAUTHENTICATED", "AUTHENTICATION_ERROR", "INVALID_CREDENTIALS", "AUTH_REQUIRED", "OAUTH_TOKEN_EXPIRED"}:
+        return True
+    message = str(result.get("error", "")).lower()
+    return bool(re.search(r"authentication required|not logged in|login required|invalid credentials|unauthorized|oauth token (?:has )?expired|please run /login|please (?:log in|login)", message))
+
+
 def parse_deepseek_final_output(output_dir, stdout_text, stdout_truncated=False):
     """Parse and validate final JSON output object from DeepSeek.
     Success requires explicit success status plus a string response.
@@ -843,6 +1237,56 @@ def parse_codex_events(stdout_text):
             intermediate_errors.append(err)
 
     return terminal_turn, terminal_event, has_terminal_402, intermediate_errors
+
+
+def parse_openai_terminal(stdout_text, truncated=False):
+    """Accept only a root Codex JSONL terminal after a started thread."""
+    if truncated or not stdout_text.endswith("\n"):
+        return None, False, []
+    started = False
+    thread_id = None
+    terminal = None
+    errors = []
+    answer = False
+    for raw in stdout_text.splitlines():
+        try:
+            event = json.loads(raw)
+        except (ValueError, RecursionError):
+            return None, False, []
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            return None, False, []
+        kind = event["type"]
+        if terminal is not None:
+            return None, False, []
+        if not started and kind != "thread.started":
+            return None, False, []
+        if kind == "thread.started" and not started and isinstance(event.get("thread_id"), str) and event["thread_id"].strip():
+            started = True
+            thread_id = event["thread_id"]
+        elif kind == "thread.started":
+            return None, False, []
+        elif kind == "item.completed" and isinstance(event.get("item"), dict):
+            item = event["item"]
+            if item.get("type") == "agent_message" and isinstance(item.get("text"), str) and item["text"].strip():
+                answer = True
+        elif kind in ("turn.completed", "turn.failed"):
+            if not started or terminal is not None:
+                return None, False, []
+            for key in ("thread_id", "parent_thread_id"):
+                if key in event and event[key] != thread_id:
+                    return None, False, []
+            terminal = event
+        elif kind == "error":
+            pass  # Intermediate diagnostics cannot establish account exhaustion.
+    if terminal and terminal["type"] == "turn.failed":
+        error = terminal.get("error")
+        if isinstance(error, dict):
+            errors.append(error)
+        elif isinstance(error, str):
+            errors.append({"message": error})
+    if terminal and terminal["type"] == "turn.completed" and not answer:
+        return None, False, []
+    return terminal, terminal is not None, errors
 
 
 def parse_gemini_final_output(stdout_text, stdout_truncated=False):
@@ -1023,6 +1467,11 @@ def terminal_quota_message(message, provider=None):
     if provider in (None, "claude"):
         patterns.append(r"you['’]ve hit your(?: (?:session|weekly|plan|monthly|opus))? limit(?:[.!]|\s*[·-]\s*resets?\s+[^\n]+)?")
         patterns.append(r"opus (?:usage )?limit (?:reached|exceeded|exhausted)[.!]?")
+    if provider in (None, "openai"):
+        suffix = r"(?:[.!](?:[ ]+[^\n]{0,500})?)?"
+        patterns.append(r"you['’]ve hit your (?:usage|weekly|plan) limit" + suffix)
+        patterns.append(r"you['’]ve reached your (?:weekly |plan )?usage limit" + suffix)
+        patterns.append(r"your chatgpt plan has reached its usage limit[.!]?")
     return any(re.fullmatch(prefix + pattern, message.strip(), re.I) for pattern in patterns)
 
 
@@ -1092,9 +1541,7 @@ def quota_error(errors, provider="gemini"):
         # RESOURCE_EXHAUSTED/429 alone also means short-term throttling: do not cache.
         if any(phrase in message for phrase in ("per minute", "per second", "requests/min", "requests/sec", "rate limit", "rate quota")):
             continue
-        if provider == "claude" and "sonnet" in message and "opus" not in message:
-            continue
-        if code in ("QUOTA_EXHAUSTED", "INSUFFICIENT_QUOTA") or terminal_quota_message(raw_message, provider):
+        if code in ("QUOTA_EXHAUSTED", "INSUFFICIENT_QUOTA", "USAGE_LIMIT_REACHED", "WEEKLY_LIMIT_REACHED") or terminal_quota_message(raw_message, provider):
             found = dict(error)
             found["message"] = raw_message
             return found
@@ -1279,9 +1726,20 @@ def framework_secrets(config):
 def child_environment(config, provider_name, checked_deepseek_key=None):
     """Keep helper credentials out of external execution-provider environments."""
     env = dict(os.environ)
+    env.pop("FRAMEWORK_PARENT_RUN_ID", None)
     env.pop("TYPESAFE_API_KEY", None)
     for name in ("META_API_KEY", "MUSE_API_KEY", "META_MODEL_API_KEY"):
         env.pop(name, None)
+    if provider_name == "openai":
+        # The desktop host exports IPC, permission and task-session controls as
+        # CODEX_* variables. A nested Codex CLI must keep only CODEX_HOME for
+        # subscription auth; inheriting host policy can inject MCP tools and
+        # deny even read-only local commands despite --ignore-user-config.
+        for name in tuple(env):
+            if name.upper().startswith("CODEX_") and name.upper() != "CODEX_HOME":
+                env.pop(name, None)
+        for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "CODEX_BASE_URL"):
+            env.pop(name, None)
     providers = config.get("providers", {}) if isinstance(config, dict) else {}
     muse = providers.get("muse", {}) if isinstance(providers, dict) else {}
     if isinstance(muse, dict) and isinstance(muse.get("api_key_env"), str):
@@ -2050,8 +2508,22 @@ def update_progress(state, value, observed_at):
         update_claude_progress(state, value, observed_at)
     elif provider == "deepseek":
         update_deepseek_progress(state, value, observed_at)
+    elif provider == "openai":
+        update_openai_progress(state, value, observed_at)
     else:
         update_gemini_progress(state, value, observed_at)
+
+
+def update_openai_progress(state, value, observed_at):
+    """Keep Codex JSONL telemetry separate from the legacy DeepSeek schema."""
+    state["event_count"] += 1
+    kind = value.get("type") if isinstance(value, dict) else None
+    state["last_event"] = {"event": kind, "summary": compact_label(kind, default="unknown")}
+    state["last_event_at"] = observed_at
+    if kind in ("turn.completed", "turn.failed"):
+        state["terminal"] = "SUCCESS" if kind == "turn.completed" else "FAILED"
+    if kind == "thread.started" and isinstance(value.get("thread_id"), str):
+        state["conversation_id"] = value["thread_id"]
 
 
 def update_muse_progress(state, value, observed_at):
@@ -2393,24 +2865,38 @@ def execute(args):
     if not isinstance(require_jev, bool):
         raise ValueError("Routing workflow.require_jev_evidence must be a boolean")
     quota_cooldown(config)
+    activity = getattr(args, "activity", None)
     provider_name = getattr(args, "provider", None) or ("gemini" if args.role == "implement" else "claude")
-    if args.role == "review" and provider_name != "claude":
+    if activity:
+        if getattr(args, "profile", None) not in config.get("profiles", {}):
+            raise ValueError("Activity execution requires a configured profile")
+        expected_role = "implement" if activity in WRITE_ACTIVITIES else "review"
+        if args.role != expected_role or config["profiles"][args.profile]["provider"] != provider_name:
+            raise ValueError("Activity role/profile/provider mismatch")
+    elif getattr(args, "profile", None):
+        raise ValueError("--profile is only valid with dispatch")
+    if not activity and args.role == "review" and provider_name != "claude":
         raise ValueError(f"Review role is Claude-only; got {provider_name}")
-    if args.role == "implement" and provider_name not in ("gemini", "deepseek", "muse"):
+    if not activity and args.role == "implement" and provider_name not in ("gemini", "deepseek", "muse"):
         raise ValueError(f"Implement role does not support provider {provider_name}")
     if provider_name not in config.get("providers", {}):
         raise ValueError(f"Provider '{provider_name}' is missing from config")
     muse_profile_arg = getattr(args, "muse_profile", None)
     require_muse_profile_allowed(muse_profile_arg, provider_name, role=args.role)
     muse_meta = {}
-    if provider_name == "muse":
+    if activity:
+        _, provider = effective_activity_provider(config, args.profile)
+    elif provider_name == "muse":
         provider, muse_meta = resolve_muse_profile(config, muse_profile_arg)
     else:
         provider = config["providers"][provider_name]
     timeout, termination_grace, heartbeat_seconds = provider_timing(config, provider_name, provider=provider)
     review_effort_arg = getattr(args, "review_effort", None)
     review_reason_arg = getattr(args, "review_reason", None)
-    if args.role == "implement":
+    if activity:
+        review_effort = provider.get("effort", "medium")
+        review_reason = getattr(args, "review_reason", None)
+    elif args.role == "implement":
         if review_effort_arg is not None or review_reason_arg is not None:
             raise ValueError("Review effort and reason options are only permitted for review role")
         review_effort = None
@@ -2432,16 +2918,34 @@ def execute(args):
         else:
             review_reason = review_reason_arg.strip() if (review_reason_arg and review_reason_arg.strip()) else None
     task = read_json(args.task_file)
+    orchestration_id = str(uuid.uuid4()) if activity == "orchestration" else None
+    if orchestration_id and not task.get("allow_delegation"):
+        raise ValueError("Orchestration requires allow_delegation=true")
     jev_meta = None
-    if require_jev:
-        jev_meta = validate_jev_task(task, workspace, args.role)
+    if require_jev and (not activity or activity in ("implementation", "implementation_complex", "implementation_long_horizon",
+                                                 "independent_review", "security_review", "deep_review")):
+        jev_meta = validate_jev_task(task, workspace,
+                                     "review" if activity in ("independent_review", "security_review", "deep_review") else "implement" if activity else args.role)
     owned_paths = normalized_owned_paths(workspace, task.get("owned_paths"))
+    if orchestration_id and not owned_paths:
+        raise ValueError("Orchestration requires explicit owned_paths")
     owned_claims = [os.path.normcase(str((workspace / path).resolve())) for path in owned_paths]
-    prompt = prompt_for(workspace, args.task_file, task)
-    state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
+    state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state")).resolve()
+    prompt = prompt_for(workspace, args.task_file, task, activity=activity)
+    if activity == "orchestration":
+        prompt += ("\nDISPATCH COMMAND: " + sys.executable + " " + str(Path(__file__).resolve()) +
+                   " dispatch --activity <ACTIVITY> --workspace " + str(workspace) +
+                   " --task-file <CHILD_CONTRACT_JSON> --config " + str(Path(args.config).resolve()) +
+                   " --state-dir " + str(state_dir) +
+                   " --parent-run-id " + orchestration_id +
+                   "\nWrite each child contract under workspace .llm-output, assign explicit disjoint owned_paths, "
+                   "call the dispatcher for authorized children, wait for terminal results, and inspect check evidence. "
+                   "Stop if a child has unresolved pending ownership.\n")
+    if getattr(args, "prior_context", None):
+        prompt += "\nPrevious route attempts (preserve partial edits and finish remaining checks):\n" + json.dumps(args.prior_context)
     if args.dry_run:
         command = command_for(args.role, provider, prompt, timeout, workspace, review_effort or "medium", provider_name=provider_name,
-                              output_dir=workspace / ".llm-output")
+                              output_dir=workspace / ".llm-output", activity=activity, state_dir=state_dir)
         dry_run_meta = {"status": "dry_run", "provider": provider_name, "model": provider["model"],
                         **muse_meta,
                         "cwd": str(workspace), "command": command, "state_dir": str(state_dir),
@@ -2518,20 +3022,20 @@ def execute(args):
         (output / "output_schema.json").write_text(json.dumps(DEEPSEEK_OUTPUT_SCHEMA, indent=2), encoding="utf-8")
     # Avoid Windows' command-line length limit; providers have a Read tool.
     prompt_path = output / "prompt.txt"
-    if provider_name == "muse":
+    if provider_name == "muse" and activity != "orchestration":
         prompt += "\nExecute this bounded task yourself. Do not spawn subagents or invoke another AI provider.\n"
     prompt_path.write_text(prompt, encoding="utf-8")
-    run_prompt = (
-        f"Read the complete task contract and instructions in {prompt_path} and follow them. "
-        "Execute the task yourself; never spawn subagents or use another AI provider."
-    )
+    run_prompt = (f"Read the complete task contract and instructions in {prompt_path} and follow them. " +
+                  ("Use the shared framework dispatcher for authorized child tasks and wait for their results." if activity == "orchestration" else
+                   "Execute the task yourself; never spawn subagents or use another AI provider."))
     if provider_name == "deepseek":
         run_prompt += (
             " When complete, return your final response as a JSON object strictly conforming to the schema: "
             '{"status": "SUCCESS" | "FAILED" | "BLOCKED" | "ERROR", "response": "<summary>"}.'
         )
     command = command_for(args.role, provider, run_prompt,
-                          timeout, workspace, review_effort or "medium", provider_name=provider_name, output_dir=output)
+                          timeout, workspace, review_effort or "medium", provider_name=provider_name, output_dir=output,
+                          activity=activity, state_dir=state_dir)
     result = {"provider": provider_name, "model": provider["model"], **muse_meta, "logs": str(output),
               "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace,
               "outer_timeout_seconds": timeout + termination_grace,
@@ -2545,8 +3049,9 @@ def execute(args):
     workspace_state = workspace_state_dir(state_dir, workspace)
     # This lock covers only the check-and-claim transaction. Provider processes run
     # concurrently once their disjoint ownership claims have been persisted.
+    claims_writer = args.role == "implement" or orchestration_id is not None
     lock = provider_lock(state_dir, float(config.get("lock_timeout_seconds", 30)),
-                         "gemini.lock" if args.role == "implement" else "quota.lock")
+                         "gemini.lock" if claims_writer else "quota.lock")
     try:
         with lock as release_claim_lock:
             state_path = quota_path(state_dir, provider_name)
@@ -2554,6 +3059,7 @@ def execute(args):
             if args.role == "implement":
                 pending_path.parent.mkdir(parents=True, exist_ok=True)
                 result["pending_path"] = str(pending_path)
+            if claims_writer:
                 legacy = legacy_pending_for(state_dir, workspace)
                 if legacy is not None:
                     result.update(status="blocked_pending_run", pending=legacy,
@@ -2562,7 +3068,7 @@ def execute(args):
                                   error="Unresolved legacy run belongs to this workspace or has unknown ownership. Confirm it stopped before resolving its pending record.")
                     release_claim_lock()
                     return finish(result, output, workspace, 1, secrets=secrets)
-            if args.role == "implement":
+            if claims_writer:
                 for existing_path, pending in all_pending_records(state_dir):
                     if not isinstance(pending, dict) or pending.get("status") != "resolved":
                         pending_workspace, pending_owned_paths = pending_claims(pending)
@@ -2573,7 +3079,24 @@ def execute(args):
                                           error="An unresolved provider run owns overlapping paths. Confirm it stopped, then mark its pending record resolved before retrying.")
                             release_claim_lock()
                             return finish(result, output, workspace, 1, secrets=secrets)
-            if provider_name in ("gemini", "claude", "muse"):
+                registered_child = getattr(args, "_registered_child_path", None)
+                for existing_path, parent in all_orchestration_records(state_dir):
+                    if isinstance(parent, dict) and parent.get("status") == "resolved":
+                        continue
+                    parent_workspace, parent_owned_paths = pending_claims(parent)
+                    if parent_workspace is not None and not claims_overlap(
+                            workspace, owned_claims, parent_workspace, parent_owned_paths):
+                        continue
+                    child_of_parent = (registered_child is not None and
+                                       Path(registered_child).parent.parent.with_suffix(".json") == existing_path and
+                                       read_json(registered_child).get("status") == "running")
+                    if not child_of_parent:
+                        result.update(status="blocked_pending_run", pending=parent,
+                                      pending_path=str(existing_path), fallback_authorized=False,
+                                      error="An unresolved orchestrator owns overlapping paths")
+                        release_claim_lock()
+                        return finish(result, output, workspace, 1, secrets=secrets)
+            if provider_name in ("gemini", "claude", "muse", "openai"):
                 state, state_error = quota_state(state_dir, provider_name)
                 if state_error:
                     result.update(status="state_error", fallback=luna_fallback() if provider_name == "gemini" else quota_fallback(provider_name, config),
@@ -2586,7 +3109,23 @@ def execute(args):
                     return finish(result, output, workspace, 20, secrets=secrets)
                 if state:
                     result["expired_quota"] = state
-            if args.role != "implement":
+            if not claims_writer:
+                release_claim_lock()
+            if orchestration_id:
+                parent_path = orchestration_path(state_dir, workspace, orchestration_id)
+                with provider_lock(state_dir, 30, "orchestration.lock"):
+                    parent_path.parent.mkdir(parents=True, exist_ok=True)
+                    for existing in parent_path.parent.glob("*.json"):
+                        previous = settle_orchestration_parent(existing)
+                        if previous.get("status") != "resolved":
+                            old_scope = [os.path.normcase(str((workspace / path).resolve())) for path in previous.get("owned_paths", [])]
+                            if claims_overlap(workspace, owned_claims, workspace, old_scope):
+                                result.update(status="blocked_pending_run", pending_path=str(existing),
+                                              error="An overlapping orchestrator or its child remains unresolved")
+                                return finish(result, output, workspace, 1, secrets=secrets)
+                    write_json(parent_path, {"status": "launching", "workspace": str(workspace),
+                                             "owned_paths": owned_paths, "run_id": orchestration_id})
+                result["_orchestration"] = {"path": str(parent_path), "state_dir": str(state_dir)}
                 release_claim_lock()
             with (output / "stdout.log").open("wb") as stdout, (output / "stderr.log").open("wb") as stderr:
                 if args.role == "implement":
@@ -2600,10 +3139,19 @@ def execute(args):
                     stream_state.update(muse_meta)
                 progress_snapshot = None
                 try:
-                    process = subprocess.Popen(command, cwd=workspace, shell=False, stdout=stdout, stderr=stderr,
-                                               env=child_environment(config, provider_name, checked_deepseek_key),
+                    child_env = child_environment(config, provider_name, checked_deepseek_key)
+                    if orchestration_id:
+                        child_env["FRAMEWORK_PARENT_RUN_ID"] = orchestration_id
+                    process = subprocess.Popen(command, cwd=workspace, shell=False, stdin=subprocess.DEVNULL,
+                                               stdout=stdout, stderr=stderr, env=child_env,
                                                start_new_session=os.name != "nt")
+                    result["_process_launched"] = True
                     started_wall, started_monotonic = time.time(), time.monotonic()
+                    if orchestration_id:
+                        with provider_lock(state_dir, 30, "orchestration.lock"):
+                            parent = read_json(parent_path)
+                            parent.update(status="running", pid=process.pid)
+                            write_json(parent_path, parent)
                     if args.role == "implement":
                         write_json(pending_path, {"status": "running", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "pid": process.pid, "provider": provider_name, **muse_meta,
                                                   "started_at": started_wall, "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace})
@@ -2648,6 +3196,7 @@ def execute(args):
                                 safe_heartbeat(result, output, provider_name, provider, process, "running",
                                                started_wall, started_monotonic, progress_snapshot)
                                 next_heartbeat = now_monotonic + heartbeat_seconds
+                    result["_local_process_exited"] = True
                     progress_snapshot, new_events = safe_refresh_progress(
                         result, output, stream_state, started_wall, started_monotonic,
                         adapter_state="finished", final=True)
@@ -2729,16 +3278,21 @@ def execute(args):
                 ds_output, is_terminal, valid_success = parse_deepseek_final_output(
                     output, stdout_text, stdout_truncated=stdout_truncated)
                 terminal_turn, terminal_event, has_terminal_402, _ = parse_codex_events(stdout_text)
+            elif provider_name == "openai":
+                codex_terminal, codex_seen, stream_errors = parse_openai_terminal(stdout_text, stdout_truncated)
+                provider_output_text = json.dumps(codex_terminal) if codex_terminal else ""
+                valid_success = bool(codex_terminal and codex_terminal.get("type") == "turn.completed" and code == 0)
+                terminal_turn, has_terminal_402 = None, False
             elif provider_name == "gemini":
                 gemini_output, gemini_result_event, stream_errors = parse_gemini_final_output(
                     stdout_text, stdout_truncated=stdout_truncated)
                 provider_output_text = json.dumps(gemini_output) if gemini_output is not None else ""
-                valid_success = successful_response(provider_output_text, args.role)
+                valid_success = successful_response(provider_output_text, "implement" if activity else args.role)
                 terminal_turn, has_terminal_402 = None, False
             elif provider_name == "claude":
                 claude_output, claude_result_event, stream_errors = parse_claude_final_output(stdout_text)
                 provider_output_text = json.dumps(claude_output) if claude_output is not None else ""
-                valid_success = successful_response(provider_output_text, args.role)
+                valid_success = successful_response(provider_output_text, "review")
                 terminal_turn, has_terminal_402 = None, False
             elif provider_name == "muse":
                 muse_terminal = stream_state.get("muse_terminal")
@@ -2766,9 +3320,9 @@ def execute(args):
                 terminal_turn, has_terminal_402 = None, False
 
             errors = error_objects(provider_output_text)
-            if provider_name != "muse":
+            if provider_name not in ("muse", "openai"):
                 errors += error_objects(stderr_text)
-            if provider_name in ("gemini", "claude") and (gemini_output is None if provider_name == "gemini" else claude_output is None):
+            if provider_name in ("gemini", "claude", "openai") and (gemini_output is None if provider_name == "gemini" else claude_output is None if provider_name == "claude" else codex_terminal is None):
                 errors.extend(error for error in stream_errors if isinstance(error, dict))
             # A truncated stderr suffix cannot prove that its remaining line
             # was the CLI's only diagnostic. Truncated stdout may hide a real
@@ -2778,6 +3332,7 @@ def execute(args):
             if provider_name == "muse" and plain_error and plain_error.get("code") != "CLI_SETUP_ERROR":
                 plain_error = None
             provider_without_terminal = (
+                (provider_name == "openai" and codex_terminal is None) or
                 (provider_name == "gemini" and gemini_output is None and not gemini_result_event) or
                 (provider_name == "claude" and claude_output is None and not claude_result_event) or
                 (provider_name == "muse" and not muse_terminal_coherent)
@@ -2785,7 +3340,9 @@ def execute(args):
             plain_error_applies = plain_error
             if provider_name == "muse" and stdout_text.strip():
                 plain_error_applies = None
-            if provider_name in ("gemini", "claude", "muse") and stdout_text.strip() and not provider_without_terminal:
+            if provider_name == "openai" and stdout_text.strip():
+                plain_error_applies = None
+            if provider_name in ("gemini", "claude", "muse", "openai") and stdout_text.strip() and not provider_without_terminal:
                 # A malformed event=result is not repaired by unrelated stderr;
                 # keep ownership unresolved instead of authorizing a fallback.
                 plain_error_applies = None
@@ -2799,9 +3356,13 @@ def execute(args):
                 complete_failure = complete_failure or complete_terminal_failure(stderr_text)
             terminal_established = (denied or valid_success or plain_error_applies is not None or
                                     (provider_name in ("gemini", "claude") and complete_failure) or
+                                    (provider_name == "openai" and codex_terminal is not None) or
                                     (provider_name == "muse" and muse_terminal_coherent) or
                                     (provider_name == "deepseek" and (is_terminal or terminal_turn == "failed")))
-            if provider_name == "muse":
+            result["terminal_established"] = bool(terminal_established)
+            if provider_name == "openai":
+                result["stream_terminal_seen"] = codex_seen
+            elif provider_name == "muse":
                 result["stream_terminal_seen"] = muse_terminal is not None
             elif provider_name in ("gemini", "claude"):
                 result["stream_terminal_seen"] = gemini_result_event if provider_name == "gemini" else claude_result_event
@@ -2876,7 +3437,8 @@ def execute(args):
                 return finish(result, output, workspace, 1, secrets=secrets)
 
             quota = (muse_quota_error(muse_terminal) if provider_name == "muse" and muse_terminal_coherent else
-                     quota_error(errors, provider_name) if terminal_established and not valid_success else None)
+                     quota_error(stream_errors if provider_name == "openai" else errors, provider_name)
+                     if terminal_established and not valid_success else None)
             if quota:
                 with provider_lock(state_dir, float(config.get("lock_timeout_seconds", 30)), "quota.lock"):
                     state = quota_record(provider_name, quota, state_dir, output, config,
@@ -2886,6 +3448,9 @@ def execute(args):
                 result.update(status="fallback_required", fallback=quota_fallback(provider_name, config), quota=state, cached=False)
                 return finish(result, output, workspace, 20, secrets=secrets)
             result.update(status="completed" if code == 0 and not errors and valid_success else "provider_error", exit_code=code)
+            if result["status"] == "provider_error" and errors:
+                result["error"] = structured_error_message(errors)
+                result["error_codes"] = [str(error.get("code", error.get("status"))) for error in errors if error.get("code", error.get("status")) is not None]
             if args.role == "implement" and not valid_success:
                 if not terminal_established:
                     result.update(status="uncertain_exit", fallback_authorized=False, fallback_blocked_by_pending=True)
@@ -2929,6 +3494,53 @@ def execute(args):
 
 
 def finish(result, output, workspace, code, secrets=None):
+    orchestration = result.pop("_orchestration", None)
+    # Cleanup is only recorded after Popen returned a process. An interrupt in
+    # the tiny interval before _process_launched was recorded is still launched.
+    process_launched = result.pop("_process_launched", False) or "cleanup" in result
+    local_process_exited = result.pop("_local_process_exited", False)
+    if orchestration:
+        parent_path = Path(orchestration["path"])
+        state_dir = Path(orchestration["state_dir"])
+        try:
+            with provider_lock(state_dir, 30, "orchestration.lock"):
+                children = orchestration_children(parent_path)
+                unresolved = any(child.get("status") not in ("completed", "failed") for child in children)
+                failed = any(child.get("status") == "failed" for child in children)
+                if unresolved:
+                    result.update(status="blocked_pending_run", fallback_authorized=False,
+                                  fallback_blocked_by_pending=True,
+                                  error="Orchestrator has unresolved child dispatches")
+                    code = 1
+                elif failed and result.get("status") == "completed":
+                    result.update(status="provider_error", error="Orchestrator child dispatch failed")
+                    code = 1
+                elif not children and result.get("status") == "completed":
+                    result.update(status="provider_error", error="Orchestrator completed without a child dispatch")
+                    code = 1
+                parent = read_json(parent_path)
+                cleanup = result.get("cleanup", {})
+                local_stopped = (local_process_exited or cleanup.get("local_process_stopped") is True or
+                                 not process_launched)
+                terminal = result.get("terminal_established") is True
+                safe_terminal = (result.get("status") in ("completed", "provider_error", "permission_denied", "fallback_required")
+                                 and terminal and local_stopped)
+                safe_prelaunch = not process_launched and not children
+                parent["status"] = "resolved" if not unresolved and (safe_terminal or safe_prelaunch) else "uncertain_exit"
+                parent["result_status"] = result.get("status")
+                parent["local_process_stopped"] = local_stopped
+                parent["terminal_established"] = terminal
+                write_json(parent_path, parent)
+                result["orchestration_run_id"] = parent.get("run_id")
+                result["orchestration_pending_path"] = str(parent_path)
+                if parent["status"] != "resolved":
+                    result["fallback_authorized"] = False
+                    result["fallback_blocked_by_pending"] = True
+        except (OSError, ValueError, TimeoutError) as exc:
+            result.update(status="blocked_pending_run", fallback_authorized=False,
+                          fallback_blocked_by_pending=True,
+                          error=f"Orchestration child state could not be verified: {exc}")
+            code = 1
     if result.pop("_claim_unresolved", False) or result.get("status") == "blocked_pending_run":
         result["fallback_authorized"] = False
         result["fallback_blocked_by_pending"] = True
@@ -2967,7 +3579,7 @@ def cli_quota_status(args):
         raise ValueError("Routing configuration must contain a providers object")
     muse_profile_arg = getattr(args, "muse_profile", None)
     require_muse_profile_allowed(muse_profile_arg, getattr(args, "provider", None))
-    providers = [args.provider] if args.provider else [p for p in ("gemini", "deepseek", "claude", "muse") if p in config["providers"]]
+    providers = [args.provider] if args.provider else [p for p in ("gemini", "deepseek", "claude", "muse", "openai") if p in config["providers"]]
     state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
     output = {}
     code = 0
@@ -3092,8 +3704,8 @@ def cli_quota_set(args):
     config = read_json(args.config)
     quota_cooldown(config)
     provider = args.provider
-    if provider not in ("gemini", "claude", "muse"):
-        raise ValueError(f"quota-set only supports subscription quota providers ('gemini', 'claude', 'muse'); '{provider}' uses monetary balance preflight")
+    if provider not in ("gemini", "claude", "muse", "openai"):
+        raise ValueError(f"quota-set only supports subscription quota providers; '{provider}' uses monetary balance preflight")
     if provider not in config.get("providers", {}):
         raise ValueError("Provider is missing from config")
     muse_profile_arg = getattr(args, "muse_profile", None)
@@ -3123,25 +3735,181 @@ def cli_quota_set(args):
     return {"status": "recorded", "provider": provider, **muse_meta, "quota": state, "quota_path": str(quota_path(state_dir, provider))}, 0
 
 
+def activity_status(args):
+    if getattr(args, "check_live", False) or getattr(args, "muse_profile", None):
+        raise ValueError("Activity status is local only and does not accept --check-live/--muse-profile")
+    if getattr(args, "profile", None) and getattr(args, "provider", None):
+        raise ValueError("Choose one of --profile or --provider")
+    config = read_json(args.config)
+    chain = activity_routes(config, args.activity)
+    if getattr(args, "profile", None):
+        if args.profile not in chain:
+            raise ValueError("Requested profile is not in the activity chain")
+        chain = [args.profile]
+    if getattr(args, "provider", None):
+        chain = [name for name in chain if config["profiles"][name]["provider"] == args.provider]
+    if not chain:
+        raise ValueError("No profiles match the requested activity/provider")
+    state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
+    blocked = set()
+    entries = []
+    for name in chain:
+        provider_name, effective = effective_activity_provider(config, name)
+        state, error = quota_state(state_dir, provider_name)
+        status = ("state_error" if error else "disabled" if config["providers"][provider_name].get("enabled", True) is False
+                  else "fallback_required" if state and state.get("retry_at", 0) > time.time() else "available_to_try")
+        if status != "available_to_try":
+            blocked.add(provider_name)
+        entries.append({"profile": name, "provider": provider_name, "model": effective["model"],
+                        "effort": effective["effort"], "status": status, "quota_path": str(quota_path(state_dir, provider_name)),
+                        **({"error": error} if error else {})})
+    return {"activity": args.activity, "routes": entries, "available_to_try": int(any(x["status"] == "available_to_try" for x in entries))}, 0
+
+
+def _dispatch_activity_core(args):
+    config = read_json(args.config)
+    if not args.activity:
+        raise ValueError("dispatch requires --activity")
+    if getattr(args, "muse_profile", None) or getattr(args, "review_effort", None):
+        raise ValueError("Legacy --muse-profile/--review-effort cannot be combined with activity dispatch")
+    if args.activity not in ("independent_review", "security_review", "deep_review") and args.review_reason:
+        raise ValueError("--review-reason is only for review activities")
+    chain = activity_routes(config, args.activity)
+    if args.profile and args.provider:
+        raise ValueError("Choose one of --profile or --provider")
+    if args.profile:
+        if args.profile not in chain:
+            raise ValueError("Requested profile is not in activity chain")
+        chain = [args.profile]
+    if args.provider:
+        chain = [p for p in chain if config["profiles"][p]["provider"] == args.provider]
+    if not chain:
+        raise ValueError("No eligible route for selection")
+    if args.activity in ("security_review", "deep_review") and not (args.review_reason and args.review_reason.strip()):
+        raise ValueError("High/deep review requires --review-reason")
+    if args.activity in WRITE_ACTIVITIES | {"orchestration"}:
+        task = read_json(args.task_file)
+        if not task.get("owned_paths"):
+            raise ValueError("Writing activity or orchestration requires explicit owned_paths")
+    if args.activity == "orchestration" and not read_json(args.task_file).get("allow_delegation"):
+        raise ValueError("Orchestration task must explicitly authorize child dispatch")
+    author = read_json(args.task_file).get("review", {}).get("author_provider") if args.activity in ("independent_review", "security_review", "deep_review") else None
+    if author in PROVIDERS and len({config["profiles"][name]["provider"] for name in chain}) > 1:
+        chain = [name for name in chain if config["profiles"][name]["provider"] != author] + [name for name in chain if config["profiles"][name]["provider"] == author]
+    state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
+    attempts = []
+    blocked = set()
+    for name in chain:
+        provider_name, effective = effective_activity_provider(config, name)
+        if (args.activity in ("independent_review", "security_review", "deep_review") and
+                effective.get("effort") in ("high", "xhigh", "max", "ultra") and
+                not (args.review_reason and args.review_reason.strip())):
+            attempts.append({"profile": name, "provider": provider_name, "status": "review_reason_required"})
+            continue
+        if provider_name in blocked:
+            attempts.append({"profile": name, "provider": provider_name, "status": "skipped_account_block"})
+            continue
+        state, error = quota_state(state_dir, provider_name)
+        if error or (state and state.get("retry_at", 0) > time.time()) or config["providers"][provider_name].get("enabled", True) is False:
+            blocked.add(provider_name)
+            attempts.append({"profile": name, "provider": provider_name,
+                             "status": "state_error" if error else "fallback_required" if state else "disabled",
+                             **({"error": error} if error else {})})
+            continue
+        route_args = copy.copy(args)
+        route_args.role = "implement" if args.activity in WRITE_ACTIVITIES else "review"
+        route_args.activity = args.activity
+        route_args.profile = name
+        route_args.provider = provider_name
+        route_args.prior_context = attempts[-3:]
+        route_args.muse_profile = None
+        try:
+            result, code = execute(route_args)
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            # execute's prelaunch validation cannot leave a writer behind.
+            result, code = {"status": "setup_error", "error": str(exc)}, 1
+        attempts.append({"profile": name, "provider": provider_name, "model": effective["model"],
+                         "status": result.get("status"), "logs": result.get("logs"),
+                         "error": result.get("error"), "evidence": result.get("evidence"),
+                         "pending_path": result.get("pending_path")})
+        if result.get("status") == "completed":
+            return {"status": "completed", "activity": args.activity, "selected": name,
+                    "same_provider_review": bool(author == provider_name), "attempts": attempts, "result": result}, 0
+        if args.dry_run:
+            return {"status": "dry_run", "activity": args.activity, "selected": name, "attempts": attempts, "result": result}, 0
+        if result.get("status") == "fallback_required":
+            blocked.add(provider_name)
+        if result.get("status") in ("provider_error", "setup_error") and account_auth_error(result):
+            blocked.add(provider_name)
+        if (result.get("fallback_blocked_by_pending") or result.get("fallback_authorized") is False or
+                result.get("status") in ("uncertain_exit", "timeout", "cancelled", "blocked_pending_run") or
+                result.get("status") == "provider_error" and not result.get("terminal_established")):
+            return {"status": "blocked_pending_run", "activity": args.activity, "attempts": attempts,
+                    "error": "Previous route is not authoritatively resolved; inspect pending state before another writer."}, 1
+        if result.get("status") not in ("fallback_required", "provider_error", "permission_denied", "setup_error", "state_error"):
+            return {"status": "blocked", "activity": args.activity, "attempts": attempts}, 1
+    return {"status": "all_routes_unavailable", "activity": args.activity, "attempts": attempts,
+            "error": "No eligible route completed; inspect route logs and account state."}, 20
+
+
+def dispatch_activity(args):
+    run_id = getattr(args, "parent_run_id", None) or os.environ.get("FRAMEWORK_PARENT_RUN_ID")
+    if not run_id or args.dry_run:
+        return _dispatch_activity_core(args)
+    workspace = Path(args.workspace).resolve(strict=True)
+    state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state")).resolve()
+    owned_paths = normalized_owned_paths(workspace, read_json(args.task_file).get("owned_paths"))
+    child_path = register_child_dispatch(state_dir, workspace, run_id, owned_paths, args.activity)
+    args = copy.copy(args)
+    args._registered_child_path = str(child_path)
+    try:
+        result, code = _dispatch_activity_core(args)
+    except BaseException:
+        resolve_child_dispatch(state_dir, child_path, {"status": "unresolved"})
+        raise
+    resolve_child_dispatch(state_dir, child_path, result)
+    return result, code
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "resolve-orchestration":
+        parser = argparse.ArgumentParser(description="Confirm a stopped orchestrator or child after inspecting its evidence")
+        parser.add_argument("--state-dir", required=True)
+        parser.add_argument("--workspace", required=True)
+        parser.add_argument("--run-id", required=True)
+        parser.add_argument("--child-id")
+        parser.add_argument("--reason", required=True)
+        parser.add_argument("--confirm-stopped", action="store_true", required=True)
+        try:
+            args = parser.parse_args(sys.argv[2:])
+            result = operator_resolve_orchestration(Path(args.state_dir).resolve(),
+                                                    Path(args.workspace).resolve(strict=True),
+                                                    args.run_id, args.reason, args.child_id)
+            code = 0
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            result, code = {"status": "state_error", "error": str(exc)}, 1
+        print(json.dumps(result, indent=2))
+        return code
     if len(sys.argv) > 1 and sys.argv[1] in ("status", "quota-set"):
         command = sys.argv[1]
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--config", required=True)
         parser.add_argument("--state-dir")
         if command == "status":
-            parser.add_argument("--provider", choices=("gemini", "deepseek", "claude", "muse"))
+            parser.add_argument("--provider", choices=("gemini", "deepseek", "claude", "muse", "openai"))
+            parser.add_argument("--activity")
+            parser.add_argument("--profile")
             parser.add_argument("--muse-profile", choices=MUSE_PROFILE_NAMES, default=None)
             parser.add_argument("--check-live", "--live", dest="check_live", action="store_true")
         if command == "quota-set":
-            parser.add_argument("--provider", choices=("gemini", "claude", "muse"), required=True)
+            parser.add_argument("--provider", choices=("gemini", "claude", "muse", "openai"), required=True)
             parser.add_argument("--muse-profile", choices=MUSE_PROFILE_NAMES, default=None)
             parser.add_argument("--reason", required=True)
             parser.add_argument("--reset-at")
         args = argparse.Namespace(provider=None)
         try:
             args = parser.parse_args(sys.argv[2:])
-            result, code = cli_quota_status(args) if command == "status" else cli_quota_set(args)
+            result, code = (activity_status(args) if args.activity else cli_quota_status(args)) if command == "status" else cli_quota_set(args)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             result = {"status": "state_error", "available_to_try": 0, "error": str(exc)}
             if getattr(args, "provider", None):
@@ -3150,8 +3918,11 @@ def main():
         print(json.dumps(result, indent=2))
         return code
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("role", choices=("implement", "review"))
-    parser.add_argument("--provider", choices=("gemini", "deepseek", "claude", "muse"), default=None)
+    parser.add_argument("role", choices=("implement", "review", "dispatch"))
+    parser.add_argument("--provider", choices=("gemini", "deepseek", "claude", "muse", "openai"), default=None)
+    parser.add_argument("--activity")
+    parser.add_argument("--profile")
+    parser.add_argument("--parent-run-id")
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--task-file", required=True)
     parser.add_argument("--config", required=True)
@@ -3162,7 +3933,9 @@ def main():
     parser.add_argument("--review-reason", default=None)
     args = parser.parse_args()
     try:
-        result, code = execute(args)
+        if args.role != "dispatch" and (args.activity or args.profile or args.parent_run_id):
+            raise ValueError("--activity, --profile and --parent-run-id require dispatch; legacy implement/review remain pinned")
+        result, code = dispatch_activity(args) if args.role == "dispatch" else execute(args)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         result, code = {"status": "setup_error", "error": str(exc)}, 1
     print(json.dumps(result, indent=2))

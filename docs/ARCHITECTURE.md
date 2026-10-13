@@ -1,141 +1,23 @@
-# Architecture and Design Decisions
+# Architecture
 
-This document details the six core architectural decisions governing the multi-provider orchestration framework. Each decision addresses concrete failure modes encountered when coordinating external AI developer CLI tools—Google Antigravity (`agy`) and Anthropic Claude Code CLI (`claude`), with retained compatibility internals for retired DeepSeek runs—under an OpenAI Codex development environment.
+The shared runner [provider_runner.py](../scripts/provider_runner.py) loads `routing.json`, validates the complete profile/activity registry, and selects an ordered chain. Each profile inherits executable, timing and secret handling from one provider entry and overrides model/effort. `dispatch_activity` performs account-cache preflight, author-provider ordering, one attempt per route, bounded prior-result continuity and terminal-state decisions. `execute` retains the existing process, stream, lock, pending-claim and log infrastructure. The legacy implement/review commands still use their pinned behavior.
 
-For operational workflows and runtime configuration, see [FRAMEWORK.md](FRAMEWORK.md). For implementation details, see [../scripts/provider_runner.py](../scripts/provider_runner.py).
+The state directory sits beside the installed routing file. Each provider has one quota JSON file, shared across all models and workspaces. Pending records preserve workspace and owned paths. A short lock protects check-and-claim; disjoint writers may then run concurrently. An unresolved active, launching, uncertain, timed-out or cancelled writer blocks overlapping claims, including a would-be fallback. A resolved known terminal releases the claim. Provider stdout/stderr, progress, prompt and result artifacts live under the task workspace `.llm-output/agent-framework`.
 
----
+Static activities run with provider-specific restrictions: Codex read-only sandbox and disabled child collaboration/plugins/MCP configuration, Claude read tools and strict MCP, Muse an exact per-run `read_file` toolset plus disabled shell/write/web tools, and Gemini a validated Antigravity custom agent tool allowlist. For Gemini, the runner checks the selected global helper path and rejects duplicate YAML-name definitions in known global, project and plugin locations, including both supported project layouts. Prompt instructions supplement these controls. The current host's Muse transport probe offered only `read_file`; managed-policy conflicts and Gemini's actual selected definition still need live confirmation.
 
-## 1. Fail-Closed Provider Routing and the Fallback Chain
+Activity `orchestration` is an agent that calls the dispatcher for bounded children. Its parent marker claims its explicit paths against unrelated writers and orchestrators; a registered child may work inside the parent's scope. Each child registers before provider launch, and parent completion checks those registrations. A timed-out, interrupted or post-launch failed parent remains unresolved until terminal evidence or explicit cessation recovery and every child is settled. Disjoint scopes can proceed. The framework does not maintain a separate autonomous pipeline.
 
-### Problem
-External AI provider CLIs suffer from rate limits, unexpected service outages, payment/quota exhaustion, and transient network errors. In an automated multi-agent coding workflow, unhandled provider failures or ambiguous error states can lead to infinite retry loops, hanging tasks, silent abandonment, or uncontrolled model switching. An orchestrator requires a deterministic routing hierarchy that attempts fast, cost-effective models first and reliably falls back to local or alternative providers without stalling or corrupting workspace state.
+OpenAI uses its subscription Codex CLI, not the retired DeepSeek provider. The runner forces the OpenAI model provider and ChatGPT login mode, removes API key environment overrides, selects an explicit supported Windows sandbox per run, and reads a dedicated root JSONL terminal. Static routes disable apps, agents, plugins and MCP and use a read-only sandbox; live enforcement still requires host validation. Malformed or incomplete output cannot authorize overlapping fallback. Existing DeepSeek parser and balance state remain for compatibility and audit.
 
-### Decision
-Implement a deterministic fail-closed fallback hierarchy for code implementation tasks:
+The [installer](../install.py) builds a complete mutation plan before writing. Version 12 adds Codex discovery, activity profiles/chains, a narrowly named Gemini reader helper and new skills/tests. It preserves valid saved customizations and quota bytes; malformed settings and conflicting reader definitions fail preflight. Installation does not change the host-selected primary model or prove live provider entitlement.
 
-1. **Primary Tier (Gemini Flash)**: Google Antigravity (`agy`) running `gemini-3.8-flash-medium`.
-2. **Fallback Tier (Native Luna Medium)**: Native OpenAI Codex role `implementer` running `gpt-6-luna` (medium effort), selected when Gemini reports terminal quota exhaustion or encounters a non-quota error, with execution gated on safe file ownership. (DeepSeek has been retired from active routing; legacy balance and stream implementation internals remain for backward compatibility).
+See [FRAMEWORK.md](FRAMEWORK.md) for commands and [MODEL_ROUTING.md](MODEL_ROUTING.md) for the calibrated default rationale.
 
-Independent code reviews follow a dedicated review route: Anthropic Claude Code CLI (`claude`) running `claude-opus-5-5` (default medium effort; high effort requires a documented reason), falling back directly to native Astra low (`reviewer`) upon quota exhaustion. DeepSeek is excluded from the review path.
+## State and evidence boundaries
 
-The opt-in Muse implementation route resolves one explicit profile per run through `resolve_muse_profile()`: `routine` (base regular Wonder, medium), `complex` (Wonder Full `muse-wonder-full-1.0`, medium) or `escalation` (Wonder Full, high). Resolution copies the base provider and overrides only model/effort, so executable, timing, secret filtering, the single `muse-quota.json` cache and cross-provider ownership claims stay shared; quota evidence records the actually selected model/profile. Profile flags are rejected for other providers and for review, and no outcome automatically escalates.
+Quota and pending records are local machine state, not provider truth. Each provider has one account-level cache; confirmed usage exhaustion updates it atomically, while transient throttling, authentication and model errors remain distinct. A short OS lock protects check-and-claim, not the entire provider run. Claims are literal paths; directories include descendants and an empty writer claim covers the workspace. Legacy pending records remain readable, and an unreadable or uncertain record fails closed.
 
-The routing engine fails closed:
-- **Exit 0 (success)**: Provider executed and completed successfully (`available_to_try` is the status subcommand's verdict when no cached block is active, rather than a runner execution exit code).
-- **Exit 20 (`fallback_required`)**: Confirmed quota exhaustion; signals the orchestrator to advance immediately to the fallback without launching the exhausted CLI again.
-- **Exit 1 (`blocked_pending_run` / `state_error`)**: Unresolved pending runs on overlapping claimed paths, preflight validation error, network failure, or corrupted state. When an unresolved pending run is detected, execution deliberately blocks (`fallback_authorized` is false and `fallback_blocked_by_pending` is true) until an operator resolves it; for other exit-1 errors, the runner directs the orchestrator to fallback while preserving unreadable diagnostic evidence.
+Raw provider JSONL remains in per-run `stdout.log` and is parsed incrementally for compact `progress.json` updates. Heartbeats record quiet-period liveness. Neither telemetry stream nor a local process exit is a success signal by itself. Gemini, Claude, Muse and OpenAI have separate terminal parsers; OpenAI requires one nonempty root thread ID, a coherent terminal and a complete final line. Only a validated terminal with stopped/resolved ownership authorizes fallback. Timeout cleanup attempts process-tree termination but cannot prove provider backend cessation.
 
-### Why It Matters
-Fail-closed routing prevents unbounded retries against depleted or failing APIs. Every terminal provider outcome routes to a defined next step except unresolved pending-run conflicts, which deliberately block until an operator inspects and resolves them. By capturing terminal quota events and mapping them to structured exit codes, the orchestrator transitions to native models without human intervention or conversational prompt loops, maintaining deterministic agent behavior.
-
-### Implementation Citations
-- **Runner**: [`../scripts/provider_runner.py`](../scripts/provider_runner.py) — `execute()` (lines 1967–2453), `quota_fallback()` (lines 848–860), `luna_fallback()` (lines 844–847), `finish()` (lines 2453–2484), `command_for()` (lines 345–405).
-- **Policy**: [`FRAMEWORK.md`](FRAMEWORK.md) — Section "Routing" and Section "Results and quota handling".
-
----
-
-## 2. Quota Caching and Legacy Monetary Preflight
-
-### Problem
-Invoking rate-limited providers such as Gemini or Claude repeatedly after quota exhaustion wastes network round-trips and adds unnecessary latency to agent execution loops. Pay-as-you-go APIs additionally require positive credit balances.
-
-### Decision
-Enforce atomic local quota caching across providers, combined with retained monetary-balance preflight checks for legacy compatibility:
-
-1. **Atomic Quota Caching**: Confirmed terminal quota errors are recorded in shared JSON cache files (`gemini-quota.json`, `claude-quota.json`, and optional `muse-quota.json`; legacy `deepseek-balance.json` stores a separate balance snapshot) in the framework `state/` directory. Updates are guarded by cross-process file locks (`provider_lock`) and written via atomic file replacement. Cached entries record exact provider reset timestamps when available, or apply a bounded probe cooldown (`quota_probe_seconds`, default 3600s). Status checks inspect these local caches without network overhead.
-2. **Legacy Monetary Preflight**: DeepSeek direct-invocation internals are retained for backward compatibility, including preflight `GET /user/balance` checks via standard library `urllib.request` with redirect rejection.
-
-### Why It Matters
-Quota caching prevents hammering rate-limited APIs during cooldown periods, allowing subsequent operations to bypass exhausted providers instantly. Retained preflight logic preserves legacy compatibility without active exposure in routing defaults.
-
-### Implementation Citations
-- **Runner**: [`../scripts/provider_runner.py`](../scripts/provider_runner.py) — `query_deepseek_balance()` (lines 1082–1172), `NoRedirectHandler` (lines 1077–1080), `classify_balance_error()` (lines 1063–1075), `validate_balance_info_entry()` (lines 878–896), `record_balance_snapshot()` (lines 1193–1255), `quota_state()` (lines 1290–1303), `quota_record()` (lines 1305–1322), `provider_lock()` (lines 254–291).
-- **Policy**: [`FRAMEWORK.md`](FRAMEWORK.md) — Section "Provider availability and manual entries".
-
----
-
-## 3. Credential Isolation Across Child Subprocesses
-
-### Problem
-In a multi-provider orchestrator, child subprocesses are spawned to execute different provider CLIs, run git commands, and collect diff evidence. If environment variables are inherited naively, sensitive credentials such as `DEEPSEEK_API_KEY` could be exposed to third-party provider tools (e.g. Google Antigravity or Claude Code) or leaked through git hooks, external diff programs, or child shell environments executed by code-generating models.
-
-### Decision
-Implement strict environment sanitization and subprocess boundary controls:
-
-1. **Subprocess Environment Stripping**: The `child_environment()` function strips `DEEPSEEK_API_KEY` (and configured or retired credential names retained in `retired_secret_env_vars`) from environment dictionaries passed to Gemini and Claude provider subprocesses. `git_evidence()` performs its own value-based secret stripping on Git subprocesses by filtering variables whose values match known credentials. Only the DeepSeek execution path receives the DeepSeek API credential verified by preflight.
-2. **Legacy Nested Codex Shell Isolation**: When invoking nested Codex CLI for DeepSeek (`codex exec -p deepseek`), the runner supplies `-c shell_environment_policy.ignore_default_excludes=false`, preventing child shell commands executed by the model from inheriting environment secrets. Unattended execution passes `--approve-for-me`, selecting the workspace-write sandbox while avoiding conflicts with explicit `--sandbox` flags.
-3. **Git Subprocess Hardening**: Git-evidence collection (`git_evidence()`) passes `--no-ext-diff` and `--no-textconv`, and executes git with `-c core.fsmonitor=false`. This prevents untrusted repository configurations from executing external diff drivers, textconv filters, or repository-configured filesystem monitors.
-
-### Why It Matters
-Credential isolation provides defense-in-depth against credential harvesting and inadvertent leakage. This filtering protects ordinary child environments and retained logs; it is not a hard containment boundary against another process running as the same user.
-
-### Implementation Citations
-- **Runner**: [`../scripts/provider_runner.py`](../scripts/provider_runner.py) — `child_environment()` (lines 935–945), `deepseek_secrets()` (lines 924–933), `command_for()` (lines 345–405), `direct_windows_codex_command()` (lines 321–343), `git_evidence()` (lines 1944–1965).
-- **Policy**: [`FRAMEWORK.md`](FRAMEWORK.md) — Section "Invocation" and Section "Provider availability and manual entries".
-
----
-
-## 4. Artifact Redaction of Retained Run Logs
-
-### Problem
-Autonomous agent runs produce extensive operational logs in `.llm-output/agent-framework/`, including stdout streams, stderr traces, event progress records, heartbeat snapshots, and git diffs. If API keys, authentication tokens, or authorization headers appear in command outputs, error traces, or tool arguments, persisting these logs to disk creates a critical credential exposure risk in git repositories or shared development machines.
-
-### Decision
-Implement post-execution artifact sanitization across all retained output files:
-
-1. **Memory-Mapped Scanning and Bounded Copy Rewriting**: `sanitize_run_artifacts()` scans retained output files (`prompt.txt`, `stdout.log`, `stderr.log`, `last_message.txt`, `provider.log`, `progress.json`, `heartbeat.json`, `status.txt`, `diff.txt`, `head.txt`) by executing `pattern.search` over a full-file memory map (`mmap`). When matching secrets are detected, it rewrites the file using bounded 64 KB copies (`ARTIFACT_COPY_CHUNK_BYTES = 64 * 1024`). `result.json` is not in this file list because it is sanitized separately in memory at result-write time before being persisted to disk.
-2. **Secret Masking**: Replaces all occurrences of known secrets (including `DEEPSEEK_API_KEY` and any discovered API key tokens) with redaction markers (`[REDACTED]`).
-3. **Resilient File Replacement**: Sanitized contents are written via atomic file replacement (`os.replace`) where supported, with a guarded single-link in-place rewrite fallback to handle Windows environments where active file handles deny renaming.
-4. **Error Accounting**: Any redaction failure is captured and reported in `artifact_errors` in the structured run result rather than silently ignored.
-
-### Why It Matters
-Retained logs are essential for post-mortem debugging, verification, and auditability, but they must not become secret storage. Performing deterministic redaction across retained artifacts and sanitizing results in memory at write time ensures that logs can be safely inspected, archived, or shared without exposing credentials.
-
-### Implementation Citations
-- **Runner**: [`../scripts/provider_runner.py`](../scripts/provider_runner.py) — `sanitize_run_artifacts()` (lines 947–1052), `_sanitize_all_secrets()` (lines 908–922), `_sanitize_secret()` (lines 898–906), `ARTIFACT_COPY_CHUNK_BYTES` (line 31).
-- **Policy**: [`FRAMEWORK.md`](FRAMEWORK.md) — Section "Results and quota handling" and Section "Provider lifecycle diagnostics".
-
----
-
-## 5. File-Ownership Claims and Pending-Run Records Preventing Overlapping Writers
-
-### Problem
-Concurrent autonomous coding agents operating within the same workspace can easily collide. If two agents simultaneously attempt to modify the same files, refactor shared modules, or write to overlapping directory trees, the workspace suffers from race conditions, conflicting edits, partial overwrites, and corrupted git state. Furthermore, if an agent process terminates unexpectedly (e.g. crash, hard timeout, or cancelled task), partially applied changes could be overwritten by a new agent before the failure is investigated.
-
-### Decision
-Implement hierarchical path-ownership registration and durable pending-run tracking:
-
-1. **Hierarchical Path Matching**: Before launching an implementation task, the runner checks the declared `owned_paths` in the task contract. Paths are canonicalized (resolving symlinks and folding Windows case via `normalized_owned_paths`). Ownership is checked hierarchically via `claims_overlap()`: exact file matches, parent-directory ownership of child files, and child-file claims within a claimed directory are all detected as conflicts. An empty `owned_paths` list conservatively claims the entire workspace.
-2. **Atomic Reservation**: Ownership checks and reservations are synchronized using a short-lived coordination lock (`gemini.lock`) via `provider_lock()`. The lock is released immediately after registration so long-running tasks do not block other disjoint writers.
-3. **Durable Pending Runs**: Active runs register pending records under `agent-framework/state/workspaces/<workspace-hash>/gemini-pending/<run-id>.json`. If a task finishes abnormally, hits a timeout, or exits with an uncertain status, the pending record remains active on disk, marking the owned paths as blocked (`blocked_pending_run`). New tasks attempting to modify those paths are rejected until an operator or recovery workflow explicitly inspects and marks the pending run as resolved.
-4. **Non-Interfering Reviews**: Read-only review tasks (Claude Opus 5.5) do not acquire write ownership locks and can run concurrently alongside implementation writers.
-
-### Why It Matters
-Hierarchical ownership coordinates concurrent writers so multiple agents can safely work in parallel in the same repository when their scopes are disjoint, while preventing conflicting writes on shared files. Durable pending records protect workspaces from accidental corruption after sudden crashes or timeouts, enforcing human or supervisor review before unfinished work is overwritten.
-
-### Implementation Citations
-- **Runner**: [`../scripts/provider_runner.py`](../scripts/provider_runner.py) — `normalized_owned_paths()` (lines 109–125), `claims_overlap()` (lines 127–137), `pending_claims()` (lines 181–196), `pending_records()` (lines 139–171), `all_pending_records()` (lines 198–223), `legacy_pending_for()` (lines 225–252), `workspace_state_dir()` (lines 104–107), `provider_lock()` (lines 254–291).
-- **Policy**: [`FRAMEWORK.md`](FRAMEWORK.md) — Section "Results and quota handling".
-
----
-
-## 6. Bounded-Memory Stream Telemetry Parsing
-
-### Problem
-Developer CLI tools (Gemini CLI, Claude Code CLI, Codex CLI) output high-volume NDJSON/JSONL event streams during multi-step coding sessions. In complex coding tasks, these streams can grow to tens or hundreds of megabytes. Buffering the entire event history in memory to inspect task progress or parse final outputs causes memory bloat, high GC overhead, and process crashes, while flooding parent agent context windows with raw token streams.
-
-### Decision
-Implement bounded-memory streaming telemetry and tail-based terminal parsing:
-
-1. **Incremental Stream Reader**: `_consume_progress_chunk()` consumes raw process stdout in 64 KB chunks (`STREAM_READ_CHUNK_BYTES = 64 * 1024`), cleanly handling line splits and UTF-8 multibyte boundary splits across chunks. Individual lines are capped at 1 MB (`MAX_STREAM_LINE_BYTES = 1024 * 1024`) to guard against runaway lines.
-2. **Throttled Summary Telemetry**: Instead of forwarding raw tokens, the runner parses event transitions and emits throttled stderr progress summaries (defaulting to 15s intervals via `STREAM_PROGRESS_EMIT_SECONDS`). It periodically updates `progress.json` with event counts, step indices, and token counters, filtering prompts, model text, reasoning, tool arguments, and tool outputs from progress records.
-3. **In-Loop Quiet-Period Heartbeat**: An in-loop liveness write with a 60s default interval clamped to a 5s minimum (`MIN_HEARTBEAT_SECONDS = 5.0`) updates `heartbeat.json` from the runner's poll loop to prove process liveness during long tool executions or network quiet periods, without background threads.
-4. **Tail-Based Terminal Output Reading**: Upon process completion, rather than reading the entire transcript, `read_text_tail()` inspects only the final bounded trailing bytes (`FINAL_OUTPUT_TAIL_BYTES = (2 * MAX_STREAM_LINE_BYTES) + STREAM_READ_CHUNK_BYTES` = 2.0625 MiB, roughly 2.1 MB) to extract and validate the terminal completion envelope (`event=result`, `type=result`, or Codex final status).
-
-### Why It Matters
-Bounded-memory stream parsing enforces a fixed per-line cap (`MAX_STREAM_LINE_BYTES`) and a fixed tail window (`FINAL_OUTPUT_TAIL_BYTES`), ensuring parsing memory is proportional to those fixed limits rather than to total stream size, regardless of how long the underlying model task runs or how many megabytes of raw stream data are generated. At the same time, it provides real-time liveness and progress visibility to the parent orchestrator without polluting agent context windows.
-
-### Implementation Citations
-- **Runner**: [`../scripts/provider_runner.py`](../scripts/provider_runner.py) — `_consume_progress_chunk()` (lines 1722–1764), `read_text_tail()` (lines 86–102), `refresh_progress()` (lines 1766–1803), `maybe_emit_progress()` (lines 1835–1861), `heartbeat()` (lines 1888–1919), `parse_gemini_final_output()` (lines 536–600), `parse_claude_final_output()` (lines 602–646), `parse_deepseek_final_output()` (lines 441–497), constants (lines 25–31).
-- **Policy**: [`FRAMEWORK.md`](FRAMEWORK.md) — Section "Provider lifecycle diagnostics".
+Child environments remove known API-key overrides, including empty override names that could change provider login selection, and retained artifacts are redacted. OpenAI children additionally drop inherited desktop `CODEX_*` IPC, permission and task-session variables except `CODEX_HOME`, which retains subscription authentication. Stored credentials are neither read nor changed by the adapter. This is defense in depth for same-user subprocesses, not a hard security sandbox. The installer plans mutations before writing, preserves unrelated configuration and quota bytes, and refuses malformed saved data or a conflicting reader helper.

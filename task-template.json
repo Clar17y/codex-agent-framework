@@ -1,4 +1,6 @@
 {
+  "activity": "implementation",
+  "allow_delegation": false,
   "objective": "Describe the observable outcome; for review include candidate HEAD, base revision and saved diff path.",
   "acceptance_criteria": [
     "Required behavior",
@@ -49,6 +51,7 @@
     }
   },
   "review": {
+    "author_provider": "gemini",
     "mode": "none | integrated_batch | integrated_batch_plus_correctness_gate",
     "candidate": "HEAD or commit identifier",
     "base": "Base revision when applicable",

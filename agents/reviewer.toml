@@ -1,7 +1,7 @@
 name = "reviewer"
-description = "Independent Astra-low fallback reviewer for one integrated batch when Claude Opus 5.5 is unavailable."
-model = "gpt-6-astra"
-model_reasoning_effort = "low"
+description = "Independent Sol-medium reviewer for one integrated batch when activity routing selects native review."
+model = "gpt-6.1-sol"
+model_reasoning_effort = "medium"
 sandbox_mode = "read-only"
 developer_instructions = """
 Review the integrated change like a repository owner. Do not edit files.

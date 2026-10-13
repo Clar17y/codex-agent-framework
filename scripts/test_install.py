@@ -73,7 +73,7 @@ class TestInstallFramework(unittest.TestCase):
         source_config = json.loads(source_path.read_text())
         source_config['activities']['unsupported'] = ['openai-sol']
         source_path.write_text(json.dumps(source_config))
-        with self.assertRaisesRegex(PreflightError, 'Unsupported routing activity: unsupported'):
+        with self.assertRaisesRegex(PreflightError, 'Unknown activity chain: unsupported'):
             install_framework(str(self.dest_root), source=str(self.source_root))
         self.assertFalse(self.dest_root.exists())
 
@@ -88,7 +88,7 @@ class TestInstallFramework(unittest.TestCase):
         saved['activities']['unsupported'] = ['openai-sol']
         routing_path.write_text(json.dumps(saved))
         before = (routing_path.read_bytes(), manifest_path.read_bytes(), sentinel.read_bytes())
-        with self.assertRaisesRegex(PreflightError, 'Unsupported routing activity: unsupported'):
+        with self.assertRaisesRegex(PreflightError, 'Unknown activity chain: unsupported'):
             install_framework(str(self.dest_root), source=str(self.source_root))
         self.assertEqual((routing_path.read_bytes(), manifest_path.read_bytes(), sentinel.read_bytes()), before)
 
@@ -101,7 +101,7 @@ class TestInstallFramework(unittest.TestCase):
         stable = routing_path.read_bytes()
         source_config['activities']['unsupported'] = ['openai-sol']
         source_path.write_text(json.dumps(source_config))
-        with self.assertRaisesRegex(PreflightError, 'Unsupported routing activity: unsupported'):
+        with self.assertRaisesRegex(PreflightError, 'Unknown activity chain: unsupported'):
             install_framework(str(self.dest_root), source=str(self.source_root))
         self.assertEqual(routing_path.read_bytes(), stable)
         source_config['activities'].pop('unsupported')
@@ -111,9 +111,93 @@ class TestInstallFramework(unittest.TestCase):
                 saved['activities']['planning'] = bad_chain
                 routing_path.write_text(json.dumps(saved))
                 before_bad = routing_path.read_bytes()
-                with self.assertRaisesRegex(PreflightError, 'Invalid routing activity chain: planning'):
+                message = ('references unknown or disabled profile' if bad_chain == ['absent-profile']
+                           else 'Activity planning requires a nonempty chain')
+                with self.assertRaisesRegex(PreflightError, message):
                     install_framework(str(self.dest_root), source=str(self.source_root))
                 self.assertEqual(routing_path.read_bytes(), before_bad)
+
+    def test_registry_validation_matches_dispatcher_for_source_and_saved_config(self):
+        from scripts import provider_runner as runner
+
+        source_path = self.source_root / 'routing.example.json'
+        source_base = json.loads(source_path.read_text())
+
+        def malformed(config, case):
+            if case == 'empty_profile_name':
+                config['profiles'][''] = dict(config['profiles']['openai-sol'])
+            elif case == 'blank_profile_name':
+                config['profiles'][' '] = dict(config['profiles']['openai-sol'])
+            elif case == 'unknown_activity':
+                config['activities']['unsupported'] = ['openai-sol']
+            elif case == 'empty_chain':
+                config['activities']['planning'] = []
+            elif case == 'duplicate_chain':
+                config['activities']['planning'] = ['openai-sol', 'openai-sol']
+            elif case == 'unknown_reference':
+                config['activities']['planning'] = ['absent-profile']
+            elif case == 'disabled_reference':
+                config['profiles']['openai-sol']['enabled'] = False
+                config['activities']['planning'] = ['openai-sol']
+            elif case == 'unhashable_chain_item':
+                config['activities']['planning'] = [['openai-sol']]
+            elif case == 'invalid_profile_field':
+                config['profiles']['openai-sol']['unexpected'] = True
+            elif case == 'unhashable_effort':
+                config['profiles']['openai-sol']['effort'] = ['medium']
+
+        cases = ('empty_profile_name', 'blank_profile_name', 'unknown_activity', 'empty_chain', 'duplicate_chain',
+                 'unknown_reference', 'disabled_reference', 'unhashable_chain_item',
+                 'invalid_profile_field', 'unhashable_effort')
+        for case in cases:
+            with self.subTest(source=case):
+                candidate = json.loads(json.dumps(source_base))
+                malformed(candidate, case)
+                with self.assertRaises(ValueError):
+                    runner.activity_routes(candidate, 'planning')
+                source_path.write_text(json.dumps(candidate))
+                with self.assertRaises(PreflightError):
+                    install_framework(str(self.dest_root), source=str(self.source_root))
+                self.assertFalse(self.dest_root.exists())
+
+        for field in ('profiles', 'activities'):
+            with self.subTest(source_shape=field):
+                candidate = json.loads(json.dumps(source_base))
+                candidate[field] = []
+                with self.assertRaises(ValueError):
+                    runner.activity_routes(candidate, 'planning')
+                source_path.write_text(json.dumps(candidate))
+                with self.assertRaises(PreflightError):
+                    install_framework(str(self.dest_root), source=str(self.source_root))
+                self.assertFalse(self.dest_root.exists())
+
+        source_base['profiles']['operator-extra'] = {'provider': 'openai', 'model': 'operator-model',
+                                                      'effort': 'medium'}
+        source_base['activities']['planning'] = ['operator-extra', 'gemini-flash', 'openai-sol']
+        self.assertEqual(runner.activity_routes(source_base, 'planning'),
+                         ['operator-extra', 'gemini-flash', 'openai-sol'])
+        source_path.write_text(json.dumps(source_base))
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        framework = self.dest_root / 'agent-framework'
+        routing_path = framework / 'routing.json'
+        saved_base = json.loads(routing_path.read_text())
+        self.assertEqual(runner.activity_routes(saved_base, 'planning'),
+                         ['operator-extra', 'gemini-flash', 'openai-sol'])
+        manifest = (framework / 'install-manifest.json').read_bytes()
+        readme = (framework / 'README.md').read_bytes()
+        for case in cases:
+            with self.subTest(saved=case):
+                candidate = json.loads(json.dumps(saved_base))
+                malformed(candidate, case)
+                with self.assertRaises(ValueError):
+                    runner.activity_routes(candidate, 'planning')
+                routing_path.write_text(json.dumps(candidate))
+                invalid_bytes = routing_path.read_bytes()
+                with self.assertRaises(PreflightError):
+                    install_framework(str(self.dest_root), source=str(self.source_root))
+                self.assertEqual(routing_path.read_bytes(), invalid_bytes)
+                self.assertEqual((framework / 'install-manifest.json').read_bytes(), manifest)
+                self.assertEqual((framework / 'README.md').read_bytes(), readme)
 
     def test_v12_reader_collision_and_missing_source_fail_preflight(self):
         helper = self.fake_home / '.gemini/config/agents/framework-reader.md'
@@ -155,7 +239,7 @@ class TestInstallFramework(unittest.TestCase):
     def test_custom_codex_home_reader_uses_actual_home_for_flag_env_and_upgrade(self):
         from scripts import provider_runner as runner
         helper = self.fake_home / '.gemini/config/agents/framework-reader.md'
-        custom_root = self.test_dir / 'nested' / 'profiles' / 'codex-home'
+        custom_root = self.test_dir / 'nested with spaces' / 'profiles' / 'codex-home'
         install_framework(codex_home=str(custom_root), source=str(self.source_root))
         config_path = custom_root / 'agent-framework/routing.json'
         config = json.loads(config_path.read_text())
@@ -164,7 +248,7 @@ class TestInstallFramework(unittest.TestCase):
         runner.validate_gemini_reader(config['providers']['gemini'], custom_root)
         self.assertFalse((custom_root.parent / '.gemini/config/agents/framework-reader.md').exists())
         custom_guide = custom_root / 'agent-framework/docs/FRAMEWORK.md'
-        self.assertIn(f'[FRAMEWORK.md]({custom_guide.resolve().as_posix()})',
+        self.assertIn(f'[FRAMEWORK.md](<{custom_guide.resolve().as_posix()}>)',
                       (custom_root / 'skills/route-activity/SKILL.md').read_text())
         self.assertTrue(custom_guide.is_file())
 
@@ -175,14 +259,14 @@ class TestInstallFramework(unittest.TestCase):
         migrated = json.loads(config_path.read_text())
         self.assertEqual(migrated['providers']['gemini']['reader_agent_file'], str(helper))
 
-        env_root = self.test_dir / 'another' / 'nested' / 'codex-home'
+        env_root = self.test_dir / 'another space' / 'nested' / 'codex-home'
         with mock.patch.dict(os.environ, {'CODEX_HOME': str(env_root)}):
             install_framework(source=str(self.source_root))
         env_config = json.loads((env_root / 'agent-framework/routing.json').read_text())
         self.assertEqual(env_config['providers']['gemini']['reader_agent_file'], str(helper))
         runner.validate_gemini_reader(env_config['providers']['gemini'], env_root)
         env_guide = env_root / 'agent-framework/docs/FRAMEWORK.md'
-        self.assertIn(f'[FRAMEWORK.md]({env_guide.resolve().as_posix()})',
+        self.assertIn(f'[FRAMEWORK.md](<{env_guide.resolve().as_posix()}>)',
                       (env_root / 'skills/route-activity/SKILL.md').read_text())
         self.assertTrue(env_guide.is_file())
 
@@ -249,7 +333,7 @@ class TestInstallFramework(unittest.TestCase):
         route_skill = skills_dir / 'route-activity/SKILL.md'
         self.assertTrue(route_skill.exists())
         guide = af_dir / 'docs/FRAMEWORK.md'
-        self.assertIn(f'[FRAMEWORK.md]({guide.resolve().as_posix()})', route_skill.read_text())
+        self.assertIn(f'[FRAMEWORK.md](<{guide.resolve().as_posix()}>)', route_skill.read_text())
         self.assertTrue(guide.is_file())
         simplify = skills_dir / 'simplify/SKILL.md'
         self.assertTrue(simplify.exists())

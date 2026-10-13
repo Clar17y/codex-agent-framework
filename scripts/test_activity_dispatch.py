@@ -72,6 +72,24 @@ class ActivityDispatchTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runner.activity_routes(config, "planning")
 
+    def test_registry_validator_rejects_unhashable_inputs_with_domain_errors(self):
+        for profile_change, chain in (({"provider": ["openai"]}, None),
+                                      ({"effort": ["medium"]}, None),
+                                      (None, [["openai-sol"]]),
+                                      (None, [{"profile": "openai-sol"}])):
+            config = copy.deepcopy(self.config)
+            if profile_change:
+                config["profiles"]["openai-sol"].update(profile_change)
+            if chain is not None:
+                config["activities"]["planning"] = chain
+            with self.subTest(profile_change=profile_change, chain=chain):
+                with self.assertRaises(ValueError):
+                    runner.activity_routes(config, "planning")
+        config = copy.deepcopy(self.config)
+        config["profiles"][""] = dict(config["profiles"]["openai-sol"])
+        with self.assertRaisesRegex(ValueError, "Invalid profile"):
+            runner.activity_routes(config, "implementation")
+
     def test_codex_terminal_requires_root_thread_and_complete_final_line(self):
         good = ('{"type":"thread.started","thread_id":"x"}\n'
                 '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}\n'

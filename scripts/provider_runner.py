@@ -48,37 +48,49 @@ ACTIVITY_EFFORTS = {"gemini": frozenset(("low", "medium", "high")),
                     "openai": frozenset(MUSE_EFFORTS), "muse": frozenset(MUSE_EFFORTS)}
 
 
-def activity_routes(config, activity):
-    """Validate the complete registry before selecting or launching a route."""
+def validate_activity_registry(config):
+    """Validate editable profiles and chains against the dispatcher's fixed activities."""
+    if not isinstance(config, dict):
+        raise ValueError("Routing requires providers, profiles and activities objects")
     profiles, activities = config.get("profiles"), config.get("activities")
     providers = config.get("providers")
     if not all(isinstance(x, dict) for x in (profiles, activities, providers)):
         raise ValueError("Routing requires providers, profiles and activities objects")
-    if activity not in READ_ACTIVITIES | WRITE_ACTIVITIES | {"orchestration"}:
-        raise ValueError(f"Unknown activity: {activity}")
     for name, profile in profiles.items():
-        if not isinstance(name, str) or not name or not isinstance(profile, dict):
+        if not isinstance(name, str) or not name.strip() or not isinstance(profile, dict):
             raise ValueError(f"Invalid profile: {name!r}")
         if set(profile) - {"provider", "model", "effort", "enabled"}:
             raise ValueError(f"Unknown fields in profile {name}")
-        if profile.get("provider") not in PROVIDERS or profile["provider"] not in providers:
+        provider_name = profile.get("provider")
+        if not isinstance(provider_name, str) or provider_name not in PROVIDERS or provider_name not in providers:
             raise ValueError(f"Invalid provider in profile {name}")
         if not isinstance(profile.get("model"), str) or not profile["model"].strip():
             raise ValueError(f"Invalid model in profile {name}")
-        if profile.get("effort", "medium") not in ACTIVITY_EFFORTS[profile["provider"]]:
+        effort = profile.get("effort", "medium")
+        if not isinstance(effort, str) or effort not in ACTIVITY_EFFORTS[provider_name]:
             raise ValueError(f"Invalid effort in profile {name}")
         if not isinstance(profile.get("enabled", True), bool):
             raise ValueError(f"Invalid enabled flag in profile {name}")
-        entry = providers[profile["provider"]]
+        entry = providers[provider_name]
         if not isinstance(entry, dict) or not entry.get("executable"):
             raise ValueError(f"Invalid executable for profile {name}")
     for name, chain in activities.items():
         if name not in READ_ACTIVITIES | WRITE_ACTIVITIES | {"orchestration"}:
             raise ValueError(f"Unknown activity chain: {name}")
-        if not isinstance(chain, list) or not chain or len(chain) != len(set(chain)):
+        if (not isinstance(chain, list) or not chain or
+                any(not isinstance(profile, str) or not profile for profile in chain) or
+                len(chain) != len(set(chain))):
             raise ValueError(f"Activity {name} requires a nonempty chain without duplicates")
         if any(profile not in profiles or not profiles[profile].get("enabled", True) for profile in chain):
             raise ValueError(f"Activity {name} references unknown or disabled profile")
+
+
+def activity_routes(config, activity):
+    """Validate the complete registry before selecting or launching a route."""
+    validate_activity_registry(config)
+    if not isinstance(activity, str) or activity not in READ_ACTIVITIES | WRITE_ACTIVITIES | {"orchestration"}:
+        raise ValueError(f"Unknown activity: {activity}")
+    activities = config["activities"]
     if activity not in activities:
         raise ValueError(f"Activity {activity} has no chain")
     return activities[activity]

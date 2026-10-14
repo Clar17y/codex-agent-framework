@@ -1529,14 +1529,17 @@ class ProviderTests(unittest.TestCase):
         for name in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_GIT_BASH_PATH", "CLAUDE_CONFIG_DIR",
                      "UNRELATED_SETTING"):
             self.assertEqual(claude[name], host[name])
-        # Anthropic API credentials, including the host-only overflow key, reach
-        # no vendor child; other Claude session markers only matter to Claude.
+        # Anthropic API credentials, including the host-only overflow key, and
+        # Claude host session markers reach no vendor child; the subscription
+        # token reaches only Claude children.
         for provider, env in {"claude": claude, **others}.items():
             with self.subTest(provider=provider):
-                for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY"):
+                for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                             "CLAUDE_API_KEY", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
                     self.assertNotIn(name, env)
+                self.assertEqual(env["CLAUDE_CODE_GIT_BASH_PATH"], host["CLAUDE_CODE_GIT_BASH_PATH"])
                 if provider != "claude":
-                    self.assertEqual(env["CLAUDECODE"], "1")
+                    self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
         with mock.patch.dict(os.environ, host, clear=False):
             self.assertEqual(dict(runner.framework_secrets({}))["CLAUDE_API_KEY"], "user-overflow-key")
         for provider, env in {"claude": claude, **others}.items():

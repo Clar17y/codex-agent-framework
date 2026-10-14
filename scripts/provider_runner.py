@@ -1727,7 +1727,8 @@ def framework_secrets(config):
 
 
 ANTHROPIC_SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY")
-CLAUDE_CHILD_ENV_KEEP = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_GIT_BASH_PATH"})
+CLAUDE_OAUTH_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+CLAUDE_CHILD_ENV_KEEP = frozenset({CLAUDE_OAUTH_ENV, "CLAUDE_CODE_GIT_BASH_PATH"})
 
 
 def child_environment(config, provider_name, checked_deepseek_key=None):
@@ -1751,19 +1752,20 @@ def child_environment(config, provider_name, checked_deepseek_key=None):
                 env.pop(name, None)
         for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "CODEX_BASE_URL"):
             env.pop(name, None)
-    if provider_name == "claude":
-        # A Claude Code host exports session markers (CLAUDECODE,
-        # CLAUDE_CODE_ENTRYPOINT, IDE ports and similar CLAUDE_CODE_* values)
-        # into its shell. A nested `claude -p` child must start as a fresh
-        # top-level session, so only the subscription token and Windows shell
-        # location survive. ANTHROPIC_* overrides (API keys, auth tokens, base
-        # URLs, default models, Bedrock/Vertex routing) would switch the child
-        # away from the signed-in subscription or the pinned model.
-        for name in tuple(env):
-            upper = name.upper()
-            if upper == "CLAUDECODE" or upper.startswith("ANTHROPIC_") or (
-                    upper.startswith("CLAUDE_CODE_") and upper not in CLAUDE_CHILD_ENV_KEEP):
-                env.pop(name, None)
+    # A Claude Code host exports session markers and tokens (CLAUDECODE,
+    # CLAUDE_CODE_ENTRYPOINT, IPC ports, messaging tokens and similar
+    # CLAUDE_CODE_* values) into its shell. No child needs them: a nested
+    # `claude -p` must start as a fresh top-level session, and other vendors
+    # must not read Claude credentials. Only Claude children keep the
+    # subscription token. ANTHROPIC_* overrides (API keys, auth tokens, base
+    # URLs, default models, Bedrock/Vertex routing) would switch a Claude child
+    # away from the signed-in subscription or the pinned model.
+    keep = CLAUDE_CHILD_ENV_KEEP if provider_name == "claude" else CLAUDE_CHILD_ENV_KEEP - {CLAUDE_OAUTH_ENV}
+    for name in tuple(env):
+        upper = name.upper()
+        if upper == "CLAUDECODE" or upper.startswith("ANTHROPIC_") or (
+                upper.startswith("CLAUDE_CODE_") and upper not in keep):
+            env.pop(name, None)
     providers = config.get("providers", {}) if isinstance(config, dict) else {}
     muse = providers.get("muse", {}) if isinstance(providers, dict) else {}
     if isinstance(muse, dict) and isinstance(muse.get("api_key_env"), str):
@@ -2984,6 +2986,10 @@ def execute(args):
         return dry_run_meta, 0
 
     secrets = [value.strip() for _, value in framework_secrets(config)]
+    # Claude children legitimately receive the subscription token, but it must
+    # never be persisted in any run's artifacts.
+    if os.environ.get(CLAUDE_OAUTH_ENV, "").strip():
+        secrets.append(os.environ[CLAUDE_OAUTH_ENV].strip())
     checked_deepseek_key = None
     if provider_name == "deepseek":
         ds_env = provider.get("api_key_env", "DEEPSEEK_API_KEY")

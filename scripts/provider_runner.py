@@ -1489,7 +1489,7 @@ def _sanitize_secret(text, secret):
     raw = secret.strip()
     if raw:
         res = res.replace(raw, "[REDACTED]")
-    return re.sub(r"(Bearer\s+)[^\s,'\"]+", r"\1[REDACTED]", res, flags=re.IGNORECASE)
+    return re.sub(r"(Bearer\s+)[^\s,'\"\\]+", r"\1[REDACTED]", res, flags=re.IGNORECASE)
 
 
 def _sanitize_all_secrets(text, secrets=None):
@@ -1503,7 +1503,7 @@ def _sanitize_all_secrets(text, secrets=None):
                 if len(raw) >= 4:
                     res = res.replace(s, "[REDACTED]")
                     res = res.replace(raw, "[REDACTED]")
-    res = re.sub(r"(Bearer\s+)[^\s,'\"]+", r"\1[REDACTED]", res, flags=re.IGNORECASE)
+    res = re.sub(r"(Bearer\s+)[^\s,'\"\\]+", r"\1[REDACTED]", res, flags=re.IGNORECASE)
     res = re.sub(r"\bsk-[A-Za-z0-9_-]{16,}\b", "[REDACTED]", res)
     return res
 
@@ -1514,6 +1514,11 @@ def retired_secrets(config):
     retired = config.get("retired_secret_env_vars", []) if isinstance(config, dict) else []
     if isinstance(retired, list):
         names.update(name for name in retired if isinstance(name, str))
+    # A routing file the installer has not migrated may still name a custom key.
+    providers = config.get("providers", {}) if isinstance(config, dict) else {}
+    legacy = providers.get("deepseek") if isinstance(providers, dict) else None
+    if isinstance(legacy, dict) and isinstance(legacy.get("api_key_env"), str):
+        names.add(legacy["api_key_env"])
     return [(name, os.environ[name]) for name in names if os.environ.get(name) and os.environ[name].strip()]
 
 
@@ -1618,7 +1623,7 @@ def sanitize_run_artifacts(output, secrets):
     )
     generic_pattern = re.compile(
         b"(?P<bearer>(?P<bearer_prefix>(?i:Bearer)" + whitespace +
-        b"+)(?:(?!" + whitespace + b")[^,'\"])+)|"
+        b"+)(?:(?!" + whitespace + b")[^,'\"\\\\])+)|"
         b"(?P<sk>\\bsk-[A-Za-z0-9_-]{16,}\\b)")
 
     def copy_range(source, destination, start, end):

@@ -1445,6 +1445,16 @@ class ProviderTests(unittest.TestCase):
         self.assertIn("old-account", redacted)
         self.assertIn("custom-account", redacted)
 
+    def test_unmigrated_deepseek_key_name_is_still_stripped(self):
+        config = {"providers": {"deepseek": {"api_key_env": "LEGACY_DS_KEY"}}}
+        with mock.patch.dict(os.environ, {"LEGACY_DS_KEY": "legacy-account"}, clear=False):
+            children = {name: runner.child_environment(config, name) for name in ("gemini", "claude", "muse", "openai")}
+            redacted = runner.redaction_secrets(config)
+        for provider, env in children.items():
+            with self.subTest(provider=provider):
+                self.assertNotIn("LEGACY_DS_KEY", env)
+        self.assertIn("legacy-account", redacted)
+
     def test_claude_child_drops_host_session_and_api_overrides(self):
         host = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SSE_PORT": "4321",
                 "claude_code_session_marker": "lowercase", "ANTHROPIC_API_KEY": "api-key",
@@ -1575,6 +1585,23 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn(bearer_token, redacted)
         self.assertNotIn(sk_token, redacted)
         self.assertEqual(redacted.count("[REDACTED]"), 3)
+
+    def test_bearer_redaction_keeps_jsonl_escapes_intact(self):
+        # A Codex event that quotes source code holds `\"Bearer {api_key}\"`;
+        # consuming the escaping backslash would end the JSON string early and
+        # hide the run's terminal event.
+        event = {"type": "item.completed", "item": {"type": "command_execution",
+                 "aggregated_output": 'headers={"Authorization": f"Bearer {api_key}", "Accept": "json"}'}}
+        line = json.dumps(event) + "\n"
+        text = runner._sanitize_all_secrets(line)
+        self.assertEqual(json.loads(text)["item"]["aggregated_output"],
+                         'headers={"Authorization": f"Bearer [REDACTED]", "Accept": "json"}')
+        output = self.root / "jsonl-bearer-output"
+        output.mkdir()
+        artifact = output / "stdout.log"
+        artifact.write_text(line, encoding="utf-8")
+        runner.sanitize_run_artifacts(output, [])
+        self.assertEqual(json.loads(artifact.read_text(encoding="utf-8")), json.loads(text))
 
     def test_artifact_redaction_prioritizes_complete_configured_secret(self):
         secret = "custom-part,private-" + uuid.uuid4().hex

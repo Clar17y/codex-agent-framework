@@ -1,0 +1,96 @@
+# Claude Code host files derived from the Codex package at install time.
+# Each replacement swaps one exact source line; installation fails if a
+# source edit leaves an `old` line missing or ambiguous.
+
+[agents.complex-implementer]
+tools = "Read, Grep, Glob, Bash, Write, Edit"
+model = "opus"
+
+[agents.correctness-gate]
+tools = "Read, Grep, Glob, Bash"
+model = "opus"
+description = "Independent final gate for a named correctness question in concurrency, cancellation, timeouts, security, migrations, data integrity or release-critical changes."
+
+[agents.docs-researcher]
+tools = "Read, Grep, Glob, WebFetch, WebSearch"
+model = "haiku"
+
+[agents.explorer]
+tools = "Read, Grep, Glob, Bash"
+model = "haiku"
+
+[agents.implementer]
+tools = "Read, Grep, Glob, Bash, Write, Edit"
+model = "sonnet"
+description = "Native Claude implementer for routine bounded work with explicit file ownership, used when the primary deliberately chooses a native writer (dispatcher routes unavailable or a concrete reason)."
+[[agents.implementer.replace]]
+old = "Use this role for routine implementation after the parent has checked the Gemini route and received fallback_required, or an unavailable/blocked result, or the user explicitly requests Luna. A local status check reporting cached exhaustion satisfies this requirement; do not request another provider call. Inspect partial edits and prior evidence before continuing. Never overlap with a running writer; ensure prior writers have exited. Implement only the assigned task and edit only the files you own. Preserve unrelated and user-authored changes."
+new = "The primary normally dispatches routine implementation to external providers; you are the native Claude writer it chooses when those routes are unavailable or a concrete reason favours a native worker. Inspect partial edits and prior evidence before continuing. Never overlap with a running writer; ensure prior writers have exited. Implement only the assigned task and edit only the files you own. Preserve unrelated and user-authored changes."
+[[agents.implementer.replace]]
+old = "Read applicable AGENTS.md files and follow existing architecture, style, and dependency patterns."
+new = "Read applicable CLAUDE.md and AGENTS.md files and follow existing architecture, style, and dependency patterns."
+
+[agents.planner]
+tools = "Read, Grep, Glob"
+model = "sonnet"
+[[agents.planner.replace]]
+old = "Resolve material ambiguity in the plan. Route routine bounded implementation through ask-gemini's local availability check first. An active cached quota block satisfies the route check and goes directly to native implementer (Luna medium), without contacting Gemini again. An unavailable/blocked route or explicit user selection also permits this fallback; preserve unresolved writer protections. Route well-specified contract-heavy, stateful, concurrent, or cross-cutting work to complex_implementer."
+new = "Resolve material ambiguity in the plan. For each task name the dispatcher activity (implementation, implementation_complex, implementation_long_horizon, test_design, testing, verification, documentation) rather than a provider; the routing chains choose the provider. Route well-specified contract-heavy, stateful, concurrent, or cross-cutting work to implementation_complex. Preserve unresolved writer protections."
+
+[agents.quality-gate-max]
+tools = "Read, Grep, Glob"
+model = "opus"
+
+[agents.refactor-auditor]
+tools = "Read, Grep, Glob"
+model = "sonnet"
+
+[agents.reviewer]
+tools = "Read, Grep, Glob, Bash"
+model = "opus"
+description = "Independent native reviewer for one integrated batch when a native Claude review is chosen over a dispatched independent_review."
+[[agents.reviewer.replace]]
+old = "For high-risk changes, identify concrete unresolved correctness questions and recommend a scoped Sol-high correctness_gate when useful. The primary chooses further scrutiny according to the actual risk; do not prescribe an additional gate solely from the topic."
+new = "For high-risk changes, identify concrete unresolved correctness questions and recommend a scoped correctness-gate when useful. The primary chooses further scrutiny according to the actual risk; do not prescribe an additional gate solely from the topic."
+
+[agents.security-reviewer]
+tools = "Read, Grep, Glob"
+model = "opus"
+
+[agents.test-engineer]
+tools = "Read, Grep, Glob, Bash, Write, Edit"
+model = "sonnet"
+
+[agents.verifier]
+tools = "Read, Grep, Glob, Bash, Write, Edit"
+model = "haiku"
+
+[skills.framework-simplify]
+source = "skills/simplify/SKILL.md"
+[[skills.framework-simplify.replace]]
+old = "name: simplify"
+new = "name: framework-simplify"
+[[skills.framework-simplify.replace]]
+old = "description: Simplify recently changed code through reuse, quality, and efficiency reviews, then apply behavior-preserving fixes. Use when asked to simplify, clean up, or reduce complexity in a diff or specified files."
+new = "description: Simplify recently changed code through reuse, quality, and efficiency reviews, then apply behavior-preserving fixes. Use when asked to simplify, clean up, or reduce complexity in a diff or specified files using the multi-provider framework's routing."
+[[skills.framework-simplify.replace]]
+old = "Make the selected code easier to maintain without changing its observable behavior. Honor additional focus supplied with `$simplify`, such as a directory or performance concern. A review-only request authorizes findings, not edits."
+new = "Make the selected code easier to maintain without changing its observable behavior. Honor additional focus supplied with the request, such as a directory or performance concern. A review-only request authorizes findings, not edits."
+[[skills.framework-simplify.replace]]
+old = "Before handing work over for independent review, inspect your own changes for reuse, clarity, and unnecessary work. Apply only justified simplifications within your assigned files, preserve observable behavior and others' edits, and rerun affected checks after any edits. Include a brief simplification summary (or state that none was warranted) and the resulting check evidence in your handoff. Perform this pass yourself; do not invoke the full $simplify workflow, spawn reviewers, or delegate this pass. This self-check does not replace independent review or verification selected by the primary for a concrete risk or explicitly required by the task or repository."
+new = "Before handing work over for independent review, inspect your own changes for reuse, clarity, and unnecessary work. Apply only justified simplifications within your assigned files, preserve observable behavior and others' edits, and rerun affected checks after any edits. Include a brief simplification summary (or state that none was warranted) and the resulting check evidence in your handoff. Perform this pass yourself; do not invoke the full framework-simplify workflow, spawn reviewers, or delegate this pass. This self-check does not replace independent review or verification selected by the primary for a concrete risk or explicitly required by the task or repository."
+[[skills.framework-simplify.replace]]
+old = "For this installation, read `{{CODEX_ROOT}}/agent-framework/docs/FRAMEWORK.md` and the relevant provider skills when invoking their routes. Applicable AGENTS.md rules remain authoritative."
+new = "For this installation, read `{{CLAUDE_ROOT}}/agent-framework/docs/FRAMEWORK.md` and the relevant provider skills when invoking their routes. Applicable CLAUDE.md and AGENTS.md rules remain authoritative."
+[[skills.framework-simplify.replace]]
+old = "When delegating independent review, use `ask-claude` under the framework's availability and fallback policy. Use `refactor_auditor` for a separate reuse or efficiency question only when it adds meaningful confidence. Additional roles are conditional, not a mandatory sequence. Store required contracts, saved diffs and provider output in the active workspace's `.llm-output/`."
+new = "When delegating independent review, dispatch the `independent_review` activity with `review.author_provider` set to the author so another vendor reviews it. Use the `refactor_audit` activity (or the native `refactor-auditor` role) for a separate reuse or efficiency question only when it adds meaningful confidence. Additional roles are conditional, not a mandatory sequence. Store required contracts, saved diffs and provider output in the active workspace's `.llm-output/`."
+[[skills.framework-simplify.replace]]
+old = "Small, well-understood repairs may be completed directly with focused checks. For delegated routine repairs, use `ask-gemini`'s local availability check first and follow its configured fallback chain. Preserve partial work and ensure the previous writer has stopped. Use the framework's complex implementation role when warranted. Assign explicit file ownership for the whole related repair batch, acceptance criteria, and checks; tell writers they share the codebase and must preserve others' edits. Do not authorize recursive delegation."
+new = "Small, well-understood repairs may be completed directly with focused checks. For delegated routine repairs, dispatch the `implementation` activity and let its chain choose the provider. Preserve partial work and ensure the previous writer has stopped. Use the `implementation_complex` activity when warranted. Assign explicit file ownership for the whole related repair batch, acceptance criteria, and checks; tell writers they share the codebase and must preserve others' edits. Do not authorize recursive delegation."
+[[skills.framework-simplify.replace]]
+old = "For repairs after review, check the original finding, repair delta and affected invariants. Do not restart the full review/verification sequence after each edit. Follow the central [review and handoff discipline]({{CODEX_ROOT}}/agent-framework/GLOBAL_POLICY.md#review-and-handoff-discipline) for the second-related-defect consolidation trigger and stable-candidate validation sequence; never use cycle reduction to waive a real defect or required check. Finish when the assigned checks and chosen self-review or integrated review are complete and no uncertainty remains. When no changes are warranted, avoid manufacturing edits or unnecessary test runs."
+new = "For repairs after review, check the original finding, repair delta and affected invariants. Do not restart the full review/verification sequence after each edit. Follow the central review and verification rules in the framework block of `{{CLAUDE_ROOT}}/CLAUDE.md` for the second-related-defect consolidation trigger and stable-candidate validation sequence; never use cycle reduction to waive a real defect or required check. Finish when the assigned checks and chosen self-review or integrated review are complete and no uncertainty remains. When no changes are warranted, avoid manufacturing edits or unnecessary test runs."
+[[skills.framework-simplify.replace]]
+old = "Workflow inspiration: [the linked simplify.ts](https://github.com/emanuelcasco/claude-code/blob/main/src/skills/bundled/simplify.ts). This skill adapts that review-and-repair approach to Codex and the installed provider routing framework."
+new = "Workflow inspiration: [the linked simplify.ts](https://github.com/emanuelcasco/claude-code/blob/main/src/skills/bundled/simplify.ts). This skill adapts that review-and-repair approach to a Claude Code primary and the installed provider routing framework."

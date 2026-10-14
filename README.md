@@ -24,7 +24,7 @@ This is local process, cache and claim coordination on one machine. CLI permissi
 
 ## Claude Code host
 
-`python install.py --host claude` installs the same dispatcher for a Claude Code primary: policy in `~/.claude/CLAUDE.md`, native roles in `~/.claude/agents/`, skills (including `ask-codex`) in `~/.claude/skills/`, and Claude-specific default chains from [claude/routing.example.json](claude/routing.example.json). It is separate from a Codex install and keeps its own state. See [CLAUDE_HOST.md](docs/CLAUDE_HOST.md).
+`python install.py --host claude` installs the same dispatcher for a Claude Code primary: policy in `~/.claude/CLAUDE.md`, native roles in `~/.claude/agents/`, skills (including `ask-codex`) in `~/.claude/skills/`, and Claude-specific default chains from [claude/routing.overlay.json](claude/routing.overlay.json). It is separate from a Codex install and keeps its own state. See [CLAUDE_HOST.md](docs/CLAUDE_HOST.md).
 
 ## Setup and operation
 

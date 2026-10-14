@@ -1,0 +1,99 @@
+{
+  "activities": {
+    "orchestration": [
+      "claude-opus",
+      "muse-full",
+      "openai-sol",
+      "gemini-flash"
+    ],
+    "planning": [
+      "claude-opus",
+      "muse-full",
+      "openai-sol",
+      "gemini-flash-high"
+    ],
+    "exploration": [
+      "gemini-flash",
+      "muse-wonder",
+      "claude-haiku",
+      "openai-luna"
+    ],
+    "implementation": [
+      "gemini-flash",
+      "muse-wonder",
+      "claude-sonnet",
+      "openai-luna"
+    ],
+    "implementation_complex": [
+      "muse-full",
+      "claude-opus",
+      "openai-sol-high",
+      "claude-sonnet-high",
+      "gemini-flash-high"
+    ],
+    "implementation_long_horizon": [
+      "muse-full",
+      "claude-opus",
+      "openai-sol-high",
+      "claude-sonnet-high",
+      "gemini-flash-high"
+    ],
+    "test_design": [
+      "muse-full",
+      "claude-sonnet",
+      "openai-sol",
+      "gemini-flash-high"
+    ],
+    "testing": [
+      "gemini-flash",
+      "muse-wonder",
+      "claude-sonnet",
+      "openai-luna"
+    ],
+    "verification": [
+      "gemini-flash",
+      "muse-wonder",
+      "claude-haiku",
+      "openai-luna"
+    ],
+    "independent_review": [
+      "openai-sol",
+      "muse-full",
+      "claude-opus",
+      "gemini-flash-high",
+      "claude-sonnet",
+      "muse-wonder"
+    ],
+    "security_review": [
+      "openai-sol-high",
+      "claude-opus-high",
+      "muse-full-high",
+      "gemini-flash-high"
+    ],
+    "refactor_audit": [
+      "gemini-flash",
+      "muse-wonder",
+      "openai-luna",
+      "claude-sonnet"
+    ],
+    "documentation": [
+      "gemini-flash",
+      "muse-wonder",
+      "claude-haiku",
+      "openai-luna"
+    ],
+    "docs_research": [
+      "gemini-flash",
+      "claude-haiku",
+      "muse-wonder",
+      "openai-luna"
+    ],
+    "deep_review": [
+      "claude-opus-high",
+      "openai-astra",
+      "muse-full-high",
+      "openai-sol-high",
+      "gemini-flash-high"
+    ]
+  }
+}

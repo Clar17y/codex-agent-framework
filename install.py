@@ -25,23 +25,33 @@ ROLE_FILES = (
     'reviewer', 'security-reviewer', 'test-engineer', 'verifier',
 )
 
-CLAUDE_SKILLS = ('route-activity', 'ask-codex', 'ask-gemini', 'ask-muse', 'framework-simplify')
+# Claude skills authored for Claude Code; framework-simplify is derived from
+# skills/simplify through claude/derived.toml.
+CLAUDE_SKILLS = ('route-activity', 'ask-codex', 'ask-gemini', 'ask-muse')
 SHARED_SKILLS = ('jev-search', 'jev-review')
 # Both resolve to the install root; Codex-authored files use the first.
 ROOT_PLACEHOLDERS = ('{{CODEX_ROOT}}', '{{CLAUDE_ROOT}}')
 MANIFEST = 'agent-framework/install-manifest.json'
+ROUTING_EXAMPLE = 'routing.example.json'
 HOSTS = {
     # Codex keeps its historical layout and behaviour byte for byte.
     'codex': {'label': 'Codex', 'env': 'CODEX_HOME', 'default_dir': '.codex',
               'policy': 'GLOBAL_POLICY.md', 'instructions': 'AGENTS.md',
-              'markers': (BEGIN_MARKER, END_MARKER, 'CODEX'), 'routing_example': 'routing.example.json',
+              'markers': (BEGIN_MARKER, END_MARKER, 'CODEX'), 'routing_overlay': None, 'derived': None,
+              'sources': (), 'protect_user_files': False,
               'restart': 'Start a new Codex task to discover the installed roles and skills.'},
     # Claude Code reads ~/.claude/CLAUDE.md, ~/.claude/agents/*.md and
     # ~/.claude/skills/<name>/SKILL.md (CLAUDE_CONFIG_DIR relocates them).
+    # Its routing replaces only the top-level keys in its overlay, and its
+    # roles and simplify skill are rendered from the Codex sources.
     'claude': {'label': 'Claude', 'env': 'CLAUDE_CONFIG_DIR', 'default_dir': '.claude',
                'policy': 'claude/CLAUDE_POLICY.md', 'instructions': 'CLAUDE.md',
                'markers': (CLAUDE_BEGIN_MARKER, CLAUDE_END_MARKER, 'CLAUDE'),
-               'routing_example': 'claude/routing.example.json',
+               'routing_overlay': 'claude/routing.overlay.json', 'derived': 'claude/derived.toml',
+               'sources': ('claude/CLAUDE_POLICY.md', 'claude/routing.overlay.json', 'claude/derived.toml',
+                           *(f'claude/skills/{name}/SKILL.md' for name in CLAUDE_SKILLS)),
+               # Users keep personal agents and skills beside ours.
+               'protect_user_files': True,
                'restart': 'Start a new Claude Code session to discover the installed roles and skills.'},
 }
 
@@ -123,10 +133,7 @@ def collect_sources(source, host='codex'):
     # Optional maintained templates, never recursive installation of state or logs.
     names += [p.relative_to(source).as_posix() for p in (source / 'docs').glob('*')
               if p.suffix in ('.md', '.json')]
-    if host == 'claude':
-        names += [HOSTS[host]['policy'], HOSTS[host]['routing_example']]
-        names += [f'claude/agents/{name}.md' for name in ROLE_FILES]
-        names += [f'claude/skills/{name}/SKILL.md' for name in CLAUDE_SKILLS]
+    names += HOSTS[host]['sources']
     files = sorted(set(names))
     for name in files:
         path = source / name
@@ -179,28 +186,41 @@ def merge_muse_profiles(entry, source_defaults):
             profile.setdefault(key, copy.deepcopy(value))
 
 
+def load_routing_example(source, overlay=None):
+    """Package routing defaults; a host overlay replaces whole top-level keys."""
+    data = {}
+    for name in (ROUTING_EXAMPLE, overlay):
+        if name is None:
+            continue
+        path = source / name
+        try:
+            layer = json.loads(path.read_text(encoding='utf-8-sig'))
+        except (ValueError, UnicodeError, OSError) as exc:
+            raise PreflightError(f'Invalid source routing file {path}: {exc}. Repair it or use --refresh-routing to restore package defaults.') from exc
+        if not isinstance(layer, dict):
+            raise PreflightError(f'Source routing file {path} must contain a JSON object.')
+        data.update(layer)
+    if not isinstance(data.get('providers'), dict):
+        raise PreflightError(f'Source routing file {source / ROUTING_EXAMPLE} must contain a providers object.')
+    return data
+
+
 def resolve_routing(source, root, gemini_override=None, claude_override=None, refresh_routing=False, muse_override=None,
-                    routing_example='routing.example.json'):
+                    routing_overlay=None):
     target = root / 'agent-framework/routing.json'
     preserving = target.exists() and not refresh_routing
-    config_path = target if preserving else source / routing_example
-    try:
-        config = json.loads(config_path.read_text(encoding='utf-8-sig'))
-    except (ValueError, UnicodeError) as exc:
-        raise PreflightError(f'Invalid routing file {config_path}: {exc}. Repair it or use --refresh-routing to restore package defaults.') from exc
+    example = load_routing_example(source, routing_overlay)
+    if preserving:
+        try:
+            config = json.loads(target.read_text(encoding='utf-8-sig'))
+        except (ValueError, UnicodeError) as exc:
+            raise PreflightError(f'Invalid routing file {target}: {exc}. Repair it or use --refresh-routing to restore package defaults.') from exc
+    else:
+        config = copy.deepcopy(example)
     if not isinstance(config, dict) or not isinstance(config.get('providers'), dict):
         raise PreflightError('Routing configuration must contain a providers object.')
 
-    source_defaults = {}
-    if preserving:
-        source_example_path = source / routing_example
-        try:
-            source_example = json.loads(source_example_path.read_text(encoding='utf-8-sig'))
-        except (ValueError, UnicodeError, OSError) as exc:
-            raise PreflightError(f'Invalid source routing file {source_example_path}: {exc}. Repair it or use --refresh-routing to restore package defaults.') from exc
-        if not isinstance(source_example, dict) or not isinstance(source_example.get('providers'), dict):
-            raise PreflightError(f'Source routing file {source_example_path} must contain a providers object.')
-        source_defaults = source_example['providers']
+    source_defaults = example['providers'] if preserving else {}
 
     target_version = config.get('version', 1) if preserving else 12
     if isinstance(target_version, bool) or not isinstance(target_version, int):
@@ -324,9 +344,8 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
         config['version'] = 12
     # v12 adds editable activity chains. Retain explicit operator choices and
     # carry forward legacy provider pin customizations into the routine profile.
-    defaults = json.loads((source / routing_example).read_text(encoding='utf-8-sig'))
-    default_profiles = defaults.get('profiles', {})
-    default_activities = defaults.get('activities', {})
+    default_profiles = example.get('profiles', {})
+    default_activities = example.get('activities', {})
     if not isinstance(default_profiles, dict) or not isinstance(default_activities, dict):
         raise PreflightError('Source routing profiles and activities must be objects.')
     profiles = config.setdefault('profiles', {})
@@ -358,7 +377,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
     except ValueError as exc:
         raise PreflightError(str(exc)) from exc
     # Merge capability defaults without overwriting saved operator choices.
-    defaults = source_example if preserving else config
+    defaults = example
     capabilities = config.setdefault('capabilities', {})
     if not isinstance(capabilities, dict):
         raise PreflightError('Routing capabilities must be an object.')
@@ -413,11 +432,41 @@ def reader_owner_roots(root):
     return list(dict.fromkeys([root, *(host_root(settings).resolve() for settings in HOSTS.values())]))
 
 
+def replace_lines(text, replacements, label):
+    """Swap exact whole lines; a missing or ambiguous line means the source drifted."""
+    lines = text.split('\n')
+    for item in replacements:
+        matches = [i for i, line in enumerate(lines) if line == item['old']]
+        if len(matches) != 1:
+            raise PreflightError(f'{label}: a derived replacement no longer matches exactly one source line '
+                                 f'({len(matches)} matches): {item["old"][:80]!r}')
+        lines[matches[0]] = item['new']
+    return '\n'.join(lines)
+
+
+def derived_files(source, root, spec_name):
+    """Host files rendered from Codex roles and skills plus exact line replacements."""
+    import tomllib  # Python 3.11+, checked before planning.
+    try:
+        spec = tomllib.loads((source / spec_name).read_text(encoding='utf-8'))
+        files = []
+        for role, agent in spec['agents'].items():
+            data = tomllib.loads((source / f'agents/{role}.toml').read_text(encoding='utf-8'))
+            body = replace_lines(data['developer_instructions'].strip(), agent.get('replace', []), f'agents/{role}.toml')
+            files.append((root / 'agents' / f'{role}.md',
+                          f"---\nname: {role}\ndescription: {agent.get('description', data['description'])}\n"
+                          f"tools: {agent['tools']}\nmodel: {agent['model']}\n---\n\n{body}\n"))
+        for name, skill in spec['skills'].items():
+            text = (source / skill['source']).read_text(encoding='utf-8-sig')
+            files.append((root / 'skills' / name / 'SKILL.md', replace_lines(text, skill['replace'], skill['source'])))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise PreflightError(f'Invalid derived host files {source / spec_name}: {exc!r}') from exc
+    return files
+
+
 def host_target(host, root, name):
     """Map a source path to its installed location for the selected host."""
     if host == 'claude':
-        if name.startswith('claude/agents/'):
-            return root / 'agents' / Path(name).name
         if name.startswith('claude/skills/'):
             return root / name[len('claude/'):]
         if name.startswith('skills/') and name.split('/')[1] in SHARED_SKILLS:
@@ -431,13 +480,15 @@ def host_target(host, root, name):
 def build_plan(source, root, gemini_override=None, claude_override=None, refresh_routing=False, muse_override=None,
                host='codex'):
     settings = HOSTS[host]
-    files = collect_sources(source, host)
+    entries = [(name, host_target(host, root, name), (source / name).read_bytes())
+               for name in collect_sources(source, host)]
+    if settings['derived']:
+        entries += [(settings['derived'], target, content.encode('utf-8'))
+                    for target, content in derived_files(source, root, settings['derived'])]
     plan = {}
     hashes = manifest_hashes(root)
-    for name in files:
-        target = host_target(host, root, name)
+    for name, target, content in entries:
         check_path(target)
-        content = (source / name).read_bytes()
         if name == settings['policy'] or target.is_relative_to(root / 'skills'):
             # Shared skills are written for the Codex layout; both hosts install
             # the framework itself under <root>/agent-framework.
@@ -446,9 +497,10 @@ def build_plan(source, root, gemini_override=None, claude_override=None, refresh
                 text = text.replace(placeholder, root.as_posix())
             content = text.encode('utf-8')
         plan[target] = content
-        # Claude users keep personal agents and skills beside ours. Replace only
-        # files this installer wrote before, never an unowned name collision.
-        if (host == 'claude' and (target.is_relative_to(root / 'agents') or target.is_relative_to(root / 'skills'))
+        # Replace only files this installer wrote before, never an unowned
+        # name collision with a user's own agent or skill.
+        if (settings['protect_user_files'] and
+                (target.is_relative_to(root / 'agents') or target.is_relative_to(root / 'skills'))
                 and target.exists()):
             existing = target.read_bytes()
             if existing != content and not owned(hashes, target, existing):
@@ -468,7 +520,7 @@ def build_plan(source, root, gemini_override=None, claude_override=None, refresh
         claude_override=claude_override,
         muse_override=muse_override,
         refresh_routing=refresh_routing,
-        routing_example=settings['routing_example'],
+        routing_overlay=settings['routing_overlay'],
     )
     plan[routing] = (json.dumps(data, indent=2) + '\n').encode('utf-8')
     # Antigravity discovers reader agents in its own global config directory.

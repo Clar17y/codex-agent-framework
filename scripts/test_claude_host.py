@@ -18,13 +18,16 @@ from install import (  # noqa: E402
     CLAUDE_BEGIN_MARKER,
     CLAUDE_END_MARKER,
     CLAUDE_SKILLS,
+    HOSTS,
     PreflightError,
     ROLE_FILES,
     SHARED_SKILLS,
     install_framework,
+    load_routing_example,
     main,
 )
 from scripts.provider_runner import activity_routes  # noqa: E402
+from scripts.test_install import copy_source_package  # noqa: E402
 
 SCRATCH_BASE = REPO_ROOT / ".llm-output" / "scratch_test_claude_host"
 FRONTMATTER = re.compile(r"\A---\nname: ([a-z-]+)\ndescription: (.+)\ntools: (.+)\nmodel: (haiku|sonnet|opus)\n---\n\n\S")
@@ -43,11 +46,7 @@ class ClaudeHostInstallTests(unittest.TestCase):
         self.addCleanup(home_patch.stop)
         self.root = self.test_dir / "claude_home"
         self.source = self.test_dir / "source"
-        self.source.mkdir()
-        for name in ("install.py", "GLOBAL_POLICY.md", "README.md", "routing.example.json", "task-template.json"):
-            shutil.copy2(REPO_ROOT / name, self.source / name)
-        for name in ("agents", "skills", "scripts", "docs", "claude"):
-            shutil.copytree(REPO_ROOT / name, self.source / name, ignore=shutil.ignore_patterns("__pycache__"))
+        copy_source_package(self.source, extra_dirs=("claude",))
 
     def install(self, **kwargs):
         with mock.patch("builtins.print"):
@@ -74,7 +73,7 @@ class ClaudeHostInstallTests(unittest.TestCase):
                 self.assertNotIn("Write", match.group(3), name)
                 self.assertNotIn("Edit", match.group(3), name)
         self.assertEqual(sorted(p.name for p in (self.root / "skills").iterdir()),
-                         sorted((*CLAUDE_SKILLS, *SHARED_SKILLS)))
+                         sorted((*CLAUDE_SKILLS, "framework-simplify", *SHARED_SKILLS)))
         for path in self.installed_text_files():
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("{{", text, path)
@@ -87,8 +86,15 @@ class ClaudeHostInstallTests(unittest.TestCase):
         self.assertTrue((self.root / "agent-framework/docs/CLAUDE_HOST.md").is_file())
         self.assertTrue((self.fake_home / ".gemini/config/agents/framework-reader.md").is_file())
         routing = json.loads((self.root / "agent-framework/routing.json").read_text(encoding="utf-8"))
-        example = json.loads((REPO_ROOT / "claude/routing.example.json").read_text(encoding="utf-8"))
+        example = load_routing_example(REPO_ROOT, HOSTS["claude"]["routing_overlay"])
         self.assertEqual(routing["activities"], example["activities"])
+        self.assertNotEqual(routing["activities"], load_routing_example(REPO_ROOT)["activities"])
+        simplify = (self.root / "skills/framework-simplify/SKILL.md").read_text(encoding="utf-8")
+        self.assertTrue(simplify.startswith("---\nname: framework-simplify\n"))
+        self.assertIn(f"{root}/agent-framework/docs/FRAMEWORK.md", simplify)
+        implementer = (self.root / "agents/implementer.md").read_text(encoding="utf-8")
+        self.assertIn("native Claude writer", implementer)
+        self.assertNotIn("Luna", implementer)
 
     def test_existing_instructions_are_preserved_and_reinstall_is_idempotent(self):
         self.root.mkdir()
@@ -115,8 +121,10 @@ class ClaudeHostInstallTests(unittest.TestCase):
 
     def test_owned_files_upgrade_but_operator_edits_are_protected(self):
         self.install()
-        source_role = self.source / "claude/agents/explorer.md"
-        source_role.write_text(source_role.read_text(encoding="utf-8") + "Upgrade marker.\n", encoding="utf-8")
+        source_role = self.source / "agents/explorer.toml"
+        last = "Do not spawn subagents unless the parent explicitly authorizes it.\n"
+        source_role.write_text(source_role.read_text(encoding="utf-8").replace(last, last + "Upgrade marker.\n"),
+                               encoding="utf-8")
         self.install()
         installed = self.root / "agents/explorer.md"
         self.assertTrue(installed.read_text(encoding="utf-8").endswith("Upgrade marker.\n"))
@@ -126,6 +134,18 @@ class ClaudeHostInstallTests(unittest.TestCase):
             self.install()
         self.assertEqual(installed.read_text(encoding="utf-8"), "operator edit")
         self.assertEqual((self.root / "agent-framework/install-manifest.json").read_bytes(), before)
+
+    def test_drifted_source_line_stops_before_writing(self):
+        # implementer's replacement targets an exact Codex line; editing that
+        # line must fail loudly instead of installing a half-adapted role.
+        source_role = self.source / "agents/implementer.toml"
+        text = source_role.read_text(encoding="utf-8")
+        old = "Read applicable AGENTS.md files and follow existing architecture, style, and dependency patterns."
+        self.assertIn(old, text)
+        source_role.write_text(text.replace(old, old + " Reworded."), encoding="utf-8")
+        with self.assertRaisesRegex(PreflightError, "agents/implementer.toml.*0 matches"):
+            self.install()
+        self.assertFalse(self.root.exists())
 
     def test_routing_edits_survive_reinstall(self):
         self.install()
@@ -186,14 +206,15 @@ class ClaudeHostInstallTests(unittest.TestCase):
 
 
 class ClaudeRoutingDefaultsTests(unittest.TestCase):
-    def setUp(self):
-        self.config = json.loads((REPO_ROOT / "claude/routing.example.json").read_text(encoding="utf-8"))
-        self.codex = json.loads((REPO_ROOT / "routing.example.json").read_text(encoding="utf-8"))
+    @classmethod
+    def setUpClass(cls):
+        overlay = HOSTS["claude"]["routing_overlay"]
+        cls.overlay = json.loads((REPO_ROOT / overlay).read_text(encoding="utf-8"))
+        cls.config = load_routing_example(REPO_ROOT, overlay)
+        cls.codex = load_routing_example(REPO_ROOT)
 
-    def test_only_activity_chains_differ_from_codex_defaults(self):
-        for key in set(self.config) | set(self.codex):
-            if key != "activities":
-                self.assertEqual(self.config.get(key), self.codex.get(key), key)
+    def test_overlay_only_reorders_activity_chains(self):
+        self.assertEqual(set(self.overlay), {"activities"})
         self.assertEqual(set(self.config["activities"]), set(self.codex["activities"]))
 
     def test_every_chain_is_valid_and_spans_all_providers(self):

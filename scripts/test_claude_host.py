@@ -25,6 +25,7 @@ from install import (  # noqa: E402
     install_framework,
     load_routing_example,
     main,
+    replace_lines,
 )
 from scripts.provider_runner import activity_routes  # noqa: E402
 from scripts.test_install import copy_source_package  # noqa: E402
@@ -107,7 +108,7 @@ class ClaudeHostInstallTests(unittest.TestCase):
         self.assertEqual((self.root / "CLAUDE.md").read_bytes(), first)
 
     def test_unowned_agent_or_skill_collision_stops_before_writing(self):
-        for relative in ("agents/explorer.md", "skills/ask-codex/SKILL.md"):
+        for relative in ("agents/explorer.md", "skills/ask-codex/SKILL.md", "skills/framework-simplify/SKILL.md"):
             with self.subTest(relative=relative):
                 shutil.rmtree(self.root, ignore_errors=True)
                 target = self.root / relative
@@ -146,6 +147,20 @@ class ClaudeHostInstallTests(unittest.TestCase):
         with self.assertRaisesRegex(PreflightError, "agents/implementer.toml.*0 matches"):
             self.install()
         self.assertFalse(self.root.exists())
+
+    def test_ambiguous_replacement_line_is_rejected(self):
+        with self.assertRaisesRegex(PreflightError, "source.md.*2 matches"):
+            replace_lines("same\nother\nsame", [{"old": "same", "new": "x"}], "source.md")
+        self.assertEqual(replace_lines("a\nb", [{"old": "b", "new": "c"}], "source.md"), "a\nc")
+
+    def test_malformed_routing_overlay_stops_before_writing(self):
+        overlay = self.source / HOSTS["claude"]["routing_overlay"]
+        for broken in ("{not json", "[]"):
+            with self.subTest(overlay=broken):
+                overlay.write_text(broken, encoding="utf-8")
+                with self.assertRaisesRegex(PreflightError, "routing.overlay.json"):
+                    self.install()
+                self.assertFalse(self.root.exists())
 
     def test_routing_edits_survive_reinstall(self):
         self.install()

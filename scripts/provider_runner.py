@@ -1718,15 +1718,26 @@ def muse_secrets(config):
 def framework_secrets(config):
     """Credentials used by framework helpers, never by execution-provider children."""
     secrets = dict(deepseek_secrets(config) + muse_secrets(config))
-    if os.environ.get("TYPESAFE_API_KEY", "").strip():
-        secrets["TYPESAFE_API_KEY"] = os.environ["TYPESAFE_API_KEY"]
+    # Anthropic API credentials (including a host-only overflow key) belong to
+    # the Claude host, never to subscription CLI children of any vendor.
+    for name in ("TYPESAFE_API_KEY", *ANTHROPIC_SECRET_ENV):
+        if os.environ.get(name, "").strip():
+            secrets[name] = os.environ[name]
     return list(secrets.items())
+
+
+ANTHROPIC_SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY")
+CLAUDE_CHILD_ENV_KEEP = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_GIT_BASH_PATH"})
 
 
 def child_environment(config, provider_name, checked_deepseek_key=None):
     """Keep helper credentials out of external execution-provider environments."""
     env = dict(os.environ)
     env.pop("FRAMEWORK_PARENT_RUN_ID", None)
+    # Host instruction files (for example ~/.claude/CLAUDE.md) can reach a
+    # child CLI. This marker tells host policy that the process is a bounded
+    # worker, not the primary orchestrator; orchestration launches override it.
+    env["FRAMEWORK_DISPATCHED_WORKER"] = "1"
     env.pop("TYPESAFE_API_KEY", None)
     for name in ("META_API_KEY", "MUSE_API_KEY", "META_MODEL_API_KEY"):
         env.pop(name, None)
@@ -1740,6 +1751,19 @@ def child_environment(config, provider_name, checked_deepseek_key=None):
                 env.pop(name, None)
         for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "CODEX_BASE_URL"):
             env.pop(name, None)
+    if provider_name == "claude":
+        # A Claude Code host exports session markers (CLAUDECODE,
+        # CLAUDE_CODE_ENTRYPOINT, IDE ports and similar CLAUDE_CODE_* values)
+        # into its shell. A nested `claude -p` child must start as a fresh
+        # top-level session, so only the subscription token and Windows shell
+        # location survive. ANTHROPIC_* overrides (API keys, auth tokens, base
+        # URLs, default models, Bedrock/Vertex routing) would switch the child
+        # away from the signed-in subscription or the pinned model.
+        for name in tuple(env):
+            upper = name.upper()
+            if upper == "CLAUDECODE" or upper.startswith("ANTHROPIC_") or (
+                    upper.startswith("CLAUDE_CODE_") and upper not in CLAUDE_CHILD_ENV_KEEP):
+                env.pop(name, None)
     providers = config.get("providers", {}) if isinstance(config, dict) else {}
     muse = providers.get("muse", {}) if isinstance(providers, dict) else {}
     if isinstance(muse, dict) and isinstance(muse.get("api_key_env"), str):
@@ -3142,6 +3166,7 @@ def execute(args):
                     child_env = child_environment(config, provider_name, checked_deepseek_key)
                     if orchestration_id:
                         child_env["FRAMEWORK_PARENT_RUN_ID"] = orchestration_id
+                        child_env["FRAMEWORK_DISPATCHED_WORKER"] = "orchestration"
                     process = subprocess.Popen(command, cwd=workspace, shell=False, stdin=subprocess.DEVNULL,
                                                stdout=stdout, stderr=stderr, env=child_env,
                                                start_new_session=os.name != "nt")

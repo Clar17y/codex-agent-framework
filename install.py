@@ -17,11 +17,30 @@ from scripts.provider_runner import validate_activity_registry
 
 BEGIN_MARKER = '<!-- BEGIN CODEX MULTI-PROVIDER FRAMEWORK -->'
 END_MARKER = '<!-- END CODEX MULTI-PROVIDER FRAMEWORK -->'
+CLAUDE_BEGIN_MARKER = '<!-- BEGIN CLAUDE MULTI-PROVIDER FRAMEWORK -->'
+CLAUDE_END_MARKER = '<!-- END CLAUDE MULTI-PROVIDER FRAMEWORK -->'
 ROLE_FILES = (
     'complex-implementer', 'correctness-gate', 'docs-researcher', 'explorer',
     'implementer', 'planner', 'quality-gate-max', 'refactor-auditor',
     'reviewer', 'security-reviewer', 'test-engineer', 'verifier',
 )
+
+CLAUDE_SKILLS = ('route-activity', 'ask-codex', 'ask-gemini', 'ask-muse', 'framework-simplify')
+SHARED_SKILLS = ('jev-search', 'jev-review')
+HOSTS = {
+    # Codex keeps its historical layout and behaviour byte for byte.
+    'codex': {'label': 'Codex', 'env': 'CODEX_HOME', 'default_dir': '.codex',
+              'policy': 'GLOBAL_POLICY.md', 'placeholder': '{{CODEX_ROOT}}', 'instructions': 'AGENTS.md',
+              'markers': (BEGIN_MARKER, END_MARKER, 'CODEX'), 'routing_example': 'routing.example.json',
+              'restart': 'Start a new Codex task to discover the installed roles and skills.'},
+    # Claude Code reads ~/.claude/CLAUDE.md, ~/.claude/agents/*.md and
+    # ~/.claude/skills/<name>/SKILL.md (CLAUDE_CONFIG_DIR relocates them).
+    'claude': {'label': 'Claude', 'env': 'CLAUDE_CONFIG_DIR', 'default_dir': '.claude',
+               'policy': 'claude/CLAUDE_POLICY.md', 'placeholder': '{{CLAUDE_ROOT}}', 'instructions': 'CLAUDE.md',
+               'markers': (CLAUDE_BEGIN_MARKER, CLAUDE_END_MARKER, 'CLAUDE'),
+               'routing_example': 'claude/routing.example.json',
+               'restart': 'Start a new Claude Code session to discover the installed roles and skills.'},
+}
 
 
 class InstallError(Exception):
@@ -60,11 +79,12 @@ def read_text(path):
         raise PreflightError(f'Expected UTF-8 text in {path}: {exc}') from exc
 
 
-def validate_agents_markers(agents_path):
+def validate_agents_markers(agents_path, markers=(BEGIN_MARKER, END_MARKER, 'CODEX')):
+    begin_marker, end_marker, tag = markers
     content = read_text(agents_path) if agents_path.exists() else ''
-    begins = list(re.finditer(re.escape(BEGIN_MARKER), content))
-    ends = list(re.finditer(re.escape(END_MARKER), content))
-    marker_comments = re.findall(r'<!--[ \t]*(?:BEGIN|END)[ \t]+CODEX MULTI-PROVIDER FRAMEWORK', content, re.I)
+    begins = list(re.finditer(re.escape(begin_marker), content))
+    ends = list(re.finditer(re.escape(end_marker), content))
+    marker_comments = re.findall(r'<!--[ \t]*(?:BEGIN|END)[ \t]+' + tag + r' MULTI-PROVIDER FRAMEWORK', content, re.I)
     if len(begins) != len(ends) or len(begins) > 1 or len(marker_comments) != len(begins) + len(ends):
         raise PreflightError(f'Ambiguous or malformed policy markers: {agents_path}')
     if not begins:
@@ -74,17 +94,17 @@ def validate_agents_markers(agents_path):
     return begins[0].start(), ends[0].end()
 
 
-def generate_agents_content(path, policy):
+def generate_agents_content(path, policy, markers=(BEGIN_MARKER, END_MARKER, 'CODEX')):
     content = read_text(path) if path.exists() else ''
-    start, end = validate_agents_markers(path)
-    block = f'{BEGIN_MARKER}\n{policy.rstrip()}\n{END_MARKER}'
+    start, end = validate_agents_markers(path, markers)
+    block = f'{markers[0]}\n{policy.rstrip()}\n{markers[1]}'
     if start is not None:
         return content[:start] + block + content[end:]
     separator = '\n\n' if content and not content.endswith('\n\n') else ''
     return content + separator + block + '\n'
 
 
-def collect_sources(source):
+def collect_sources(source, host='codex'):
     """Explicit core files make incomplete source packages fail before mutation."""
     names = ['GLOBAL_POLICY.md', 'task-template.json', 'README.md',
              'routing.example.json', 'install.py', 'scripts/provider_runner.py',
@@ -100,6 +120,10 @@ def collect_sources(source):
     # Optional maintained templates, never recursive installation of state or logs.
     names += [p.relative_to(source).as_posix() for p in (source / 'docs').glob('*')
               if p.suffix in ('.md', '.json')]
+    if host == 'claude':
+        names += ['claude/CLAUDE_POLICY.md', 'claude/routing.example.json']
+        names += [f'claude/agents/{name}.md' for name in ROLE_FILES]
+        names += [f'claude/skills/{name}/SKILL.md' for name in CLAUDE_SKILLS]
     files = sorted(set(names))
     for name in files:
         path = source / name
@@ -152,10 +176,11 @@ def merge_muse_profiles(entry, source_defaults):
             profile.setdefault(key, copy.deepcopy(value))
 
 
-def resolve_routing(source, root, gemini_override=None, claude_override=None, refresh_routing=False, muse_override=None):
+def resolve_routing(source, root, gemini_override=None, claude_override=None, refresh_routing=False, muse_override=None,
+                    routing_example='routing.example.json'):
     target = root / 'agent-framework/routing.json'
     preserving = target.exists() and not refresh_routing
-    config_path = target if preserving else source / 'routing.example.json'
+    config_path = target if preserving else source / routing_example
     try:
         config = json.loads(config_path.read_text(encoding='utf-8-sig'))
     except (ValueError, UnicodeError) as exc:
@@ -165,7 +190,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
 
     source_defaults = {}
     if preserving:
-        source_example_path = source / 'routing.example.json'
+        source_example_path = source / routing_example
         try:
             source_example = json.loads(source_example_path.read_text(encoding='utf-8-sig'))
         except (ValueError, UnicodeError, OSError) as exc:
@@ -296,7 +321,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
         config['version'] = 12
     # v12 adds editable activity chains. Retain explicit operator choices and
     # carry forward legacy provider pin customizations into the routine profile.
-    defaults = json.loads((source / 'routing.example.json').read_text(encoding='utf-8-sig'))
+    defaults = json.loads((source / routing_example).read_text(encoding='utf-8-sig'))
     default_profiles = defaults.get('profiles', {})
     default_activities = defaults.get('activities', {})
     if not isinstance(default_profiles, dict) or not isinstance(default_activities, dict):
@@ -362,23 +387,81 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
     return config
 
 
-def build_plan(source, root, gemini_override=None, claude_override=None, refresh_routing=False, muse_override=None):
-    files = collect_sources(source)
+def manifest_owns(root, target, existing):
+    """True when the previous install manifest recorded exactly these bytes."""
+    manifest_path = root / 'agent-framework/install-manifest.json'
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        return any(Path(entry['path']).resolve() == target.resolve() and
+                   entry['sha256'].upper() == hashlib.sha256(existing).hexdigest().upper()
+                   for entry in manifest['files'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def reader_owner_roots(root):
+    """Install roots whose manifests may own the shared Gemini reader helper."""
+    roots = [root]
+    for settings in HOSTS.values():
+        configured = os.environ.get(settings['env'])
+        candidate = Path(configured).expanduser() if configured else Path.home() / settings['default_dir']
+        roots.append(candidate.absolute())
+    return roots
+
+
+def host_target(host, root, name):
+    """Map a source path to its installed location for the selected host."""
+    if host == 'claude':
+        if name.startswith('claude/agents/'):
+            return root / 'agents' / Path(name).name
+        if name.startswith('claude/skills/'):
+            return root / name[len('claude/'):]
+        if name.startswith('skills/') and name.split('/')[1] in SHARED_SKILLS:
+            return root / name
+        # Codex roles and skills ship inside the package for reference only.
+        return root / 'agent-framework' / name
+    return root / (name if name.startswith('skills/') or
+                   (name.startswith('agents/') and name.endswith('.toml')) else 'agent-framework/' + name)
+
+
+def build_plan(source, root, gemini_override=None, claude_override=None, refresh_routing=False, muse_override=None,
+               host='codex'):
+    settings = HOSTS[host]
+    placeholder = settings['placeholder']
+    files = collect_sources(source, host)
     plan = {}
+    protected = []
     for name in files:
-        target = root / (name if name.startswith('skills/') or
-                         (name.startswith('agents/') and name.endswith('.toml')) else 'agent-framework/' + name)
+        target = host_target(host, root, name)
         check_path(target)
         content = (source / name).read_bytes()
-        if name == 'GLOBAL_POLICY.md' or name.startswith('skills/'):
-            content = content.decode('utf-8-sig').replace('{{CODEX_ROOT}}', root.as_posix()).encode('utf-8')
+        if host == 'codex':
+            rendered = name == 'GLOBAL_POLICY.md' or name.startswith('skills/')
+        else:
+            rendered = name == settings['policy'] or target.is_relative_to(root / 'skills')
+        if rendered:
+            text = content.decode('utf-8-sig').replace(placeholder, root.as_posix())
+            # Shared skills are written for the Codex layout; both hosts install
+            # the framework itself under <root>/agent-framework.
+            content = text.replace('{{CODEX_ROOT}}', root.as_posix()).encode('utf-8')
         plan[target] = content
-    agents = root / 'AGENTS.md'
+        if host == 'claude' and (target.is_relative_to(root / 'agents') or target.is_relative_to(root / 'skills')):
+            protected.append(target)
+    # Claude users keep personal agents and skills beside ours. Replace only
+    # files this installer wrote before, never an unowned name collision.
+    for target in protected:
+        if target.exists():
+            existing = target.read_bytes()
+            if existing != plan[target] and not manifest_owns(root, target, existing):
+                raise PreflightError(f'Existing file differs and is not owned by this framework: {target}. '
+                                     'Rename or remove it, then rerun the installer.')
+    agents = root / settings['instructions']
     routing = root / 'agent-framework/routing.json'
     check_path(agents)
     check_path(routing)
-    policy = plan[root / 'agent-framework/GLOBAL_POLICY.md'].decode('utf-8')
-    plan[agents] = generate_agents_content(agents, policy).encode('utf-8')
+    policy_target = host_target(host, root, settings['policy'])
+    policy = plan[policy_target].decode('utf-8')
+    plan[agents] = generate_agents_content(agents, policy, settings['markers']).encode('utf-8')
     data = resolve_routing(
         source=source,
         root=root,
@@ -386,6 +469,7 @@ def build_plan(source, root, gemini_override=None, claude_override=None, refresh
         claude_override=claude_override,
         muse_override=muse_override,
         refresh_routing=refresh_routing,
+        routing_example=settings['routing_example'],
     )
     plan[routing] = (json.dumps(data, indent=2) + '\n').encode('utf-8')
     # Antigravity discovers reader agents in its own global config directory.
@@ -396,32 +480,32 @@ def build_plan(source, root, gemini_override=None, claude_override=None, refresh
     content = (source / 'agents/framework-reader.md').read_bytes()
     if reader.exists():
         existing = reader.read_bytes()
-        if existing != content:
-            manifest_path = root / 'agent-framework/install-manifest.json'
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-                owned = any(Path(entry['path']).resolve() == reader.resolve() and
-                            entry['sha256'].upper() == hashlib.sha256(existing).hexdigest().upper()
-                            for entry in manifest['files'])
-            except (OSError, ValueError, KeyError, TypeError):
-                owned = False
-            if not owned:
-                raise PreflightError(f'Existing Gemini reader agent differs: {reader}')
+        # Both hosts share this file, so either host's manifest proves ownership.
+        if existing != content and not any(manifest_owns(owner, reader, existing)
+                                           for owner in reader_owner_roots(root)):
+            raise PreflightError(f'Existing Gemini reader agent differs: {reader}')
     plan[reader] = content
     return plan
 
 
 def install_framework(codex_home=None, dry_run=False, gemini_override=None,
-                      claude_override=None, refresh_routing=False, source=None, muse_override=None):
+                      claude_override=None, refresh_routing=False, source=None, muse_override=None,
+                      host='codex', claude_home=None):
     if sys.version_info < (3, 11):
         raise PreflightError('Python 3.11 or newer is required.')
+    if host not in HOSTS:
+        raise PreflightError(f'Unknown host: {host!r}; expected codex or claude.')
+    settings = HOSTS[host]
+    if (host == 'codex' and claude_home) or (host == 'claude' and codex_home):
+        raise PreflightError(f'--{"claude" if host == "codex" else "codex"}-home does not apply to the {host} host.')
+    home = codex_home if host == 'codex' else claude_home
     source_root = Path(source or Path(__file__).absolute().parent).expanduser().absolute()
-    root = Path(codex_home or os.environ.get('CODEX_HOME') or Path.home() / '.codex').expanduser().absolute()
+    root = Path(home or os.environ.get(settings['env']) or Path.home() / settings['default_dir']).expanduser().absolute()
     check_path(source_root, directory=True)
     check_path(root, directory=True)
     source_root, root = source_root.resolve(), root.resolve()
     if root == root.parent:
-        raise PreflightError('Refusing a filesystem root as the Codex directory.')
+        raise PreflightError(f"Refusing a filesystem root as the {settings['label']} directory.")
     if source_root.is_relative_to(root) or root.is_relative_to(source_root):
         raise PreflightError('Source package and destination must not overlap. Run the installer from a separate source clone or release ZIP, not the installed copy.')
     manifest_path = root / 'agent-framework/install-manifest.json'
@@ -439,10 +523,11 @@ def install_framework(codex_home=None, dry_run=False, gemini_override=None,
         claude_override=claude_override,
         muse_override=muse_override,
         refresh_routing=refresh_routing,
+        host=host,
     )
     if dry_run:
         print('Dry run requested. No changes made.')
-        print(f'Target Codex root: {root}')
+        print(f"Target {settings['label']} root: {root}")
         for target in plan:
             print(f'  {target}')
         return
@@ -466,6 +551,7 @@ def install_framework(codex_home=None, dry_run=False, gemini_override=None,
             claude_override=claude_override,
             muse_override=muse_override,
             refresh_routing=refresh_routing,
+            host=host,
         )
         backup_dir.mkdir(parents=True, exist_ok=False)
         backups = {}
@@ -492,12 +578,15 @@ def install_framework(codex_home=None, dry_run=False, gemini_override=None,
         lock_path.unlink()
     print(f'Framework installed successfully into {root}')
     print(f'Backups stored in: {backup_dir}')
-    print('Start a new Codex task to discover the installed roles and skills.')
+    print(settings['restart'])
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--codex-home', help='Override CODEX_HOME or ~/.codex.')
+    parser.add_argument('--host', choices=sorted(HOSTS), default='codex',
+                        help='Agent host to install for: codex (~/.codex, AGENTS.md) or claude (~/.claude, CLAUDE.md).')
+    parser.add_argument('--codex-home', help='Override CODEX_HOME or ~/.codex (codex host).')
+    parser.add_argument('--claude-home', help='Override CLAUDE_CONFIG_DIR or ~/.claude (claude host).')
     parser.add_argument('--dry-run', action='store_true', help='Validate and list destinations without writes.')
     parser.add_argument('--gemini', help='Override Gemini executable.')
     parser.add_argument('--claude', help='Override Claude executable.')
@@ -514,6 +603,8 @@ def main(argv=None):
             muse_override=args.muse,
             refresh_routing=args.refresh_routing,
             source=args.source,
+            host=args.host,
+            claude_home=args.claude_home,
         )
     except (InstallError, OSError, ValueError) as exc:
         print(f'Installation error: {exc}', file=sys.stderr)

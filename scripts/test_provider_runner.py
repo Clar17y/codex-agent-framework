@@ -1511,6 +1511,39 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(deepseek["DEEPSEEK_API_KEY"], "checked-account")
         self.assertNotIn("CUSTOM_DEEPSEEK_KEY", deepseek)
 
+    def test_claude_child_drops_host_session_and_api_overrides(self):
+        host = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SSE_PORT": "4321",
+                "claude_code_session_marker": "lowercase", "ANTHROPIC_API_KEY": "api-key",
+                "ANTHROPIC_AUTH_TOKEN": "token", "ANTHROPIC_BASE_URL": "https://proxy.invalid",
+                "ANTHROPIC_MODEL": "claude-haiku-5-5", "CLAUDE_CODE_USE_BEDROCK": "1",
+                "CLAUDE_CODE_OAUTH_TOKEN": "subscription", "CLAUDE_CODE_GIT_BASH_PATH": r"C:\Git\bin\bash.exe",
+                "CLAUDE_CONFIG_DIR": "/claude-home", "CLAUDE_API_KEY": "user-overflow-key",
+                "UNRELATED_SETTING": "kept"}
+        with mock.patch.dict(os.environ, host, clear=False):
+            claude = runner.child_environment({}, "claude")
+            others = {name: runner.child_environment({}, name) for name in ("gemini", "muse", "openai")}
+        for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT",
+                     "claude_code_session_marker", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                     "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK"):
+            self.assertNotIn(name, claude)
+        for name in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_GIT_BASH_PATH", "CLAUDE_CONFIG_DIR",
+                     "UNRELATED_SETTING"):
+            self.assertEqual(claude[name], host[name])
+        # Anthropic API credentials, including the host-only overflow key, reach
+        # no vendor child; other Claude session markers only matter to Claude.
+        for provider, env in {"claude": claude, **others}.items():
+            with self.subTest(provider=provider):
+                for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY"):
+                    self.assertNotIn(name, env)
+                if provider != "claude":
+                    self.assertEqual(env["CLAUDECODE"], "1")
+        with mock.patch.dict(os.environ, host, clear=False):
+            self.assertEqual(dict(runner.framework_secrets({}))["CLAUDE_API_KEY"], "user-overflow-key")
+        for provider, env in {"claude": claude, **others}.items():
+            self.assertEqual(env["FRAMEWORK_DISPATCHED_WORKER"], "1", provider)
+        with mock.patch.dict(os.environ, {"FRAMEWORK_DISPATCHED_WORKER": "orchestration"}):
+            self.assertEqual(runner.child_environment({}, "claude")["FRAMEWORK_DISPATCHED_WORKER"], "1")
+
     def test_deepseek_balance_redirects_are_refused(self):
         handler = runner.NoRedirectHandler()
         request = urllib.request.Request("https://api.deepseek.com/user/balance")

@@ -1216,7 +1216,7 @@ class TestInstallFramework(unittest.TestCase):
         self.assertNotIn("deepseek", routing["providers"])
 
     def test_retired_custom_credential_stays_filtered_after_upgrade(self):
-        from scripts.provider_runner import child_environment, deepseek_secrets
+        from scripts.provider_runner import child_environment, retired_secrets
 
         install_framework(str(self.dest_root), source=str(self.source_root))
         routing_path = self.dest_root / "agent-framework/routing.json"
@@ -1237,7 +1237,7 @@ class TestInstallFramework(unittest.TestCase):
             for provider in ("gemini", "claude", "git"):
                 child = child_environment(upgraded, provider)
                 self.assertTrue(all(name not in child for name in credentials))
-            captured = dict(deepseek_secrets(upgraded))
+            captured = dict(retired_secrets(upgraded))
             self.assertTrue(all(captured[name] == value for name, value in credentials.items()))
         self.assertNotIn("fixture-retired-secret", routing_path.read_text(encoding="utf-8"))
         installed = routing_path.read_bytes()

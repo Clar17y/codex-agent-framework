@@ -3,7 +3,6 @@ import argparse
 import contextlib
 import copy
 import datetime as dt
-from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -17,9 +16,6 @@ import stat
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 
 UTC = dt.timezone.utc
@@ -220,22 +216,6 @@ def safe_regular_file(path, workspace):
         except ImportError as exc:
             raise ValueError("Jev evidence checks are unavailable; reinstall the complete framework") from exc
     return jev_safe_regular_file(path, workspace)
-
-DEEPSEEK_OUTPUT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "status": {
-            "type": "string",
-            "enum": ["SUCCESS", "FAILED", "BLOCKED", "ERROR"]
-        },
-        "response": {
-            "type": "string"
-        }
-    },
-    "required": ["status", "response"],
-    "additionalProperties": False
-}
-
 
 def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
@@ -885,8 +865,8 @@ def direct_windows_codex_command(command, platform_name=None):
     node = str(sibling_node) if sibling_node.is_file() else shutil.which("node")
     if not codex_js.is_file() or not node:
         raise ValueError(
-            "DeepSeek's Windows Codex launcher is a batch shim, but its direct npm "
-            "Node entrypoint could not be found. Reinstall Codex or configure providers.deepseek.executable "
+            "The Windows Codex launcher is a batch shim, but its direct npm "
+            "Node entrypoint could not be found. Reinstall Codex or configure providers.openai.executable "
             "as an argv list containing the Node executable and @openai/codex/bin/codex.js."
         )
     return [str(Path(node).resolve()), str(codex_js), *command[1:]]
@@ -957,14 +937,9 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
         raise ValueError("Provider executable must be a string or nonempty argv list")
 
     if provider_name is None:
-        if role == "review":
-            provider_name = "claude"
-        elif provider.get("profile") == "deepseek" or provider.get("model") == "deepseek-flash":
-            provider_name = "deepseek"
-        else:
-            provider_name = "gemini"
+        provider_name = "claude" if role == "review" else "gemini"
 
-    if provider_name in ("deepseek", "openai"):
+    if provider_name == "openai":
         command = direct_windows_codex_command(command)
     elif provider_name == "muse":
         command = (direct_windows_muse_config_command(command) if activity in READ_ACTIVITIES
@@ -1062,22 +1037,6 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
             return command + ["--print", prompt, "--model", model, "--mode", "accept-edits",
                               "--dangerously-skip-permissions", "--add-dir", str(workspace), "--output-format", "stream-json",
                               "--print-timeout", f"{timeout}s", "--log-file", str(log_file)]
-        elif provider_name == "deepseek":
-            expected = "deepseek-flash"
-            if model != expected:
-                raise ValueError(f"{role} with deepseek requires pinned model {expected}; got {model}")
-            profile = provider.get("profile", "deepseek")
-            last_msg = str((output_dir / "last_message.txt") if output_dir else (Path(workspace) / ".llm-output" / "last_message.txt"))
-            if output_dir:
-                schema_file = output_dir / "output_schema.json"
-            else:
-                schema_file = Path(workspace) / ".llm-output" / "output_schema.json"
-            return command + ["exec", "-p", profile, "--model", model,
-                              "--approve-for-me",
-                              "-c", "shell_environment_policy.ignore_default_excludes=false",
-                              "--json",
-                              "--output-schema", str(schema_file),
-                              "--output-last-message", last_msg, "--ephemeral", prompt]
         elif provider_name == "muse":
             if output_dir is None:
                 raise ValueError("Muse requires an output directory for its prompt file")
@@ -1142,101 +1101,6 @@ def account_auth_error(result):
         return True
     message = str(result.get("error", "")).lower()
     return bool(re.search(r"authentication required|not logged in|login required|invalid credentials|unauthorized|oauth token (?:has )?expired|please run /login|please (?:log in|login)", message))
-
-
-def parse_deepseek_final_output(output_dir, stdout_text, stdout_truncated=False):
-    """Parse and validate final JSON output object from DeepSeek.
-    Success requires explicit success status plus a string response.
-    Arbitrary messages, progress events, malformed output, or blocked/error status are not success."""
-    raw_content = None
-    if output_dir:
-        last_msg_file = output_dir / "last_message.txt"
-        if last_msg_file.exists():
-            raw_content, truncated = read_text_tail(last_msg_file)
-            if truncated:
-                return None, False, False
-            raw_content = raw_content.strip()
-
-    obj = None
-    if raw_content:
-        try:
-            parsed = json.loads(raw_content)
-            if isinstance(parsed, dict):
-                obj = parsed
-        except (ValueError, RecursionError):
-            return None, False, False
-    elif stdout_text and not stdout_truncated:
-        try:
-            parsed = json.loads(stdout_text.strip())
-            if isinstance(parsed, dict):
-                obj = parsed
-        except (ValueError, RecursionError):
-            for line in reversed(stdout_text.splitlines()):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    parsed = json.loads(line)
-                    if isinstance(parsed, dict) and "status" in parsed and "response" in parsed and "type" not in parsed:
-                        obj = parsed
-                        break
-                except (ValueError, RecursionError):
-                    pass
-
-    if not isinstance(obj, dict):
-        return None, False, False
-
-    if "type" in obj and obj.get("type") in ("turn.completed", "turn_completed", "response.done", "item.completed", "step"):
-        return None, False, False
-
-    status = obj.get("status")
-    response = obj.get("response")
-    if not isinstance(status, str) or isinstance(status, bool) or not isinstance(response, str) or isinstance(response, bool):
-        return None, False, False
-
-    status_upper = status.strip().upper()
-    if status_upper not in ("SUCCESS", "FAILED", "BLOCKED", "ERROR"):
-        return None, False, False
-    is_terminal = True
-    is_success = (status_upper == "SUCCESS")
-    return obj, is_terminal, is_success
-
-
-def parse_codex_events(stdout_text):
-    """Parse Codex JSONL events to extract terminal outcome and structured errors."""
-    terminal_event = None
-    terminal_turn = None
-    has_terminal_402 = False
-    intermediate_errors = []
-
-    for line in stdout_text.splitlines():
-        line = line.strip()
-        if not line or not (line.startswith("{") and line.endswith("}")):
-            continue
-        try:
-            obj = json.loads(line)
-        except (ValueError, RecursionError):
-            continue
-        if not isinstance(obj, dict):
-            continue
-
-        evt_type = obj.get("type")
-        if evt_type == "turn.completed":
-            terminal_turn = "completed"
-            terminal_event = obj
-        elif evt_type == "turn.failed":
-            terminal_turn = "failed"
-            terminal_event = obj
-            err = obj.get("error")
-            if isinstance(err, dict):
-                code = err.get("code") or err.get("status")
-                if code == 402 or str(code).lower() in ("402", "insufficient_balance"):
-                    has_terminal_402 = True
-        elif evt_type == "error" or "error" in obj:
-            err = obj.get("error") or obj
-            intermediate_errors.append(err)
-
-    return terminal_turn, terminal_event, has_terminal_402, intermediate_errors
 
 
 def parse_openai_terminal(stdout_text, truncated=False):
@@ -1401,11 +1265,7 @@ def parse_claude_final_output(stdout_text):
     return terminal, saw_result_event, stream_errors
 
 
-def successful_response(text, role, provider="gemini", output_dir=None):
-    if provider == "deepseek":
-        _, _, is_success = parse_deepseek_final_output(output_dir, text)
-        return is_success
-
+def successful_response(text, role):
     try:
         value = json.loads(text)
     except (ValueError, RecursionError):
@@ -1612,10 +1472,6 @@ def quota_path(state_dir, provider):
     return state_dir / f"{provider}-quota.json"
 
 
-def balance_path(state_dir):
-    return state_dir / "deepseek-balance.json"
-
-
 def luna_fallback():
     return {"model": "gpt-6-luna", "effort": "medium"}
 
@@ -1623,46 +1479,7 @@ def luna_fallback():
 def quota_fallback(provider, config=None):
     if provider in ("gemini", "muse"):
         return luna_fallback()
-    if provider == "deepseek":
-        return luna_fallback()
     return {"model": "gpt-6-astra", "effort": "low"}
-
-
-def _parse_decimal_string(val, field_name):
-    if not isinstance(val, str) or isinstance(val, bool):
-        raise ValueError(f"Balance field '{field_name}' must be a string; got {type(val).__name__}")
-    val_clean = val.strip()
-    if not val_clean:
-        raise ValueError(f"Balance field '{field_name}' must not be empty")
-    try:
-        d = Decimal(val_clean)
-    except InvalidOperation as exc:
-        raise ValueError(f"Balance field '{field_name}' is not a valid decimal: {val!r}") from exc
-    if not d.is_finite():
-        raise ValueError(f"Balance field '{field_name}' must be finite: {val!r}")
-    if d < 0:
-        raise ValueError(f"Balance field '{field_name}' must not be negative: {val!r}")
-    return d, val_clean
-
-
-def validate_balance_info_entry(item):
-    if not isinstance(item, dict):
-        raise ValueError("Balance info entry must be a dictionary")
-    currency = item.get("currency")
-    if not isinstance(currency, str) or isinstance(currency, bool) or not currency.strip():
-        raise ValueError("currency must be a non-empty string")
-
-    entry = {"currency": currency.strip()}
-    if "total_balance" not in item:
-        raise ValueError("Balance info entry missing 'total_balance'")
-    _, entry["total_balance"] = _parse_decimal_string(item["total_balance"], "total_balance")
-
-    for field in ("granted_balance", "topped_up_balance"):
-        if field in item:
-            _, entry[field] = _parse_decimal_string(item[field], field)
-        else:
-            entry[field] = "0.00"
-    return entry
 
 
 def _sanitize_secret(text, secret):
@@ -1672,7 +1489,7 @@ def _sanitize_secret(text, secret):
     raw = secret.strip()
     if raw:
         res = res.replace(raw, "[REDACTED]")
-    return re.sub(r"(Bearer\s+)[^\s,'\"]+", r"\1[REDACTED]", res, flags=re.IGNORECASE)
+    return re.sub(r"(Bearer\s+)[^\s,'\"\\]+", r"\1[REDACTED]", res, flags=re.IGNORECASE)
 
 
 def _sanitize_all_secrets(text, secrets=None):
@@ -1686,22 +1503,22 @@ def _sanitize_all_secrets(text, secrets=None):
                 if len(raw) >= 4:
                     res = res.replace(s, "[REDACTED]")
                     res = res.replace(raw, "[REDACTED]")
-    res = re.sub(r"(Bearer\s+)[^\s,'\"]+", r"\1[REDACTED]", res, flags=re.IGNORECASE)
+    res = re.sub(r"(Bearer\s+)[^\s,'\"\\]+", r"\1[REDACTED]", res, flags=re.IGNORECASE)
     res = re.sub(r"\bsk-[A-Za-z0-9_-]{16,}\b", "[REDACTED]", res)
     return res
 
 
-def deepseek_secrets(config):
-    """Return current/retired DeepSeek credentials for filtering, never disclose them in results."""
-    providers = config.get("providers", {}) if isinstance(config, dict) else {}
-    deepseek = providers.get("deepseek", {}) if isinstance(providers, dict) else {}
-    configured = deepseek.get("api_key_env", "DEEPSEEK_API_KEY") if isinstance(deepseek, dict) else "DEEPSEEK_API_KEY"
+def retired_secrets(config):
+    """Credentials of retired providers (DeepSeek), kept out of every child and every result."""
     names = {"DEEPSEEK_API_KEY"}
     retired = config.get("retired_secret_env_vars", []) if isinstance(config, dict) else []
     if isinstance(retired, list):
         names.update(name for name in retired if isinstance(name, str))
-    if isinstance(configured, str):
-        names.add(configured)
+    # A routing file the installer has not migrated may still name a custom key.
+    providers = config.get("providers", {}) if isinstance(config, dict) else {}
+    legacy = providers.get("deepseek") if isinstance(providers, dict) else None
+    if isinstance(legacy, dict) and isinstance(legacy.get("api_key_env"), str):
+        names.add(legacy["api_key_env"])
     return [(name, os.environ[name]) for name in names if os.environ.get(name) and os.environ[name].strip()]
 
 
@@ -1717,7 +1534,7 @@ def muse_secrets(config):
 
 def framework_secrets(config):
     """Credentials used by framework helpers, never by execution-provider children."""
-    secrets = dict(deepseek_secrets(config) + muse_secrets(config))
+    secrets = dict(retired_secrets(config) + muse_secrets(config))
     # Anthropic API credentials (including a host-only overflow key) belong to
     # the Claude host, never to subscription CLI children of any vendor.
     for name in ("TYPESAFE_API_KEY", *ANTHROPIC_SECRET_ENV):
@@ -1738,7 +1555,7 @@ def redaction_secrets(config):
     return secrets
 
 
-def child_environment(config, provider_name, checked_deepseek_key=None):
+def child_environment(config, provider_name):
     """Keep helper credentials out of external execution-provider environments."""
     env = dict(os.environ)
     env.pop("FRAMEWORK_PARENT_RUN_ID", None)
@@ -1779,10 +1596,6 @@ def child_environment(config, provider_name, checked_deepseek_key=None):
         env.pop(muse["api_key_env"], None)
     for name, _ in framework_secrets(config):
         env.pop(name, None)
-    if provider_name == "deepseek" and checked_deepseek_key:
-        # The default Codex profile consumes this canonical name.  Do not leave a
-        # second configured name that could make it select a different account.
-        env["DEEPSEEK_API_KEY"] = checked_deepseek_key
     return env
 
 
@@ -1810,7 +1623,7 @@ def sanitize_run_artifacts(output, secrets):
     )
     generic_pattern = re.compile(
         b"(?P<bearer>(?P<bearer_prefix>(?i:Bearer)" + whitespace +
-        b"+)(?:(?!" + whitespace + b")[^,'\"])+)|"
+        b"+)(?:(?!" + whitespace + b")[^,'\"\\\\])+)|"
         b"(?P<sk>\\bsk-[A-Za-z0-9_-]{16,}\\b)")
 
     def copy_range(source, destination, start, end):
@@ -1891,242 +1704,6 @@ def sanitize_run_artifacts(output, secrets):
                 except OSError:
                     pass
     return errors
-
-
-class BalanceError(str):
-    """A balance query error string annotated with category kind ('depleted' vs 'unverified') and structured code."""
-    def __new__(cls, message, kind="unverified", code="UNKNOWN"):
-        obj = str.__new__(cls, message)
-        obj.kind = kind
-        obj.code = code
-        return obj
-
-
-def classify_balance_error(err):
-    if err is None:
-        return None, None
-    kind = getattr(err, "kind", None)
-    code = getattr(err, "code", None)
-    if kind:
-        return kind, code
-    err_str = str(err)
-    err_lower = err_str.lower()
-    if any(k in err_lower for k in ("depleted", "is_available=false", "is_available is false", "402", "insufficient balance")):
-        return "depleted", "DEPLETED"
-    return "unverified", "UNVERIFIED"
-
-
-class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, f"HTTP redirect ({code}) is not permitted for balance queries", headers, fp)
-
-
-def query_deepseek_balance(config, timeout=15):
-    """Query official DeepSeek GET /user/balance endpoint using standard library. Never prints or persists key."""
-    deepseek_config = config.get("providers", {}).get("deepseek", {}) if isinstance(config.get("providers"), dict) else {}
-    env_name = deepseek_config.get("api_key_env", "DEEPSEEK_API_KEY")
-    if not isinstance(env_name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
-        return None, BalanceError(f"Invalid api_key_env configuration: {env_name!r}", kind="unverified", code="INVALID_CONFIG")
-
-    raw_api_key = os.environ.get(env_name)
-    if raw_api_key is None or not raw_api_key.strip():
-        return None, BalanceError(f"Environment variable '{env_name}' is not set or empty", kind="unverified", code="MISSING_KEY")
-    api_key = raw_api_key.strip()
-    if any(c in api_key for c in "\r\n\t") or not api_key.isascii() or not api_key.isprintable():
-        return None, BalanceError(f"Environment variable '{env_name}' contains invalid key characters", kind="unverified", code="INVALID_KEY")
-
-    base_url = deepseek_config.get("base_url", "https://api.deepseek.com")
-    parsed_url = urllib.parse.urlsplit(base_url) if isinstance(base_url, str) else None
-    if (parsed_url is None or parsed_url.scheme != "https" or parsed_url.netloc != "api.deepseek.com"
-            or parsed_url.path not in ("", "/") or parsed_url.query or parsed_url.fragment or parsed_url.username or parsed_url.password):
-        return None, BalanceError("DeepSeek balance endpoint must be https://api.deepseek.com", kind="unverified", code="INVALID_URL")
-    url = "https://api.deepseek.com/user/balance"
-
-    def sanitize(msg):
-        return _sanitize_secret(msg, raw_api_key)
-
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Accept": "application/json",
-                "User-Agent": "codex-agent-framework",
-            },
-        )
-        opener = urllib.request.build_opener(NoRedirectHandler)
-        resp_ctx = opener.open(req, timeout=timeout)
-        with resp_ctx as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            if exc.code == 402:
-                return None, BalanceError("HTTP 402: Insufficient balance", kind="depleted", code="HTTP_402")
-            if exc.code == 401:
-                return None, BalanceError("HTTP 401: Unauthorized / invalid DeepSeek API key", kind="unverified", code="HTTP_401")
-            if exc.code == 429:
-                return None, BalanceError(sanitize(f"DeepSeek balance query rate limited (HTTP 429): {exc.reason}"), kind="unverified", code="RATE_LIMITED")
-            if 500 <= exc.code < 600:
-                return None, BalanceError(sanitize(f"DeepSeek balance query server error (HTTP {exc.code}): {exc.reason}"), kind="unverified", code="SERVER_ERROR")
-            return None, BalanceError(sanitize(f"DeepSeek balance query failed with HTTP {exc.code}: {exc.reason}"), kind="unverified", code="HTTP_ERROR")
-        finally:
-            if hasattr(exc, "close"):
-                exc.close()
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return None, BalanceError(sanitize(f"DeepSeek balance query network error: {exc}"), kind="unverified", code="NETWORK_ERROR")
-    except (ValueError, UnicodeDecodeError) as exc:
-        return None, BalanceError(sanitize(f"DeepSeek balance response malformed: {exc}"), kind="unverified", code="MALFORMED_RESPONSE")
-    except Exception as exc:
-        return None, BalanceError(sanitize(f"DeepSeek balance query unexpected error: {exc}"), kind="unverified", code="UNEXPECTED_ERROR")
-
-    if not isinstance(data, dict):
-        return None, BalanceError("DeepSeek balance response is not a JSON object", kind="unverified", code="MALFORMED_RESPONSE")
-    if "is_available" not in data or not isinstance(data["is_available"], bool):
-        return None, BalanceError("DeepSeek balance response missing boolean 'is_available'", kind="unverified", code="MALFORMED_RESPONSE")
-    if "balance_infos" not in data or not isinstance(data["balance_infos"], list):
-        return None, BalanceError("DeepSeek balance response missing list 'balance_infos'", kind="unverified", code="MALFORMED_RESPONSE")
-
-    validated_infos = []
-    has_positive = False
-    for item in data["balance_infos"]:
-        if not isinstance(item, dict):
-            return None, BalanceError("DeepSeek balance item is not a JSON object", kind="unverified", code="MALFORMED_RESPONSE")
-        for field in ("currency", "total_balance", "granted_balance", "topped_up_balance"):
-            if field not in item:
-                return None, BalanceError(f"DeepSeek balance item missing required field '{field}'", kind="unverified", code="MALFORMED_RESPONSE")
-        try:
-            entry = validate_balance_info_entry(item)
-            validated_infos.append(entry)
-            if Decimal(entry["total_balance"]) > 0:
-                has_positive = True
-        except ValueError as exc:
-            return None, BalanceError(f"DeepSeek balance item invalid: {exc}", kind="unverified", code="MALFORMED_RESPONSE")
-
-    data["balance_infos"] = validated_infos
-
-    if data["is_available"] is False:
-        return data, BalanceError("DeepSeek reported account is not available (is_available=false)", kind="depleted", code="ACCOUNT_UNAVAILABLE")
-
-    if not has_positive:
-        return data, BalanceError("DeepSeek balance is depleted (no positive total_balance)", kind="depleted", code="BALANCE_DEPLETED")
-
-    return data, None
-
-
-def balance_state(state_dir):
-    path = balance_path(state_dir)
-    try:
-        state = read_json(path)
-        if not isinstance(state, dict):
-            raise ValueError("Balance snapshot must be a JSON object")
-        if state.get("is_available") is not None and not isinstance(state.get("is_available"), bool):
-            raise ValueError("Balance snapshot 'is_available' must be boolean")
-        if "balance_infos" not in state or not isinstance(state["balance_infos"], list):
-            raise ValueError("Balance snapshot missing 'balance_infos' list")
-        for item in state["balance_infos"]:
-            validate_balance_info_entry(item)
-        return state, None
-    except FileNotFoundError:
-        return None, None
-    except (OSError, ValueError, TypeError) as exc:
-        return None, str(exc)
-
-
-def record_balance_snapshot(state_dir, data, error=None, config=None):
-    observed = time.time()
-    state_dir = Path(state_dir)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    lock_timeout = float(config.get("lock_timeout_seconds", 30)) if isinstance(config, dict) else 30.0
-    with provider_lock(state_dir, lock_timeout, "balance.lock"):
-        existing, _ = balance_state(state_dir)
-        if existing and isinstance(existing.get("observed_at"), str):
-            try:
-                existing_stamp = dt.datetime.fromisoformat(existing["observed_at"].replace("Z", "+00:00")).timestamp()
-                if existing_stamp > observed:
-                    return existing
-            except (ValueError, OSError):
-                pass
-
-        model = "deepseek-flash"
-        if config and isinstance(config.get("providers"), dict) and isinstance(config["providers"].get("deepseek"), dict):
-            model = config["providers"]["deepseek"].get("model", model)
-
-        observed_iso = dt.datetime.fromtimestamp(observed, UTC).isoformat().replace("+00:00", "Z")
-        kind, code = classify_balance_error(error)
-
-        if data is None and existing:
-            # Preserve last successful monetary snapshot on unverified error
-            snapshot = dict(existing)
-            snapshot["last_check_error"] = str(error)
-            snapshot["last_check_error_at"] = observed_iso
-            snapshot["last_check_error_kind"] = kind
-            write_json(balance_path(state_dir), snapshot)
-            return snapshot
-
-        raw_balance_infos = data.get("balance_infos", []) if isinstance(data, dict) else []
-        validated_infos = []
-        has_positive = False
-        for item in raw_balance_infos:
-            try:
-                entry = validate_balance_info_entry(item)
-                validated_infos.append(entry)
-                if Decimal(entry["total_balance"]) > 0:
-                    has_positive = True
-            except (ValueError, TypeError):
-                pass
-
-        total_balance = validated_infos[0]["total_balance"] if len(validated_infos) == 1 else None
-        raw_available = data.get("is_available", False) if isinstance(data, dict) else False
-        is_available = bool(raw_available and (error is None) and has_positive)
-        snapshot = {
-            "version": 1,
-            "provider": "deepseek",
-            "model": model,
-            "observed_at": observed_iso if data is not None else None,
-            "is_available": is_available if data is not None else None,
-            "total_balance": total_balance,
-            "balance_infos": validated_infos,
-            "error": str(error) if error else None,
-            "error_kind": kind,
-            "last_check_error": str(error) if (error and data is None) else None,
-            "last_check_error_at": observed_iso if (error and data is None) else None,
-            "last_check_error_kind": kind if (error and data is None) else None,
-        }
-        write_json(balance_path(state_dir), snapshot)
-        return snapshot
-
-
-def refresh_balance_safe(state_dir, config):
-    try:
-        data, err = query_deepseek_balance(config, timeout=10)
-        if data is not None:
-            record_balance_snapshot(state_dir, data, err, config)
-    except Exception:
-        pass
-
-
-def deepseek_insufficient_balance_error(errors, stderr_text=""):
-    """Detect an actual DeepSeek HTTP 402/insufficient-balance run failure.
-    Rate limits and unrelated errors are not balance exhaustion."""
-    for error in errors:
-        code = str(error.get("code", error.get("status", ""))).lower()
-        msg = str(error.get("message", error.get("result", ""))).lower()
-        if any(rl in msg for rl in ("rate limit", "rate_limit", "too many requests", "429", "requests per minute", "requests/min")):
-            continue
-        if code in ("402", "insufficient_balance") or "insufficient_balance" in code:
-            return error
-        if "insufficient balance" in msg or "insufficient_balance" in msg or "402 payment required" in msg or "402: payment required" in msg:
-            return error
-    for line in stderr_text.splitlines():
-        line_clean = line.strip()
-        lower = line_clean.lower()
-        if any(rl in lower for rl in ("rate limit", "rate_limit", "too many requests", "429", "requests per minute", "requests/min")):
-            continue
-        if re.search(r"\b402\b", lower) and any(kw in lower for kw in ("insufficient", "payment required", "balance")):
-            return {"code": "INSUFFICIENT_BALANCE", "message": line_clean, "source": "terminal_stderr"}
-        if "insufficient balance" in lower or "insufficient_balance" in lower:
-            return {"code": "INSUFFICIENT_BALANCE", "message": line_clean, "source": "terminal_stderr"}
-    return None
 
 
 def quota_state(state_dir, provider):
@@ -2454,93 +2031,12 @@ def update_claude_progress(state, value, observed_at):
         state["usage"] = summary["usage"]
 
 
-def compact_deepseek_event(value):
-    """Summarize one Codex JSONL event without copying prompts, text, parameters, or tool output."""
-    event_type = compact_label(value.get("type") or value.get("event"))
-    if event_type == "thread.started":
-        return {"event": "thread.started", "summary": "thread started"}
-    if event_type == "turn.started":
-        return {"event": "turn.started", "summary": "turn started"}
-    if event_type == "turn.completed":
-        summary = {"event": "turn.completed", "summary": "turn completed"}
-        usage = compact_usage(value.get("usage"))
-        if usage:
-            summary["usage"] = usage
-        return summary
-    if event_type == "turn.failed":
-        return {"event": "turn.failed", "status": "FAILED", "summary": "terminal FAILED"}
-    if event_type == "item.started":
-        item = value.get("item") if isinstance(value.get("item"), dict) else {}
-        item_type = compact_label(item.get("type"), default="item", limit=60)
-        if item_type in CODEX_TOOL_ITEM_TYPES:
-            candidate = ((item.get("tool") or item.get("name"))
-                         if item_type == "mcp_tool_call" else item_type)
-            tool_name = compact_label(candidate, default=item_type, limit=120)
-            return {"event": "item.started", "step_type": "item", "tool_name": tool_name,
-                    "step_state": "ACTIVE", "summary": f"tool {tool_name} ACTIVE"}
-        return {"event": "item.started", "summary": f"{item_type} started"}
-    if event_type == "item.completed":
-        item = value.get("item") if isinstance(value.get("item"), dict) else {}
-        item_type = compact_label(item.get("type"), default="item", limit=60)
-        if item_type in CODEX_TOOL_ITEM_TYPES:
-            candidate = ((item.get("tool") or item.get("name"))
-                         if item_type == "mcp_tool_call" else item_type)
-            tool_name = compact_label(candidate, default=item_type, limit=120)
-            return {"event": "item.completed", "step_type": "item", "tool_name": tool_name,
-                    "step_state": "DONE", "summary": f"tool {tool_name} DONE"}
-        return {"event": "item.completed", "summary": f"{item_type} completed"}
-    if event_type == "error":
-        return {"event": "error", "summary": "error"}
-    # DeepSeek final response schema line emitted in stdout
-    if isinstance(value.get("status"), str) and "response" in value and event_type == "unknown":
-        status = compact_label(value.get("status"), default="unknown", limit=40)
-        return {"event": "result", "status": status, "summary": f"terminal {status}"}
-    return {"event": event_type, "summary": event_type}
-
-
-def update_deepseek_progress(state, value, observed_at):
-    if not isinstance(value, dict):
-        return
-    state["event_count"] += 1
-    summary = compact_deepseek_event(value)
-    state["last_event"] = summary
-    state["last_event_at"] = observed_at
-    thread_id = compact_label(value.get("thread_id") or value.get("conversation_id"), default=None, limit=200)
-    if thread_id:
-        state["conversation_id"] = thread_id
-
-    if summary.get("step_state") == "ACTIVE":
-        state["active_step"] = {k: summary[k] for k in
-                                ("step_type", "step_state", "tool_name", "summary") if k in summary}
-    elif summary.get("step_state") == "DONE":
-        tool_name = summary.get("tool_name") or (state.get("active_step") or {}).get("tool_name") or "item"
-        item_id = (value.get("item") or {}).get("id") if isinstance(value.get("item"), dict) else None
-        item_key = compact_label(item_id, default=None, limit=100) if isinstance(item_id, str) else None
-        key = item_key or ("item", tool_name, state["event_count"])
-        state["completed_steps"].add(key)
-        if (state.get("active_step") or {}).get("tool_name") == tool_name:
-            state["active_step"] = None
-    elif summary.get("event") == "turn.completed":
-        state["completed_steps"].add(("turn", state["event_count"]))
-        state["active_step"] = None
-    elif summary.get("event") in ("turn.failed", "result"):
-        state["terminal"] = {k: summary[k] for k in
-                             ("status", "summary") if k in summary}
-        state["active_step"] = None
-    elif summary.get("event") == "error":
-        state["last_error"] = {"summary": "error", "observed_at": observed_at}
-    if summary.get("usage"):
-        state["usage"] = summary["usage"]
-
-
 def update_progress(state, value, observed_at):
     provider = state.get("provider", "gemini")
     if provider == "muse":
         update_muse_progress(state, value, observed_at)
     elif provider == "claude":
         update_claude_progress(state, value, observed_at)
-    elif provider == "deepseek":
-        update_deepseek_progress(state, value, observed_at)
     elif provider == "openai":
         update_openai_progress(state, value, observed_at)
     else:
@@ -2548,7 +2044,7 @@ def update_progress(state, value, observed_at):
 
 
 def update_openai_progress(state, value, observed_at):
-    """Keep Codex JSONL telemetry separate from the legacy DeepSeek schema."""
+    """Summarize Codex JSONL telemetry events."""
     state["event_count"] += 1
     kind = value.get("type") if isinstance(value, dict) else None
     state["last_event"] = {"event": kind, "summary": compact_label(kind, default="unknown")}
@@ -2910,7 +2406,7 @@ def execute(args):
         raise ValueError("--profile is only valid with dispatch")
     if not activity and args.role == "review" and provider_name != "claude":
         raise ValueError(f"Review role is Claude-only; got {provider_name}")
-    if not activity and args.role == "implement" and provider_name not in ("gemini", "deepseek", "muse"):
+    if not activity and args.role == "implement" and provider_name not in ("gemini", "muse"):
         raise ValueError(f"Implement role does not support provider {provider_name}")
     if provider_name not in config.get("providers", {}):
         raise ValueError(f"Provider '{provider_name}' is missing from config")
@@ -2993,66 +2489,9 @@ def execute(args):
         return dry_run_meta, 0
 
     secrets = redaction_secrets(config)
-    checked_deepseek_key = None
-    if provider_name == "deepseek":
-        ds_env = provider.get("api_key_env", "DEEPSEEK_API_KEY")
-        key = os.environ.get(ds_env)
-        if key and key.strip():
-            checked_deepseek_key = key.strip()
-
-        if provider.get("enabled", True) is False:
-            output = workspace / ".llm-output" / "agent-framework" / str(uuid.uuid4())
-            output.mkdir(parents=True, exist_ok=True)
-            result = {
-                "provider": "deepseek",
-                "model": provider["model"],
-                "logs": str(output),
-                "status": "fallback_required",
-                "fallback": luna_fallback(),
-                "error": "DeepSeek provider is disabled in configuration (enabled=false)",
-            }
-            return finish(result, output, workspace, 20, secrets=secrets)
-
-        output = workspace / ".llm-output" / "agent-framework" / str(uuid.uuid4())
-        try:
-            data, balance_err = query_deepseek_balance(config)
-            record_balance_snapshot(state_dir, data, balance_err, config)
-        except Exception as exc:
-            output.mkdir(parents=True, exist_ok=True)
-            result = {
-                "provider": "deepseek",
-                "model": provider["model"],
-                "logs": str(output),
-                "status": "balance_check_failed",
-                "fallback": luna_fallback(),
-                "error": f"DeepSeek balance preflight failed: {exc}",
-            }
-            return finish(result, output, workspace, 1, secrets=secrets)
-
-        if balance_err is not None:
-            output.mkdir(parents=True, exist_ok=True)
-            kind, _ = classify_balance_error(balance_err)
-            status = "fallback_required" if kind == "depleted" else "balance_check_failed"
-            result = {
-                "provider": "deepseek",
-                "model": provider["model"],
-                "logs": str(output),
-                "status": status,
-                "fallback": luna_fallback(),
-                "error": f"DeepSeek balance preflight failed: {balance_err}",
-            }
-            if data:
-                result["balance"] = data
-            return finish(result, output, workspace, 20 if status == "fallback_required" else 1, secrets=secrets)
-    else:
-        output = workspace / ".llm-output" / "agent-framework" / str(uuid.uuid4())
-        output.mkdir(parents=True, exist_ok=True)
-
-    # Create the per-run output directory exactly once, after DeepSeek's live
-    # preflight.  Command construction itself is deliberately side-effect free.
+    # Command construction itself is deliberately side-effect free.
+    output = workspace / ".llm-output" / "agent-framework" / str(uuid.uuid4())
     output.mkdir(parents=True, exist_ok=True)
-    if provider_name == "deepseek":
-        (output / "output_schema.json").write_text(json.dumps(DEEPSEEK_OUTPUT_SCHEMA, indent=2), encoding="utf-8")
     # Avoid Windows' command-line length limit; providers have a Read tool.
     prompt_path = output / "prompt.txt"
     if provider_name == "muse" and activity != "orchestration":
@@ -3061,11 +2500,6 @@ def execute(args):
     run_prompt = (f"Read the complete task contract and instructions in {prompt_path} and follow them. " +
                   ("Use the shared framework dispatcher for authorized child tasks and wait for their results." if activity == "orchestration" else
                    "Execute the task yourself; never spawn subagents or use another AI provider."))
-    if provider_name == "deepseek":
-        run_prompt += (
-            " When complete, return your final response as a JSON object strictly conforming to the schema: "
-            '{"status": "SUCCESS" | "FAILED" | "BLOCKED" | "ERROR", "response": "<summary>"}.'
-        )
     command = command_for(args.role, provider, run_prompt,
                           timeout, workspace, review_effort or "medium", provider_name=provider_name, output_dir=output,
                           activity=activity, state_dir=state_dir)
@@ -3172,7 +2606,7 @@ def execute(args):
                     stream_state.update(muse_meta)
                 progress_snapshot = None
                 try:
-                    child_env = child_environment(config, provider_name, checked_deepseek_key)
+                    child_env = child_environment(config, provider_name)
                     if orchestration_id:
                         child_env["FRAMEWORK_PARENT_RUN_ID"] = orchestration_id
                         child_env["FRAMEWORK_DISPATCHED_WORKER"] = "orchestration"
@@ -3298,8 +2732,6 @@ def execute(args):
             stdout_text = _sanitize_all_secrets(stdout_text, secrets)
             stderr_text = _sanitize_all_secrets(stderr_text, secrets)
 
-            is_terminal = False
-            ds_output = None
             gemini_output = None
             claude_output = None
             muse_terminal = None
@@ -3308,26 +2740,19 @@ def execute(args):
             claude_result_event = False
             stream_errors = []
             provider_output_text = stdout_text
-            if provider_name == "deepseek":
-                ds_output, is_terminal, valid_success = parse_deepseek_final_output(
-                    output, stdout_text, stdout_truncated=stdout_truncated)
-                terminal_turn, terminal_event, has_terminal_402, _ = parse_codex_events(stdout_text)
-            elif provider_name == "openai":
+            if provider_name == "openai":
                 codex_terminal, codex_seen, stream_errors = parse_openai_terminal(stdout_text, stdout_truncated)
                 provider_output_text = json.dumps(codex_terminal) if codex_terminal else ""
                 valid_success = bool(codex_terminal and codex_terminal.get("type") == "turn.completed" and code == 0)
-                terminal_turn, has_terminal_402 = None, False
             elif provider_name == "gemini":
                 gemini_output, gemini_result_event, stream_errors = parse_gemini_final_output(
                     stdout_text, stdout_truncated=stdout_truncated)
                 provider_output_text = json.dumps(gemini_output) if gemini_output is not None else ""
                 valid_success = successful_response(provider_output_text, "implement" if activity else args.role)
-                terminal_turn, has_terminal_402 = None, False
             elif provider_name == "claude":
                 claude_output, claude_result_event, stream_errors = parse_claude_final_output(stdout_text)
                 provider_output_text = json.dumps(claude_output) if claude_output is not None else ""
                 valid_success = successful_response(provider_output_text, "review")
-                terminal_turn, has_terminal_402 = None, False
             elif provider_name == "muse":
                 muse_terminal = stream_state.get("muse_terminal")
                 if muse_terminal:
@@ -3348,10 +2773,8 @@ def execute(args):
                 else:
                     provider_output_text = ""
                     valid_success = False
-                terminal_turn, has_terminal_402 = None, False
             else:
                 valid_success = successful_response(stdout_text, args.role)
-                terminal_turn, has_terminal_402 = None, False
 
             errors = error_objects(provider_output_text)
             if provider_name not in ("muse", "openai"):
@@ -3382,17 +2805,15 @@ def execute(args):
                 plain_error_applies = None
             if plain_error_applies and (not stdout_text.strip() or provider_without_terminal):
                 errors.append(plain_error_applies)
-            raw_stdout_is_partial = provider_name == "deepseek" and stdout_truncated
-            denied = [] if raw_stdout_is_partial else permission_denials(provider_output_text)
-            complete_failure = False if raw_stdout_is_partial else complete_terminal_failure(provider_output_text)
+            denied = permission_denials(provider_output_text)
+            complete_failure = complete_terminal_failure(provider_output_text)
             if (provider_name != "muse" and (not stdout_text.strip() or provider_without_terminal) and
                     not stderr_truncated and not stdout_truncated):
                 complete_failure = complete_failure or complete_terminal_failure(stderr_text)
             terminal_established = (denied or valid_success or plain_error_applies is not None or
                                     (provider_name in ("gemini", "claude") and complete_failure) or
                                     (provider_name == "openai" and codex_terminal is not None) or
-                                    (provider_name == "muse" and muse_terminal_coherent) or
-                                    (provider_name == "deepseek" and (is_terminal or terminal_turn == "failed")))
+                                    (provider_name == "muse" and muse_terminal_coherent))
             result["terminal_established"] = bool(terminal_established)
             if provider_name == "openai":
                 result["stream_terminal_seen"] = codex_seen
@@ -3400,11 +2821,6 @@ def execute(args):
                 result["stream_terminal_seen"] = muse_terminal is not None
             elif provider_name in ("gemini", "claude"):
                 result["stream_terminal_seen"] = gemini_result_event if provider_name == "gemini" else claude_result_event
-            elif provider_name == "deepseek":
-                # turn.completed alone does not validate the required final
-                # schema in last_message.txt, so it cannot claim a usable
-                # terminal result.
-                result["stream_terminal_seen"] = is_terminal or terminal_turn == "failed"
             if args.role == "implement":
                 pending_data = {"status": "resolved" if terminal_established else "uncertain_exit", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "exit_code": code, "provider": provider_name, **muse_meta,
                                 "started_at": started_wall, "finished_at": time.time(), "duration_seconds": result.get("duration_seconds"),
@@ -3422,52 +2838,6 @@ def execute(args):
                     result["error"] = "Provider denied required tools or file access. Task is incomplete; retry with native Luna fallback."
                 else:
                     result["error"] = "Provider denied required tools or file access. Task is incomplete; no automatic permission bypass."
-                return finish(result, output, workspace, 1, secrets=secrets)
-
-            if provider_name == "deepseek":
-                if valid_success and code == 0 and terminal_turn != "failed":
-                    result.update(status="completed", exit_code=code)
-                    refresh_balance_safe(state_dir, config)
-                    return finish(result, output, workspace, 0, secrets=secrets)
-
-                # Only check for runtime 402/insufficient balance when there is no terminal success
-                insufficient_balance = None
-                if has_terminal_402:
-                    insufficient_balance = {"code": "INSUFFICIENT_BALANCE", "message": "HTTP 402: Insufficient balance", "source": "codex_event"}
-                else:
-                    # Balance depletion must come from terminal evidence. An
-                    # intermediate error event may be followed by a different
-                    # terminal failure and must not permanently poison routing.
-                    terminal_balance_errors = []
-                    if terminal_turn == "failed" and isinstance(terminal_event, dict):
-                        terminal_error = terminal_event.get("error")
-                        if isinstance(terminal_error, dict):
-                            terminal_balance_errors.append(terminal_error)
-                        elif isinstance(terminal_error, str):
-                            terminal_balance_errors.append({"message": terminal_error})
-                    if is_terminal and isinstance(ds_output, dict):
-                        terminal_balance_errors.extend(error_objects(json.dumps(ds_output)))
-                    insufficient_balance = deepseek_insufficient_balance_error(terminal_balance_errors)
-
-                if insufficient_balance and terminal_established:
-                    record_balance_snapshot(state_dir, {"is_available": False, "balance_infos": []},
-                                            error=insufficient_balance.get("message", "HTTP 402: Insufficient balance"), config=config)
-                    result.update(status="fallback_required", fallback=luna_fallback(),
-                                  error=insufficient_balance.get("message", "HTTP 402: Insufficient balance"), exit_code=code)
-                    return finish(result, output, workspace, 20, secrets=secrets)
-
-                result.update(status="uncertain_exit" if not terminal_established else "provider_error", exit_code=code if code != 0 else 1)
-                if terminal_established:
-                    result["fallback"] = luna_fallback()
-                if errors and not is_terminal:
-                    result["error"] = (structured_error_message(errors)
-                                       or "DeepSeek provider reported an error without details.")
-                elif not errors and not is_terminal:
-                    result["error"] = "No structured terminal result from DeepSeek; output missing or malformed."
-                elif is_terminal and not valid_success:
-                    result["error"] = (ds_output.get("response")
-                                       if ds_output and ds_output.get("response")
-                                       else f"DeepSeek returned terminal non-success status: {ds_output.get('status') if ds_output else 'UNKNOWN'}")
                 return finish(result, output, workspace, 1, secrets=secrets)
 
             quota = (muse_quota_error(muse_terminal) if provider_name == "muse" and muse_terminal_coherent else
@@ -3613,88 +2983,16 @@ def cli_quota_status(args):
         raise ValueError("Routing configuration must contain a providers object")
     muse_profile_arg = getattr(args, "muse_profile", None)
     require_muse_profile_allowed(muse_profile_arg, getattr(args, "provider", None))
-    providers = [args.provider] if args.provider else [p for p in ("gemini", "deepseek", "claude", "muse", "openai") if p in config["providers"]]
+    providers = [args.provider] if args.provider else [p for p in ("gemini", "claude", "muse", "openai") if p in config["providers"]]
     state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
     output = {}
     code = 0
-    check_live = getattr(args, "check_live", False)
 
     for provider in providers:
         if not isinstance(config["providers"].get(provider), dict):
             output[provider] = {"status": "state_error", "available_to_try": 0,
                                 "error": "Provider is missing from config"}
             code = 1
-            continue
-
-        if provider == "deepseek":
-            item = {
-                "provider": "deepseek",
-                "model": config["providers"]["deepseek"].get("model"),
-                "balance_path": str(balance_path(state_dir)),
-            }
-            if config["providers"]["deepseek"].get("enabled", True) is False:
-                item.update(
-                    status="disabled",
-                    available_to_try=0,
-                    fallback=luna_fallback(),
-                    error="DeepSeek provider is disabled in configuration (enabled=false)",
-                )
-                output[provider] = item
-                continue
-
-            if check_live:
-                item["live"] = True
-                item["cached"] = False
-                try:
-                    data, err = query_deepseek_balance(config)
-                    snapshot = record_balance_snapshot(state_dir, data, err, config)
-                except Exception as exc:
-                    data, err = None, BalanceError(f"Balance check exception: {exc}", kind="unverified", code="CHECK_EXCEPTION")
-                    snapshot = record_balance_snapshot(state_dir, None, err, config)
-
-                item["observed_at"] = snapshot.get("observed_at")
-                if data:
-                    item["is_available"] = data.get("is_available")
-                    item["balance_infos"] = data.get("balance_infos")
-                    item["total_balance"] = snapshot.get("total_balance")
-                if err:
-                    item["error"] = str(err)
-                    item["available_to_try"] = 0
-                    item["fallback"] = luna_fallback()
-                    kind, _ = classify_balance_error(err)
-                    if kind == "depleted":
-                        item["status"] = "fallback_required"
-                        if code == 0:
-                            code = 20
-                    else:
-                        item["status"] = "balance_check_failed"
-                        code = 1
-                else:
-                    item["status"] = "available_to_try"
-                    item["available_to_try"] = 1
-            else:
-                item["live"] = False
-                snapshot, state_err = balance_state(state_dir)
-                if state_err:
-                    item.update(cached=False, status="state_error", available_to_try=0, fallback=luna_fallback(), error="Malformed or unreadable balance snapshot: " + state_err)
-                    code = 1
-                elif snapshot:
-                    item["cached"] = True
-                    item["observed_at"] = snapshot.get("observed_at")
-                    item["is_available"] = snapshot.get("is_available")
-                    item["balance_infos"] = snapshot.get("balance_infos", [])
-                    item["total_balance"] = snapshot.get("total_balance")
-                    item["last_check_error"] = snapshot.get("last_check_error") or snapshot.get("error")
-                    item["last_check_error_at"] = snapshot.get("last_check_error_at")
-                    item["status"] = "available_to_try"
-                    item["available_to_try"] = 1
-                    item["live_check_required"] = True
-                    item["note"] = "Cached snapshot is reporting evidence only; live check is required and performed on execute (or pass --check-live)."
-                else:
-                    item.update(cached=False, status="available_to_try", available_to_try=1, observed_at=None, is_available=None, balance_infos=[])
-                    item["live_check_required"] = True
-                    item["note"] = "No cached snapshot; live check is required and performed on execute (or pass --check-live)."
-            output[provider] = item
             continue
 
         muse_meta = {}
@@ -3739,7 +3037,7 @@ def cli_quota_set(args):
     quota_cooldown(config)
     provider = args.provider
     if provider not in ("gemini", "claude", "muse", "openai"):
-        raise ValueError(f"quota-set only supports subscription quota providers; '{provider}' uses monetary balance preflight")
+        raise ValueError(f"quota-set only supports subscription quota providers; got '{provider}'")
     if provider not in config.get("providers", {}):
         raise ValueError("Provider is missing from config")
     muse_profile_arg = getattr(args, "muse_profile", None)
@@ -3770,8 +3068,8 @@ def cli_quota_set(args):
 
 
 def activity_status(args):
-    if getattr(args, "check_live", False) or getattr(args, "muse_profile", None):
-        raise ValueError("Activity status is local only and does not accept --check-live/--muse-profile")
+    if getattr(args, "muse_profile", None):
+        raise ValueError("Activity status is local only and does not accept --muse-profile")
     if getattr(args, "profile", None) and getattr(args, "provider", None):
         raise ValueError("Choose one of --profile or --provider")
     config = read_json(args.config)
@@ -3930,11 +3228,10 @@ def main():
         parser.add_argument("--config", required=True)
         parser.add_argument("--state-dir")
         if command == "status":
-            parser.add_argument("--provider", choices=("gemini", "deepseek", "claude", "muse", "openai"))
+            parser.add_argument("--provider", choices=("gemini", "claude", "muse", "openai"))
             parser.add_argument("--activity")
             parser.add_argument("--profile")
             parser.add_argument("--muse-profile", choices=MUSE_PROFILE_NAMES, default=None)
-            parser.add_argument("--check-live", "--live", dest="check_live", action="store_true")
         if command == "quota-set":
             parser.add_argument("--provider", choices=("gemini", "claude", "muse", "openai"), required=True)
             parser.add_argument("--muse-profile", choices=MUSE_PROFILE_NAMES, default=None)
@@ -3947,13 +3244,13 @@ def main():
         except (OSError, ValueError, KeyError, TypeError) as exc:
             result = {"status": "state_error", "available_to_try": 0, "error": str(exc)}
             if getattr(args, "provider", None):
-                result["fallback"] = luna_fallback() if args.provider in ("gemini", "deepseek", "muse") else {"model": "gpt-6-astra", "effort": "low"}
+                result["fallback"] = luna_fallback() if args.provider in ("gemini", "muse") else {"model": "gpt-6-astra", "effort": "low"}
             code = 1
         print(json.dumps(result, indent=2))
         return code
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("role", choices=("implement", "review", "dispatch"))
-    parser.add_argument("--provider", choices=("gemini", "deepseek", "claude", "muse", "openai"), default=None)
+    parser.add_argument("--provider", choices=("gemini", "claude", "muse", "openai"), default=None)
     parser.add_argument("--activity")
     parser.add_argument("--profile")
     parser.add_argument("--parent-run-id")

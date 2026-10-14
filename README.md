@@ -18,7 +18,7 @@ The dispatcher shares one quota cache per account across all models and activiti
 
 Static analysis activities use restricted read/search tools. Writing activities require explicit owned paths. A `verification` worker can execute checks and write generated/scratch artifacts within its contract. Independent review starts fresh against a saved candidate and Jev diff binding, and prefers a provider other than the author when one is eligible. High/deep review requires a concrete reason.
 
-The legacy `implement`, `review`, `status --provider` and `quota-set` commands remain for existing scripts. Their pinned-provider fallback metadata does not define the new activity chains. Retired DeepSeek code and state remain for compatibility and audit; the v12 chain does not route to it.
+The legacy `implement`, `review`, `status --provider` and `quota-set` commands remain for existing scripts. Their pinned-provider fallback metadata does not define the new activity chains. DeepSeek has been removed. Upgrades drop it from `routing.json`, and its API key names stay filtered out of every provider process.
 
 This is local process, cache and claim coordination on one machine. CLI permissions and secret filtering add defense in depth; they are not a cross-process security boundary. Offline fake-CLI tests establish parser and routing behavior, while live authentication, account entitlement and provider-enforced tool capabilities require bounded signed-in validation.
 

@@ -22,6 +22,10 @@ The legacy `implement`, `review`, `status --provider` and `quota-set` commands r
 
 This is local process, cache and claim coordination on one machine. CLI permissions and secret filtering add defense in depth; they are not a cross-process security boundary. Offline fake-CLI tests establish parser and routing behavior, while live authentication, account entitlement and provider-enforced tool capabilities require bounded signed-in validation.
 
+## Claude Code host
+
+`python install.py --host claude` installs the same dispatcher for a Claude Code primary: policy in `~/.claude/CLAUDE.md`, native roles in `~/.claude/agents/`, skills (including `ask-codex`) in `~/.claude/skills/`, and Claude-specific default chains from [claude/routing.example.json](claude/routing.example.json). It is separate from a Codex install and keeps its own state. See [CLAUDE_HOST.md](docs/CLAUDE_HOST.md).
+
 ## Setup and operation
 
 Install the external CLIs and sign into the intended subscription accounts before expecting any route to run. Codex uses its ChatGPT login path; a stored API key or alternate provider configuration must not be assumed to use the subscription. Muse Power needs its interactive browser sign-in and an entitled CLI model ID; regular Wonder and Wonder Full access should be checked separately. Claude and Gemini likewise need installed, signed-in CLIs. The installer discovers executable paths but does not log in, purchase a plan, redeem credits or establish model entitlement. Jev search/review evidence is prepared by the primary/native agent and referenced in task JSON; external children do not inherit its API key. See [JEV.md](docs/JEV.md).

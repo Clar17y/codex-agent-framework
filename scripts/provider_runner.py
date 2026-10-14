@@ -1718,15 +1718,34 @@ def muse_secrets(config):
 def framework_secrets(config):
     """Credentials used by framework helpers, never by execution-provider children."""
     secrets = dict(deepseek_secrets(config) + muse_secrets(config))
-    if os.environ.get("TYPESAFE_API_KEY", "").strip():
-        secrets["TYPESAFE_API_KEY"] = os.environ["TYPESAFE_API_KEY"]
+    # Anthropic API credentials (including a host-only overflow key) belong to
+    # the Claude host, never to subscription CLI children of any vendor.
+    for name in ("TYPESAFE_API_KEY", *ANTHROPIC_SECRET_ENV):
+        if os.environ.get(name, "").strip():
+            secrets[name] = os.environ[name]
     return list(secrets.items())
+
+
+ANTHROPIC_SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY")
+CLAUDE_OAUTH_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+
+
+def redaction_secrets(config):
+    """Secret values never persisted in artifacts, including ones a child legitimately receives."""
+    secrets = [value.strip() for _, value in framework_secrets(config)]
+    if os.environ.get(CLAUDE_OAUTH_ENV, "").strip():
+        secrets.append(os.environ[CLAUDE_OAUTH_ENV].strip())
+    return secrets
 
 
 def child_environment(config, provider_name, checked_deepseek_key=None):
     """Keep helper credentials out of external execution-provider environments."""
     env = dict(os.environ)
     env.pop("FRAMEWORK_PARENT_RUN_ID", None)
+    # Host instruction files (for example ~/.claude/CLAUDE.md) can reach a
+    # child CLI. This marker tells host policy that the process is a bounded
+    # worker, not the primary orchestrator; orchestration launches override it.
+    env["FRAMEWORK_DISPATCHED_WORKER"] = "1"
     env.pop("TYPESAFE_API_KEY", None)
     for name in ("META_API_KEY", "MUSE_API_KEY", "META_MODEL_API_KEY"):
         env.pop(name, None)
@@ -1739,6 +1758,20 @@ def child_environment(config, provider_name, checked_deepseek_key=None):
             if name.upper().startswith("CODEX_") and name.upper() != "CODEX_HOME":
                 env.pop(name, None)
         for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "CODEX_BASE_URL"):
+            env.pop(name, None)
+    # A Claude Code host exports session markers and tokens (CLAUDECODE,
+    # CLAUDE_CODE_ENTRYPOINT, IPC ports, messaging tokens and similar
+    # CLAUDE_CODE_* values) into its shell. No child needs them: a nested
+    # `claude -p` must start as a fresh top-level session, and other vendors
+    # must not read Claude credentials. Only Claude children keep the
+    # subscription token. ANTHROPIC_* overrides (API keys, auth tokens, base
+    # URLs, default models, Bedrock/Vertex routing) would switch a Claude child
+    # away from the signed-in subscription or the pinned model.
+    for name in tuple(env):
+        upper = name.upper()
+        if upper == "CLAUDECODE" or upper.startswith("ANTHROPIC_") or (
+                upper.startswith("CLAUDE_CODE_") and upper != "CLAUDE_CODE_GIT_BASH_PATH"
+                and not (upper == CLAUDE_OAUTH_ENV and provider_name == "claude")):
             env.pop(name, None)
     providers = config.get("providers", {}) if isinstance(config, dict) else {}
     muse = providers.get("muse", {}) if isinstance(providers, dict) else {}
@@ -2959,7 +2992,7 @@ def execute(args):
             dry_run_meta["jev"] = jev_meta
         return dry_run_meta, 0
 
-    secrets = [value.strip() for _, value in framework_secrets(config)]
+    secrets = redaction_secrets(config)
     checked_deepseek_key = None
     if provider_name == "deepseek":
         ds_env = provider.get("api_key_env", "DEEPSEEK_API_KEY")
@@ -3142,6 +3175,7 @@ def execute(args):
                     child_env = child_environment(config, provider_name, checked_deepseek_key)
                     if orchestration_id:
                         child_env["FRAMEWORK_PARENT_RUN_ID"] = orchestration_id
+                        child_env["FRAMEWORK_DISPATCHED_WORKER"] = "orchestration"
                     process = subprocess.Popen(command, cwd=workspace, shell=False, stdin=subprocess.DEVNULL,
                                                stdout=stdout, stderr=stderr, env=child_env,
                                                start_new_session=os.name != "nt")
@@ -3716,7 +3750,7 @@ def cli_quota_set(args):
     reason = args.reason.strip() if isinstance(args.reason, str) else ""
     if not reason:
         raise ValueError("reason must be non-empty")
-    secret_values = [value.strip() for _, value in framework_secrets(config)]
+    secret_values = redaction_secrets(config)
     error = {"code": "QUOTA_EXHAUSTED", "message": _sanitize_all_secrets(reason, secret_values), "source": "operator"}
     if args.reset_at:
         try:

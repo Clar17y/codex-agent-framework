@@ -54,8 +54,7 @@ class ClaudeHostInstallTests(unittest.TestCase):
             install_framework(host="claude", claude_home=str(self.root), source=str(self.source), **kwargs)
 
     def installed_text_files(self):
-        for path in [self.root / "CLAUDE.md", *(self.root / "agents").glob("*"), *(self.root / "skills").rglob("*.md")]:
-            yield path
+        return [self.root / "CLAUDE.md", *(self.root / "agents").glob("*"), *(self.root / "skills").rglob("*.md")]
 
     def test_fresh_install_writes_claude_layout_with_rendered_paths(self):
         self.install()

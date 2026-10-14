@@ -1728,7 +1728,14 @@ def framework_secrets(config):
 
 ANTHROPIC_SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY")
 CLAUDE_OAUTH_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
-CLAUDE_CHILD_ENV_KEEP = frozenset({CLAUDE_OAUTH_ENV, "CLAUDE_CODE_GIT_BASH_PATH"})
+
+
+def redaction_secrets(config):
+    """Secret values never persisted in artifacts, including ones a child legitimately receives."""
+    secrets = [value.strip() for _, value in framework_secrets(config)]
+    if os.environ.get(CLAUDE_OAUTH_ENV, "").strip():
+        secrets.append(os.environ[CLAUDE_OAUTH_ENV].strip())
+    return secrets
 
 
 def child_environment(config, provider_name, checked_deepseek_key=None):
@@ -1760,11 +1767,11 @@ def child_environment(config, provider_name, checked_deepseek_key=None):
     # subscription token. ANTHROPIC_* overrides (API keys, auth tokens, base
     # URLs, default models, Bedrock/Vertex routing) would switch a Claude child
     # away from the signed-in subscription or the pinned model.
-    keep = CLAUDE_CHILD_ENV_KEEP if provider_name == "claude" else CLAUDE_CHILD_ENV_KEEP - {CLAUDE_OAUTH_ENV}
     for name in tuple(env):
         upper = name.upper()
         if upper == "CLAUDECODE" or upper.startswith("ANTHROPIC_") or (
-                upper.startswith("CLAUDE_CODE_") and upper not in keep):
+                upper.startswith("CLAUDE_CODE_") and upper != "CLAUDE_CODE_GIT_BASH_PATH"
+                and not (upper == CLAUDE_OAUTH_ENV and provider_name == "claude")):
             env.pop(name, None)
     providers = config.get("providers", {}) if isinstance(config, dict) else {}
     muse = providers.get("muse", {}) if isinstance(providers, dict) else {}
@@ -2985,11 +2992,7 @@ def execute(args):
             dry_run_meta["jev"] = jev_meta
         return dry_run_meta, 0
 
-    secrets = [value.strip() for _, value in framework_secrets(config)]
-    # Claude children legitimately receive the subscription token, but it must
-    # never be persisted in any run's artifacts.
-    if os.environ.get(CLAUDE_OAUTH_ENV, "").strip():
-        secrets.append(os.environ[CLAUDE_OAUTH_ENV].strip())
+    secrets = redaction_secrets(config)
     checked_deepseek_key = None
     if provider_name == "deepseek":
         ds_env = provider.get("api_key_env", "DEEPSEEK_API_KEY")
@@ -3747,7 +3750,7 @@ def cli_quota_set(args):
     reason = args.reason.strip() if isinstance(args.reason, str) else ""
     if not reason:
         raise ValueError("reason must be non-empty")
-    secret_values = [value.strip() for _, value in framework_secrets(config)]
+    secret_values = redaction_secrets(config)
     error = {"code": "QUOTA_EXHAUSTED", "message": _sanitize_all_secrets(reason, secret_values), "source": "operator"}
     if args.reset_at:
         try:

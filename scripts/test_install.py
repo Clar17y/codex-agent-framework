@@ -26,6 +26,17 @@ from install import (
 )
 
 SCRATCH_BASE = REPO_ROOT / ".llm-output" / "scratch_test_install"
+SOURCE_FILES = ('install.py', 'GLOBAL_POLICY.md', 'README.md', 'routing.example.json', 'task-template.json')
+SOURCE_DIRS = ('agents', 'skills', 'scripts', 'docs')
+
+
+def copy_source_package(dest, extra_dirs=()):
+    """Copy the installable package (not caches or scratch output) into dest."""
+    dest.mkdir()
+    for name in SOURCE_FILES:
+        shutil.copy2(REPO_ROOT / name, dest / name)
+    for name in (*SOURCE_DIRS, *extra_dirs):
+        shutil.copytree(REPO_ROOT / name, dest / name, ignore=shutil.ignore_patterns('__pycache__'))
 
 
 class TestInstallFramework(unittest.TestCase):
@@ -43,12 +54,7 @@ class TestInstallFramework(unittest.TestCase):
         self.addCleanup(home_patch.stop)
         self.dest_root = self.test_dir / "target_codex"
         self.source_root = self.test_dir / "source"
-        self.source_root.mkdir()
-        for name in ('install.py', 'GLOBAL_POLICY.md', 'README.md', 'routing.example.json', 'task-template.json'):
-            shutil.copy2(REPO_ROOT / name, self.source_root / name)
-        for name in ('agents', 'skills', 'scripts', 'docs'):
-            shutil.copytree(REPO_ROOT / name, self.source_root / name,
-                            ignore=shutil.ignore_patterns('__pycache__'))
+        copy_source_package(self.source_root)
 
     def test_v12_custom_profile_and_chain_preserved_and_bad_reference_rejected(self):
         install_framework(str(self.dest_root), source=str(self.source_root))

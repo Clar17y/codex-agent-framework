@@ -14,9 +14,9 @@ The default root is `~/.claude` (`CLAUDE_CONFIG_DIR` or `--claude-home` override
 | Destination | Content |
 | --- | --- |
 | `~/.claude/CLAUDE.md` | Framework policy inside `<!-- BEGIN/END CLAUDE MULTI-PROVIDER FRAMEWORK -->` markers. Text outside the markers is preserved. |
-| `~/.claude/agents/*.md` | Twelve native roles on Haiku, Sonnet or Opus. |
+| `~/.claude/agents/*.md` | Twelve native roles on Haiku, Sonnet or Opus, rendered from `agents/*.toml` (see below). |
 | `~/.claude/skills/` | `route-activity`, `ask-codex`, `ask-gemini`, `ask-muse`, `framework-simplify`, `jev-search`, `jev-review`. |
-| `~/.claude/agent-framework/` | Runner, Jev helpers, docs, task template, `routing.json` from `claude/routing.example.json`, and `state/`. |
+| `~/.claude/agent-framework/` | Runner, Jev helpers, docs, task template, `routing.json` from `routing.example.json` with `claude/routing.overlay.json` applied, and `state/`. |
 | `~/.gemini/config/agents/framework-reader.md` | Antigravity read-only helper, shared with a Codex install; either host's manifest (default roots or `CODEX_HOME`/`CLAUDE_CONFIG_DIR`) counts as ownership when upgrading it. |
 
 Existing agents or skills with the same names are replaced only when the previous manifest shows this installer wrote them; any other collision stops installation before writing. Backups go to `agent-framework/backups/`. Start a new Claude Code session afterwards so the roles and skills load.
@@ -29,7 +29,7 @@ Dispatch needs the signed-in CLIs, so it works from Claude Code on the machine w
 
 ## Default routing
 
-`claude/routing.example.json` keeps every profile from the Codex package and changes only the activity chains. It assumes Claude Max as the orchestrator budget, Codex on the smaller ChatGPT plan, Google AI Pro and Muse Power:
+`claude/routing.overlay.json` replaces only the `activities` key of the shared `routing.example.json`, so profiles, providers and workflow defaults stay in one place. It assumes Claude Max as the orchestrator budget, Codex on the smaller ChatGPT plan, Google AI Pro and Muse Power:
 
 - Routine work (exploration, implementation, testing, verification, documentation, docs research, refactor audit) starts on Gemini Flash, then Muse Wonder, with Claude and Codex Luna last.
 - Complex and long-horizon implementation and test design start on Muse Wonder Full, with Claude Opus and Codex Sol high behind it.
@@ -38,6 +38,10 @@ Dispatch needs the signed-in CLIs, so it works from Claude Code on the machine w
 - Deep review starts on Claude Opus high, then Astra, which may not be available on every ChatGPT plan.
 
 These are quota-driven defaults, not measurements. Edit the chains in the installed `routing.json`; reinstalling preserves your edits.
+
+## Derived roles and skills
+
+The Claude roles and the `framework-simplify` skill are not kept as separate copies. At install time `claude/derived.toml` renders each `agents/<role>.toml` into Claude Code frontmatter (tools, model alias, optional description) followed by its `developer_instructions`, and renders `skills/simplify/SKILL.md` as `framework-simplify`. Host-specific wording is a list of exact whole-line replacements. Edit a role in its TOML once; if an edit changes a line that a replacement targets, installation stops before writing and names the file, so update the `old` line in `claude/derived.toml` to match.
 
 ## Running a dispatch
 

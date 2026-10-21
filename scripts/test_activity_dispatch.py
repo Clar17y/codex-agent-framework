@@ -625,6 +625,8 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
         helper.write_bytes((ROOT / "agents/framework-reader.md").read_bytes())
         for name in ("openai-sol", "claude-opus", "muse-full", "gemini-flash"):
             provider_name, provider = runner.effective_activity_provider(self.config, name)
+            # Command construction must not discover the operator's installed CLI.
+            provider["executable"] = [sys.executable]
             if provider_name == "gemini":
                 provider.update(reader_agent_file=str(helper))
             with mock.patch.object(runner.Path, "home", return_value=self.root):
@@ -658,6 +660,7 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
 
     def test_openai_orchestration_writable_roots_are_explicit_and_bounded(self):
         _, provider = runner.effective_activity_provider(self.config, "openai-sol")
+        provider["executable"] = [sys.executable]
         state = self.root / "shared-state"
         cache = self.root / "provider-cache"
         provider["orchestration_writable_roots"] = [str(cache)]

@@ -293,6 +293,9 @@ class TestInstallFramework(unittest.TestCase):
         self.assertTrue((af_dir / "routing.example.json").exists())
         self.assertTrue((af_dir / "install.py").exists())
         self.assertTrue((af_dir / "scripts" / "provider_runner.py").exists())
+        for name in ('run_tests.py', 'test_run_tests.py'):
+            self.assertEqual((af_dir / 'scripts' / name).read_bytes(),
+                             (self.source_root / 'scripts' / name).read_bytes())
         self.assertEqual(
             (af_dir / "scripts" / "test_muse_provider.py").read_bytes(),
             (self.source_root / "scripts" / "test_muse_provider.py").read_bytes(),
@@ -1000,13 +1003,17 @@ class TestInstallFramework(unittest.TestCase):
 
     def test_cli_execution(self):
         """Test invoking install.py via CLI with --codex-home and --dry-run."""
+        # Path.home patches do not cross process boundaries. Keep the reader
+        # registration and CLI discovery out of the operator's actual home.
+        child_env = dict(os.environ, USERPROFILE=str(self.fake_home), HOME=str(self.fake_home))
         # CLI dry run
         res_dry = subprocess.run(
             [sys.executable, str(self.source_root / "install.py"), "--codex-home", str(self.dest_root), "--dry-run"],
             capture_output=True,
             text=True,
+            env=child_env,
         )
-        self.assertEqual(res_dry.returncode, 0)
+        self.assertEqual(res_dry.returncode, 0, res_dry.stderr)
         self.assertIn("Dry run requested", res_dry.stdout)
         self.assertFalse(self.dest_root.exists())
 
@@ -1015,14 +1022,18 @@ class TestInstallFramework(unittest.TestCase):
             [sys.executable, str(self.source_root / "install.py"), "--codex-home", str(self.dest_root)],
             capture_output=True,
             text=True,
+            env=child_env,
         )
-        self.assertEqual(res_real.returncode, 0)
+        self.assertEqual(res_real.returncode, 0, res_real.stderr)
         self.assertTrue((self.dest_root / "agent-framework" / "install-manifest.json").exists())
+        self.assertTrue((self.fake_home / '.gemini/config/agents/framework-reader.md').is_file())
 
     def make_link(self, link, target, directory=True):
         if sys.platform == 'win32' and directory:
             result = subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(target)],
                                     capture_output=True, text=True)
+            if result.returncode and 'Access is denied' in result.stderr:
+                self.skipTest(f'Platform denies junction creation: {result.stderr.strip()}')
             self.assertEqual(result.returncode, 0, result.stderr)
         else:
             try:

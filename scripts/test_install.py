@@ -293,6 +293,9 @@ class TestInstallFramework(unittest.TestCase):
         self.assertTrue((af_dir / "routing.example.json").exists())
         self.assertTrue((af_dir / "install.py").exists())
         self.assertTrue((af_dir / "scripts" / "provider_runner.py").exists())
+        for name in ('run_tests.py', 'test_run_tests.py'):
+            self.assertEqual((af_dir / 'scripts' / name).read_bytes(),
+                             (self.source_root / 'scripts' / name).read_bytes())
         self.assertEqual(
             (af_dir / "scripts" / "test_muse_provider.py").read_bytes(),
             (self.source_root / "scripts" / "test_muse_provider.py").read_bytes(),
@@ -1000,13 +1003,17 @@ class TestInstallFramework(unittest.TestCase):
 
     def test_cli_execution(self):
         """Test invoking install.py via CLI with --codex-home and --dry-run."""
+        # Path.home patches do not cross process boundaries. Keep the reader
+        # registration and CLI discovery out of the operator's actual home.
+        child_env = dict(os.environ, USERPROFILE=str(self.fake_home), HOME=str(self.fake_home))
         # CLI dry run
         res_dry = subprocess.run(
             [sys.executable, str(self.source_root / "install.py"), "--codex-home", str(self.dest_root), "--dry-run"],
             capture_output=True,
             text=True,
+            env=child_env,
         )
-        self.assertEqual(res_dry.returncode, 0)
+        self.assertEqual(res_dry.returncode, 0, res_dry.stderr)
         self.assertIn("Dry run requested", res_dry.stdout)
         self.assertFalse(self.dest_root.exists())
 
@@ -1015,20 +1022,55 @@ class TestInstallFramework(unittest.TestCase):
             [sys.executable, str(self.source_root / "install.py"), "--codex-home", str(self.dest_root)],
             capture_output=True,
             text=True,
+            env=child_env,
         )
-        self.assertEqual(res_real.returncode, 0)
+        self.assertEqual(res_real.returncode, 0, res_real.stderr)
         self.assertTrue((self.dest_root / "agent-framework" / "install-manifest.json").exists())
+        self.assertTrue((self.fake_home / '.gemini/config/agents/framework-reader.md').is_file())
 
     def make_link(self, link, target, directory=True):
         if sys.platform == 'win32' and directory:
-            result = subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(target)],
-                                    capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            import _winapi
+            try:
+                _winapi.CreateJunction(str(target), str(link))
+            except OSError as exc:
+                # Native codes survive localization; do not hide other errors.
+                if exc.winerror in (5, 1314):  # access denied / privilege not held
+                    self.skipTest(f'Platform denies junction creation (winerror={exc.winerror})')
+                raise
         else:
             try:
                 link.symlink_to(target, target_is_directory=directory)
             except OSError as exc:
                 self.skipTest(f'Platform cannot create symlink: {exc}')
+
+    def test_junction_creation_uses_native_api(self):
+        native = mock.Mock()
+        with mock.patch.object(sys, 'platform', 'win32'), mock.patch.dict(sys.modules, {'_winapi': native}):
+            self.make_link(self.dest_root, self.fake_home)
+        native.CreateJunction.assert_called_once_with(str(self.fake_home), str(self.dest_root))
+
+    def test_junction_permission_skips_are_language_independent(self):
+        for code in (5, 1314):
+            for message in ('Zugriff verweigert', 'Accès refusé'):
+                with self.subTest(code=code, message=message):
+                    error = OSError(message)
+                    error.winerror = code
+                    native = mock.Mock()
+                    native.CreateJunction.side_effect = error
+                    with mock.patch.object(sys, 'platform', 'win32'), mock.patch.dict(sys.modules, {'_winapi': native}):
+                        with self.assertRaisesRegex(unittest.SkipTest, f'winerror={code}'):
+                            self.make_link(self.dest_root, self.fake_home)
+
+    def test_junction_nonpermission_errors_are_not_skipped(self):
+        error = OSError('Access is denied')  # Text alone must not select a skip.
+        error.winerror = 183  # already exists
+        native = mock.Mock()
+        native.CreateJunction.side_effect = error
+        with mock.patch.object(sys, 'platform', 'win32'), mock.patch.dict(sys.modules, {'_winapi': native}):
+            with self.assertRaises(OSError) as caught:
+                self.make_link(self.dest_root, self.fake_home)
+        self.assertIs(caught.exception, error)
 
     def test_linked_root_rejected_before_resolving(self):
         outside = self.test_dir / 'outside'

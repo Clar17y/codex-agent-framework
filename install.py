@@ -123,7 +123,7 @@ def collect_sources(source, host='codex'):
              'routing.example.json', 'install.py', 'scripts/provider_runner.py',
              'agents/framework-reader.md',
              'scripts/test_provider_runner.py', 'scripts/test_install.py',
-             'scripts/test_activity_dispatch.py',
+             'scripts/test_activity_dispatch.py', 'scripts/run_tests.py', 'scripts/test_run_tests.py',
              'scripts/test_muse_provider.py', 'docs/FRAMEWORK.md',
              'scripts/jev_client.py', 'scripts/jev_search.py', 'scripts/jev_review.py',
              'scripts/test_jev_client.py', 'scripts/test_jev_search.py', 'scripts/test_jev_review.py']

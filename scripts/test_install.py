@@ -1030,16 +1030,47 @@ class TestInstallFramework(unittest.TestCase):
 
     def make_link(self, link, target, directory=True):
         if sys.platform == 'win32' and directory:
-            result = subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(target)],
-                                    capture_output=True, text=True)
-            if result.returncode and 'Access is denied' in result.stderr:
-                self.skipTest(f'Platform denies junction creation: {result.stderr.strip()}')
-            self.assertEqual(result.returncode, 0, result.stderr)
+            import _winapi
+            try:
+                _winapi.CreateJunction(str(target), str(link))
+            except OSError as exc:
+                # Native codes survive localization; do not hide other errors.
+                if exc.winerror in (5, 1314):  # access denied / privilege not held
+                    self.skipTest(f'Platform denies junction creation (winerror={exc.winerror})')
+                raise
         else:
             try:
                 link.symlink_to(target, target_is_directory=directory)
             except OSError as exc:
                 self.skipTest(f'Platform cannot create symlink: {exc}')
+
+    def test_junction_creation_uses_native_api(self):
+        native = mock.Mock()
+        with mock.patch.object(sys, 'platform', 'win32'), mock.patch.dict(sys.modules, {'_winapi': native}):
+            self.make_link(self.dest_root, self.fake_home)
+        native.CreateJunction.assert_called_once_with(str(self.fake_home), str(self.dest_root))
+
+    def test_junction_permission_skips_are_language_independent(self):
+        for code in (5, 1314):
+            for message in ('Zugriff verweigert', 'Accès refusé'):
+                with self.subTest(code=code, message=message):
+                    error = OSError(message)
+                    error.winerror = code
+                    native = mock.Mock()
+                    native.CreateJunction.side_effect = error
+                    with mock.patch.object(sys, 'platform', 'win32'), mock.patch.dict(sys.modules, {'_winapi': native}):
+                        with self.assertRaisesRegex(unittest.SkipTest, f'winerror={code}'):
+                            self.make_link(self.dest_root, self.fake_home)
+
+    def test_junction_nonpermission_errors_are_not_skipped(self):
+        error = OSError('Access is denied')  # Text alone must not select a skip.
+        error.winerror = 183  # already exists
+        native = mock.Mock()
+        native.CreateJunction.side_effect = error
+        with mock.patch.object(sys, 'platform', 'win32'), mock.patch.dict(sys.modules, {'_winapi': native}):
+            with self.assertRaises(OSError) as caught:
+                self.make_link(self.dest_root, self.fake_home)
+        self.assertIs(caught.exception, error)
 
     def test_linked_root_rejected_before_resolving(self):
         outside = self.test_dir / 'outside'

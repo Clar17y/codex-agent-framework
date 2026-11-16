@@ -849,6 +849,146 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
         launch.assert_not_called()
         self.assertTrue(all(x["quota_path"].endswith(x["provider"] + "-quota.json") for x in result["routes"]))
 
+    def test_hydrogen_model_unavailable_falls_through_to_flash_success(self):
+        """Authoritative terminal model failure on Hydrogen falls through to Flash."""
+        launches = []
+        def fake_execute(args):
+            launches.append(args.profile)
+            if args.profile == "gemini-hydrogen":
+                return {
+                    "status": "provider_error",
+                    "terminal_established": True,
+                    "error": "model gemini-4-hydrogen-medium is unavailable",
+                    "logs": "hydrogen-model-fail"
+                }, 1
+            if args.profile == "gemini-flash":
+                return {"status": "completed", "logs": "flash-ok"}, 0
+            raise AssertionError(f"Unexpected launch: {args.profile}")
+
+        with mock.patch.object(runner, "execute", side_effect=fake_execute), \
+             mock.patch.object(runner, "quota_state", return_value=(None, None)):
+            result, code = runner.dispatch_activity(self.args("implementation"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["selected"], "gemini-flash")
+        self.assertEqual(launches, ["gemini-hydrogen", "gemini-flash"])
+        self.assertEqual(result["attempts"][0]["profile"], "gemini-hydrogen")
+        self.assertEqual(result["attempts"][0]["status"], "provider_error")
+        self.assertEqual(result["attempts"][1]["profile"], "gemini-flash")
+        self.assertEqual(result["attempts"][1]["status"], "completed")
+        self.assertFalse((Path(self.args("implementation").state_dir) / "gemini-quota.json").exists())
+
+    def test_active_cached_gemini_quota_blocks_both_hydrogen_and_flash(self):
+        """Active cached Gemini quota blocks Hydrogen and Flash without launching either."""
+        state_dir = Path(self.args("implementation").state_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        quota_file = state_dir / "gemini-quota.json"
+        cached_data = {"retry_at": time.time() + 7200, "reason": "rate_limit_exceeded"}
+        runner.write_json(quota_file, cached_data)
+        initial_bytes = quota_file.read_bytes()
+
+        launches = []
+        def fake_execute(args):
+            launches.append(args.profile)
+            return {"status": "completed"}, 0
+
+        with mock.patch.object(runner, "execute", side_effect=fake_execute):
+            result, code = runner.dispatch_activity(self.args("implementation"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(result["selected"], "muse-wonder")
+        self.assertEqual(launches, ["muse-wonder"])
+        self.assertEqual(result["attempts"][0]["profile"], "gemini-hydrogen")
+        self.assertEqual(result["attempts"][0]["status"], "fallback_required")
+        self.assertEqual(result["attempts"][1]["profile"], "gemini-flash")
+        self.assertEqual(result["attempts"][1]["status"], "skipped_account_block")
+        self.assertEqual(quota_file.read_bytes(), initial_bytes)
+
+    def test_hydrogen_confirmed_quota_skips_same_provider_flash_and_launches_next_provider(self):
+        """Confirmed quota during Hydrogen run skips same-provider Flash and advances to Muse."""
+        launches = []
+        def fake_execute(args):
+            launches.append(args.profile)
+            if args.profile == "gemini-hydrogen":
+                return {
+                    "status": "fallback_required",
+                    "error": "Usage limit reached for account",
+                    "logs": "hydrogen-quota"
+                }, 20
+            if args.profile == "muse-wonder":
+                return {"status": "completed", "logs": "muse-ok"}, 0
+            raise AssertionError(f"Unexpected launch: {args.profile}")
+
+        with mock.patch.object(runner, "execute", side_effect=fake_execute), \
+             mock.patch.object(runner, "quota_state", return_value=(None, None)):
+            result, code = runner.dispatch_activity(self.args("implementation"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(result["selected"], "muse-wonder")
+        self.assertEqual(launches, ["gemini-hydrogen", "muse-wonder"])
+        self.assertEqual(result["attempts"][0]["profile"], "gemini-hydrogen")
+        self.assertEqual(result["attempts"][0]["status"], "fallback_required")
+        self.assertEqual(result["attempts"][1]["profile"], "gemini-flash")
+        self.assertEqual(result["attempts"][1]["status"], "skipped_account_block")
+        self.assertEqual(result["attempts"][2]["profile"], "muse-wonder")
+        self.assertEqual(result["attempts"][2]["status"], "completed")
+
+    def test_unknown_or_generic_gemini_quota_remains_account_wide(self):
+        """Gemini quota is account-wide; neither profile uses an independent allowance pool."""
+        state_dir = Path(self.args("implementation").state_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Effective provider for both profiles is gemini
+        p1, eff1 = runner.effective_activity_provider(self.config, "gemini-hydrogen")
+        p2, eff2 = runner.effective_activity_provider(self.config, "gemini-flash")
+        self.assertEqual((p1, eff1["model"], eff1["effort"]), ("gemini", "gemini-4-hydrogen-medium", "medium"))
+        self.assertEqual((p2, eff2["model"], eff2["effort"]), ("gemini", "gemini-3.8-flash-medium", "medium"))
+
+        # 2. Activity status shows both routing through gemini-quota.json
+        status_res, code = runner.activity_status(self.args("implementation"))
+        self.assertEqual(code, 0)
+        gemini_routes = [r for r in status_res["routes"] if r["provider"] == "gemini"]
+        self.assertEqual(len(gemini_routes), 2)
+        for r in gemini_routes:
+            self.assertTrue(r["quota_path"].endswith("gemini-quota.json"))
+
+        # 3. Setting quota on gemini provider blocks both
+        quota_data = {"retry_at": time.time() + 3600, "observed_at": "2026-11-16T18:00:00Z"}
+        runner.write_json(state_dir / "gemini-quota.json", quota_data)
+        status_after, _ = runner.activity_status(self.args("implementation"))
+        gemini_after = [r for r in status_after["routes"] if r["provider"] == "gemini"]
+        self.assertEqual(len(gemini_after), 2)
+        for r in gemini_after:
+            self.assertEqual(r["status"], "fallback_required")
+
+        # Confirm no hydrogen-specific quota file was created
+        self.assertFalse((state_dir / "hydrogen-quota.json").exists())
+        self.assertFalse((state_dir / "gemini-hydrogen-quota.json").exists())
+
+    def test_unresolved_writer_or_timeout_on_hydrogen_stops_before_flash(self):
+        """Unresolved writer, uncertain exit, or timeout on Hydrogen prevents Flash launch."""
+        for failure in [
+            {"status": "uncertain_exit", "fallback_authorized": False},
+            {"status": "timeout", "fallback_authorized": False},
+            {"status": "cancelled", "fallback_authorized": False},
+            {"status": "provider_error", "terminal_established": False, "error": "broken stream"}
+        ]:
+            with self.subTest(failure_status=failure.get("status")):
+                launches = []
+                def fake_execute(args):
+                    launches.append(args.profile)
+                    return dict(failure), 1
+
+                with mock.patch.object(runner, "execute", side_effect=fake_execute), \
+                     mock.patch.object(runner, "quota_state", return_value=(None, None)):
+                    result, code = runner.dispatch_activity(self.args("implementation"))
+
+                self.assertEqual(code, 1)
+                self.assertEqual(result["status"], "blocked_pending_run")
+                self.assertEqual(launches, ["gemini-hydrogen"])
+                self.assertEqual(len(result["attempts"]), 1)
+
 
 class AtomicStateWriteTests(unittest.TestCase):
     def setUp(self):

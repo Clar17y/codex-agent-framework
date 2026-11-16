@@ -408,7 +408,7 @@ class TestInstallFramework(unittest.TestCase):
 
         # Check routing.json
         routing = json.loads((af_dir / "routing.json").read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 12)
+        self.assertEqual(routing.get("version"), 14)
         self.assertIn("providers", routing)
         self.assertIn("gemini", routing["providers"])
         self.assertNotIn("deepseek", routing["providers"])
@@ -551,7 +551,7 @@ class TestInstallFramework(unittest.TestCase):
         expected_quota = quota.read_bytes()
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         resolved = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(resolved["version"], 12)
+        self.assertEqual(resolved["version"], 14)
         self.assertEqual(resolved["providers"]["muse"]["executable"], "custom-muse")
         self.assertEqual(resolved["providers"]["muse"]["model"], "cli-default")
         self.assertEqual(resolved["providers"]["muse"]["effort"], "high")
@@ -577,7 +577,7 @@ class TestInstallFramework(unittest.TestCase):
         with mock.patch("install.shutil.which", return_value=None):
             install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         resolved = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(resolved["version"], 12)
+        self.assertEqual(resolved["version"], 14)
         self.assertEqual(resolved["providers"]["muse"]["executable"], "muse")
         self.assertEqual(resolved["providers"]["muse"]["model"], "muse-wonder-1.0")
         self.assertEqual(resolved["providers"]["gemini"]["heartbeat_seconds"], 0)
@@ -587,7 +587,7 @@ class TestInstallFramework(unittest.TestCase):
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         routing_path = self.dest_root / "agent-framework/routing.json"
         fresh = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(fresh["version"], 12)
+        self.assertEqual(fresh["version"], 14)
         self.assertEqual(fresh["providers"]["muse"]["profiles"], {
             "complex": {"model": "muse-wonder-full-1.0", "effort": "medium"},
             "escalation": {"model": "muse-wonder-full-1.0", "effort": "high"}})
@@ -603,14 +603,14 @@ class TestInstallFramework(unittest.TestCase):
         quota.parent.mkdir(parents=True, exist_ok=True)
         quota.write_bytes(b'{"retry_at":4070908800}')
         resolved = resolve_routing(self.source_root, self.dest_root)
-        self.assertEqual(resolved["version"], 12)
+        self.assertEqual(resolved["version"], 14)
         muse = resolved["providers"]["muse"]
         self.assertEqual((muse["executable"], muse["model"], muse["effort"], muse["timeout_seconds"], muse["custom"]),
                          ("custom-muse", "cli-default", "low", 123, "keep"))
         self.assertEqual(muse["profiles"]["complex"], {"model": "muse-wonder-full-1.0", "effort": "medium"})
         self.assertEqual(quota.read_bytes(), b'{"retry_at":4070908800}')
         # Positional calling convention still works.
-        self.assertEqual(resolve_routing(self.source_root, self.dest_root, None, None, False)["version"], 12)
+        self.assertEqual(resolve_routing(self.source_root, self.dest_root, None, None, False)["version"], 14)
 
     def test_muse_profiles_partial_custom_and_repeat(self):
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
@@ -745,7 +745,7 @@ class TestInstallFramework(unittest.TestCase):
         role.write_text('model = "gpt-5.6-luna"\n', encoding="utf-8")
 
         install_framework(str(self.dest_root), source=str(self.source_root))
-        data["version"] = 12
+        data["version"] = 14
         data["providers"]["claude"]["model"] = "claude-opus-5-5"
         data["providers"].pop("deepseek", None)
         self.assertEqual(json.loads(routing_path.read_text(encoding="utf-8")), data)
@@ -773,7 +773,7 @@ class TestInstallFramework(unittest.TestCase):
                 data["providers"]["claude"]["model"] = before
                 routing_path.write_text(json.dumps(data), encoding="utf-8")
                 resolved = resolve_routing(self.source_root, self.dest_root)
-                data["version"] = max(version, 12)
+                data["version"] = max(version, 14)
                 data["providers"]["claude"]["model"] = after
                 self.assertEqual(resolved, data)
 
@@ -789,7 +789,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(data), encoding="utf-8")
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         migrated = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 12)
+        self.assertEqual(migrated["version"], 14)
         self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 3600)
         self.assertEqual(migrated["providers"]["gemini"]["termination_grace_seconds"], 120)
 
@@ -802,7 +802,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(data), encoding="utf-8")
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         migrated = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 12)
+        self.assertEqual(migrated["version"], 14)
         self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 3600)
 
     def test_v6_custom_gemini_timeout_is_preserved(self):
@@ -814,7 +814,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(data), encoding="utf-8")
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         migrated = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 12)
+        self.assertEqual(migrated["version"], 14)
         self.assertEqual(migrated["providers"]["gemini"]["timeout_seconds"], 2700)
 
     def test_preserved_routing_fills_missing_universal_heartbeats_only(self):
@@ -1189,7 +1189,7 @@ class TestInstallFramework(unittest.TestCase):
         install_framework(codex_home=str(self.dest_root), source=str(self.source_root))
         routing_path = self.dest_root / "agent-framework" / "routing.json"
         routing = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 12)
+        self.assertEqual(routing.get("version"), 14)
         self.assertIn("gemini", routing["providers"])
         self.assertIn("claude", routing["providers"])
         self.assertNotIn("deepseek", routing["providers"])
@@ -1216,7 +1216,7 @@ class TestInstallFramework(unittest.TestCase):
 
         install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
         upgraded_v4 = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(upgraded_v4.get("version"), 12)
+        self.assertEqual(upgraded_v4.get("version"), 14)
         self.assertNotIn("deepseek", upgraded_v4["providers"])
         self.assertEqual(upgraded_v4["providers"]["gemini"]["model"], "gemini-custom-ultra")
         self.assertEqual(upgraded_v4["providers"]["claude"]["model"], "claude-opus-5-5")
@@ -1236,7 +1236,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(v8_data, indent=2), encoding="utf-8")
         install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
         upgraded_v8 = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(upgraded_v8.get("version"), 12)
+        self.assertEqual(upgraded_v8.get("version"), 14)
         self.assertNotIn("deepseek", upgraded_v8["providers"])
         self.assertEqual(upgraded_v8["providers"]["gemini"]["model"], "gemini-2.5-pro")
         self.assertEqual(upgraded_v8["providers"]["claude"]["executable"], "/custom/claude")
@@ -1254,7 +1254,7 @@ class TestInstallFramework(unittest.TestCase):
         second_installed_bytes = routing_path.read_bytes()
         self.assertEqual(first_installed_bytes, second_installed_bytes)
         routing = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 12)
+        self.assertEqual(routing.get("version"), 14)
         self.assertNotIn("deepseek", routing["providers"])
 
     def test_retired_custom_credential_stays_filtered_after_upgrade(self):
@@ -1320,7 +1320,7 @@ class TestInstallFramework(unittest.TestCase):
         routing_path = self.dest_root / "agent-framework/routing.json"
         self.assertTrue(routing_path.exists())
         routing = json.loads(routing_path.read_text(encoding="utf-8"))
-        self.assertEqual(routing.get("version"), 12)
+        self.assertEqual(routing.get("version"), 14)
         self.assertNotIn("deepseek", routing["providers"])
         self.assertIn("gemini", routing["providers"])
         self.assertIn("claude", routing["providers"])
@@ -1407,6 +1407,284 @@ class TestInstallFramework(unittest.TestCase):
         routing_path.write_text(json.dumps(routing, indent=2), encoding="utf-8")
         with self.assertRaises(PreflightError):
             install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+
+    def test_v14_fresh_codex_and_claude_overlay_promotion_and_non_implementation_chains(self):
+        """Fresh installs promote Hydrogen for implementation only, keeping provider pin and other chains."""
+        # 1. Fresh Codex install
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        config = json.loads(routing_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(config.get("version"), 14)
+        self.assertEqual(config["profiles"]["gemini-hydrogen"], {
+            "provider": "gemini",
+            "model": "gemini-4-hydrogen-medium",
+            "effort": "medium"
+        })
+        self.assertEqual(config["providers"]["gemini"]["model"], "gemini-3.8-flash-medium")
+        self.assertEqual(config["activities"]["implementation"], [
+            "gemini-hydrogen",
+            "gemini-flash",
+            "muse-wonder",
+            "claude-sonnet",
+            "openai-sol"
+        ])
+
+        # Verify no other activity chain includes gemini-hydrogen
+        for name, chain in config["activities"].items():
+            if name != "implementation":
+                self.assertNotIn("gemini-hydrogen", chain, f"gemini-hydrogen unexpectedly in {name}")
+
+        # 2. Fresh Claude overlay routing resolution
+        claude_root = self.test_dir / "target_claude"
+        claude_config = resolve_routing(self.source_root, claude_root,
+                                        routing_overlay=REPO_ROOT / "claude/routing.overlay.json")
+        self.assertEqual(claude_config.get("version"), 14)
+        self.assertEqual(claude_config["activities"]["implementation"], [
+            "gemini-hydrogen",
+            "gemini-flash",
+            "muse-wonder",
+            "claude-sonnet",
+            "openai-luna"
+        ])
+        for name, chain in claude_config["activities"].items():
+            if name != "implementation":
+                self.assertNotIn("gemini-hydrogen", chain, f"gemini-hydrogen unexpectedly in Claude {name}")
+
+    def test_v14_upgrade_untouched_old_packaged_chains_promote_hydrogen(self):
+        """Untouched pre-v12, v12 and v13 standard chains promote Hydrogen, keeping legacy pin."""
+        # Case A: Untouched pre-v12 default
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        routing_path.parent.mkdir(parents=True, exist_ok=True)
+        v5_data = {
+            "version": 5,
+            "providers": {
+                "gemini": {"executable": "agy", "model": "gemini-3.8-flash-medium", "timeout_seconds": 3600},
+                "claude": {"executable": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+                "muse": {"executable": "muse", "model": "muse-wonder-1.0", "effort": "medium"},
+                "openai": {"executable": "codex", "model": "gpt-6.1-sol", "effort": "medium"}
+            }
+        }
+        routing_path.write_text(json.dumps(v5_data, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        upgraded_v5 = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded_v5.get("version"), 14)
+        self.assertEqual(upgraded_v5["providers"]["gemini"]["model"], "gemini-3.8-flash-medium")
+        self.assertEqual(upgraded_v5["activities"]["implementation"], [
+            "gemini-hydrogen",
+            "gemini-flash",
+            "muse-wonder",
+            "claude-sonnet",
+            "openai-sol"
+        ])
+
+        # Case B: Untouched v12 standard Codex chain
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        v12_config = json.loads(routing_path.read_text(encoding="utf-8"))
+        v12_config["version"] = 12
+        v12_config["activities"]["implementation"] = [
+            "gemini-flash", "muse-wonder", "claude-sonnet", "openai-sol"
+        ]
+        v12_config["profiles"].pop("gemini-hydrogen", None)
+        routing_path.write_text(json.dumps(v12_config, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        upgraded_v12 = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded_v12.get("version"), 14)
+        self.assertEqual(upgraded_v12["providers"]["gemini"]["model"], "gemini-3.8-flash-medium")
+        self.assertIn("gemini-hydrogen", upgraded_v12["profiles"])
+        self.assertEqual(upgraded_v12["activities"]["implementation"], [
+            "gemini-hydrogen",
+            "gemini-flash",
+            "muse-wonder",
+            "claude-sonnet",
+            "openai-sol"
+        ])
+
+        # Case C: Untouched v13 standard Claude chain
+        v13_config = json.loads(routing_path.read_text(encoding="utf-8"))
+        v13_config["version"] = 13
+        v13_config["activities"]["implementation"] = [
+            "gemini-flash", "muse-wonder", "claude-sonnet", "openai-luna"
+        ]
+        v13_config["profiles"].pop("gemini-hydrogen", None)
+        routing_path.write_text(json.dumps(v13_config, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        upgraded_v13 = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded_v13.get("version"), 14)
+        self.assertEqual(upgraded_v13["activities"]["implementation"], [
+            "gemini-hydrogen",
+            "gemini-flash",
+            "muse-wonder",
+            "claude-sonnet",
+            "openai-luna"
+        ])
+
+    def test_v14_preserves_unused_custom_hydrogen_profiles(self):
+        original = json.loads((self.source_root / 'routing.example.json').read_text())
+        old_chain = ['gemini-flash', 'muse-wonder', 'claude-sonnet', 'openai-sol']
+        routing_path = self.dest_root / 'agent-framework/routing.json'
+        routing_path.parent.mkdir(parents=True, exist_ok=True)
+        for version in (11, 12, 13):
+            for customization in (
+                {'enabled': False},
+                {'model': 'operator-hydrogen'},
+                {'effort': 'high'},
+                {'provider': 'openai', 'model': 'operator-model'},
+            ):
+                with self.subTest(version=version, customization=customization):
+                    config = json.loads(json.dumps(original))
+                    config['version'] = version
+                    config['profiles']['gemini-hydrogen'].update(customization)
+                    saved_profile = dict(config['profiles']['gemini-hydrogen'])
+                    if version < 12:
+                        config.pop('activities')
+                    else:
+                        config['activities']['implementation'] = old_chain
+                    routing_path.write_text(json.dumps(config), encoding='utf-8')
+                    upgraded = resolve_routing(self.source_root, self.dest_root)
+                    self.assertEqual(upgraded['activities']['implementation'], old_chain)
+                    self.assertEqual(upgraded['profiles']['gemini-hydrogen'], saved_profile)
+
+    def test_v14_missing_implementation_chain_preserves_custom_flash_selection(self):
+        original = json.loads((self.source_root / 'routing.example.json').read_text())
+        routing_path = self.dest_root / 'agent-framework/routing.json'
+        routing_path.parent.mkdir(parents=True, exist_ok=True)
+        for version in (11, 12, 13):
+            with self.subTest(version=version):
+                config = json.loads(json.dumps(original))
+                config['version'] = version
+                config['profiles'].pop('gemini-hydrogen')
+                config['profiles']['gemini-flash']['model'] = 'operator-flash'
+                config['activities'].pop('implementation')
+                routing_path.write_text(json.dumps(config), encoding='utf-8')
+                upgraded = resolve_routing(self.source_root, self.dest_root)
+                self.assertEqual(upgraded['activities']['implementation'], [
+                    'gemini-flash', 'muse-wonder', 'claude-sonnet', 'openai-sol'
+                ])
+                self.assertEqual(upgraded['profiles']['gemini-flash']['model'], 'operator-flash')
+
+    def test_v14_migration_preserves_operator_choices_and_quota_and_is_idempotent(self):
+        """Migration preserves custom chains, pins, profiles, disabled flags, future versions, and quota bytes."""
+        install_framework(str(self.dest_root), source=str(self.source_root))
+        routing_path = self.dest_root / "agent-framework/routing.json"
+        quota_path = self.dest_root / "agent-framework/state/gemini-quota.json"
+        quota_path.parent.mkdir(parents=True, exist_ok=True)
+        quota_bytes = b'{"retry_at":4102444800,"observed_at":"2026-11-16T18:00:00Z","reason":"operator"}'
+        quota_path.write_bytes(quota_bytes)
+
+        # 1. Custom implementation order
+        config = json.loads(routing_path.read_text(encoding="utf-8"))
+        config["version"] = 12
+        config["activities"]["implementation"] = ["muse-wonder", "gemini-flash", "claude-sonnet"]
+        config["profiles"].pop("gemini-hydrogen", None)
+        routing_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        upgraded = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded["activities"]["implementation"],
+                         ["muse-wonder", "gemini-flash", "claude-sonnet"])
+        self.assertIn("gemini-hydrogen", upgraded["profiles"])
+        self.assertEqual(quota_path.read_bytes(), quota_bytes)
+
+        # 2. Omitted Gemini in implementation
+        config["version"] = 12
+        config["activities"]["implementation"] = ["muse-wonder", "claude-sonnet", "openai-sol"]
+        config["profiles"].pop("gemini-hydrogen", None)
+        routing_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        upgraded = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded["activities"]["implementation"],
+                         ["muse-wonder", "claude-sonnet", "openai-sol"])
+        self.assertEqual(quota_path.read_bytes(), quota_bytes)
+
+        # 3. Custom Flash profile
+        config["version"] = 12
+        config["activities"]["implementation"] = [
+            "gemini-flash", "muse-wonder", "claude-sonnet", "openai-sol"
+        ]
+        config["profiles"]["gemini-flash"]["model"] = "gemini-3.8-flash-custom"
+        config["profiles"].pop("gemini-hydrogen", None)
+        routing_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        upgraded = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded["profiles"]["gemini-flash"]["model"], "gemini-3.8-flash-custom")
+        self.assertEqual(upgraded["activities"]["implementation"], [
+            "gemini-flash", "muse-wonder", "claude-sonnet", "openai-sol"
+        ])
+        self.assertEqual(quota_path.read_bytes(), quota_bytes)
+
+        # 4. Custom legacy provider pin (v12 and pre-v12)
+        config["version"] = 12
+        config["profiles"]["gemini-flash"]["model"] = "gemini-3.8-flash-medium"
+        config["providers"]["gemini"]["model"] = "gemini-custom-pin"
+        config["profiles"].pop("gemini-hydrogen", None)
+        routing_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        upgraded = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded["providers"]["gemini"]["model"], "gemini-custom-pin")
+        self.assertEqual(upgraded["activities"]["implementation"], [
+            "gemini-flash", "muse-wonder", "claude-sonnet", "openai-sol"
+        ])
+
+        # Pre-v12 custom provider pin preserves custom model in gemini-flash, does not promote hydrogen
+        v4_data = {
+            "version": 4,
+            "providers": {
+                "gemini": {"executable": "agy", "model": "gemini-custom-v4", "timeout_seconds": 3600},
+                "claude": {"executable": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+                "muse": {"executable": "muse", "model": "muse-wonder-1.0", "effort": "medium"},
+                "openai": {"executable": "codex", "model": "gpt-6.1-sol", "effort": "medium"}
+            }
+        }
+        routing_path.write_text(json.dumps(v4_data, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        upgraded_v4 = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded_v4["profiles"]["gemini-flash"]["model"], "gemini-custom-v4")
+        self.assertEqual(upgraded_v4["activities"]["implementation"], [
+            "gemini-flash", "muse-wonder", "claude-sonnet", "openai-sol"
+        ])
+
+        # 5. Custom Hydrogen profile contents retained
+        config = json.loads(routing_path.read_text(encoding="utf-8"))
+        config["version"] = 12
+        config["profiles"]["gemini-hydrogen"] = {
+            "provider": "gemini",
+            "model": "gemini-custom-hydrogen-model",
+            "effort": "high"
+        }
+        routing_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        upgraded = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded["profiles"]["gemini-hydrogen"]["model"], "gemini-custom-hydrogen-model")
+        self.assertEqual(upgraded["profiles"]["gemini-hydrogen"]["effort"], "high")
+
+        # 6. Disabled provider preserved
+        config = json.loads(routing_path.read_text(encoding="utf-8"))
+        config["providers"]["gemini"]["enabled"] = False
+        routing_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        upgraded = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertIs(upgraded["providers"]["gemini"]["enabled"], False)
+
+        # 7. Repeat v14 install with later operator edits is idempotent
+        config = json.loads(routing_path.read_text(encoding="utf-8"))
+        config["version"] = 14
+        config["activities"]["implementation"] = ["openai-sol", "gemini-hydrogen"]
+        routing_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        first_bytes = routing_path.read_bytes()
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        self.assertEqual(routing_path.read_bytes(), first_bytes)
+        reinstalled = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(reinstalled["activities"]["implementation"], ["openai-sol", "gemini-hydrogen"])
+
+        # 8. Future version preserved
+        config = json.loads(routing_path.read_text(encoding="utf-8"))
+        config["version"] = 15
+        routing_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        install_framework(str(self.dest_root), source=str(self.source_root), refresh_routing=False)
+        future = json.loads(routing_path.read_text(encoding="utf-8"))
+        self.assertEqual(future.get("version"), 15)
+        self.assertEqual(quota_path.read_bytes(), quota_bytes)
 
 
 if __name__ == "__main__":

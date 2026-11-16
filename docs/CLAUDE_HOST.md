@@ -31,13 +31,13 @@ Dispatch needs the signed-in CLIs, so it works from Claude Code on the machine w
 
 `claude/routing.overlay.json` replaces only the `activities` key of the shared `routing.example.json`, so profiles, providers and workflow defaults stay in one place. It assumes Claude Max as the orchestrator budget, Codex on the smaller ChatGPT plan, Google AI Pro and Muse Power:
 
-- Routine work (exploration, implementation, testing, verification, documentation, docs research, refactor audit) starts on Gemini Flash, then Muse Wonder, with Claude and Codex Luna last.
+- Routine implementation starts on Gemini Hydrogen medium, followed by Gemini Flash medium as safe fallback, then Muse Wonder, with Claude Sonnet and Codex Luna last. Other routine work (exploration, testing, verification, documentation, docs research, refactor audit) starts on Gemini Flash, then Muse Wonder, with Claude and Codex Luna last.
 - Complex and long-horizon implementation and test design start on Muse Wonder Full, with Claude Opus and Codex Sol high behind it.
 - Independent and security review start on Codex Sol, so Claude-authored work is reviewed by another vendor by default; set `review.author_provider` to `claude` for work done in the Claude session and the dispatcher moves Claude profiles to the back.
 - Planning and orchestration start on Claude Opus; in practice the Claude session plans directly.
 - Deep review starts on Claude Opus high, then Astra, which may not be available on every ChatGPT plan.
 
-These are quota-driven defaults, not measurements. Edit the chains in the installed `routing.json`; reinstalling preserves your edits.
+These are quota-driven defaults, not measurements. Edit the chains in the installed `routing.json`; reinstalling preserves your edits. Routing version 14 upgrades untouched pre-v14 Claude implementation chains (`gemini-flash > muse-wonder > claude-sonnet > openai-luna`) to start with `gemini-hydrogen > gemini-flash`, while preserving any customized chains, custom Flash or Hydrogen profile contents, and legacy provider pins. The framework conservatively accounts for Hydrogen and Flash together in `gemini-quota.json`; active or confirmed quota blocks both profiles and advances to subsequent providers, while settled model errors fall through to Flash.
 
 ## Derived roles and skills
 

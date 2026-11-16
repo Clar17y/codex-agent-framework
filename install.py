@@ -222,7 +222,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
 
     source_defaults = example['providers'] if preserving else {}
 
-    target_version = config.get('version', 1) if preserving else 12
+    target_version = config.get('version', 1) if preserving else 14
     if isinstance(target_version, bool) or not isinstance(target_version, int):
         raise PreflightError('Routing configuration version must be an integer.')
 
@@ -337,11 +337,11 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
                     raise PreflightError('retired_secret_env_vars must be a list of environment variable names.')
                 if env_name not in names:
                     names.append(env_name)
-            config['version'] = 12
+            config['version'] = 14
         else:
-            config['version'] = max(target_version, 12)
+            config['version'] = max(target_version, 14)
     else:
-        config['version'] = 12
+        config['version'] = 14
     # v12 adds editable activity chains. Retain explicit operator choices and
     # carry forward legacy provider pin customizations into the routine profile.
     default_profiles = example.get('profiles', {})
@@ -368,6 +368,52 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
         for old, new in (('complex', 'muse-full'), ('escalation', 'muse-full-high')):
             if new not in profiles and old in muse_profiles:
                 profiles[new] = {'provider': 'muse', **copy.deepcopy(muse_profiles[old])}
+    # v14 promotes Gemini 4 Hydrogen medium as the default routine implementation
+    # profile, with Flash medium retained immediately after it as safe fallback.
+    # Upgrade exact prior packaged chains only when the saved Gemini selections
+    # still match defaults. Never activate an unused custom or disabled profile.
+    prior_implementation_chains = (
+        ['gemini-flash', 'muse-wonder', 'claude-sonnet', 'openai-sol'],
+        ['gemini-flash', 'muse-wonder', 'claude-sonnet', 'openai-luna'],
+    )
+    if preserving and target_version < 14:
+        gemini_entry = config.get('providers', {}).get('gemini', {})
+        legacy_uncustomized = (
+            not isinstance(gemini_entry, dict) or (
+                gemini_entry.get('model', 'gemini-3.8-flash-medium') == 'gemini-3.8-flash-medium' and
+                gemini_entry.get('effort', 'medium') == 'medium'
+            )
+        )
+        flash_profile = profiles.get('gemini-flash')
+        flash_uncustomized = (
+            flash_profile is None or (
+                isinstance(flash_profile, dict) and
+                flash_profile.get('provider') == 'gemini' and
+                flash_profile.get('model') == 'gemini-3.8-flash-medium' and
+                flash_profile.get('effort', 'medium') == 'medium' and
+                flash_profile.get('enabled', True) is True
+            )
+        )
+        hydrogen_profile = profiles.get('gemini-hydrogen')
+        hydrogen_uncustomized = (
+            hydrogen_profile is None or (
+                isinstance(hydrogen_profile, dict) and
+                hydrogen_profile.get('provider') == 'gemini' and
+                hydrogen_profile.get('model') == 'gemini-4-hydrogen-medium' and
+                hydrogen_profile.get('effort', 'medium') == 'medium' and
+                hydrogen_profile.get('enabled', True) is True
+            )
+        )
+        if legacy_uncustomized and flash_uncustomized and hydrogen_uncustomized:
+            if target_version >= 12 and 'implementation' in activities:
+                current_impl = activities['implementation']
+                if current_impl in prior_implementation_chains:
+                    activities['implementation'] = ['gemini-hydrogen'] + current_impl
+        else:
+            if 'implementation' not in activities:
+                activities['implementation'] = [
+                    p for p in default_activities.get('implementation', []) if p != 'gemini-hydrogen'
+                ]
     for name, value in default_profiles.items():
         profiles.setdefault(name, copy.deepcopy(value))
     for name, value in default_activities.items():

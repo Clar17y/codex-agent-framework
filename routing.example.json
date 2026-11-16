@@ -1,5 +1,5 @@
 {
-  "version": 12,
+  "version": 14,
   "workflow": {
     "require_jev_evidence": true
   },
@@ -114,6 +114,11 @@
       "model": "claude-haiku-5-5",
       "effort": "medium"
     },
+    "gemini-hydrogen": {
+      "provider": "gemini",
+      "model": "gemini-4-hydrogen-medium",
+      "effort": "medium"
+    },
     "gemini-flash": {
       "provider": "gemini",
       "model": "gemini-3.8-flash-medium",
@@ -163,6 +168,7 @@
       "muse-wonder"
     ],
     "implementation": [
+      "gemini-hydrogen",
       "gemini-flash",
       "muse-wonder",
       "claude-sonnet",

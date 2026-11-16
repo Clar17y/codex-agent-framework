@@ -151,7 +151,7 @@ MUSE_PROFILE_DEFAULTS = {
 MUSE_EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 
 
-# Exact v12 packaged chains eligible for the one-time v13 migration.
+# Frozen packaged chains, matched only against their actual schema version.
 V12_ACTIVITY_DEFAULTS = {
     'orchestration': ['openai-sol', 'claude-opus', 'muse-full', 'claude-sonnet', 'gemini-flash', 'muse-wonder'],
     'planning': ['openai-sol', 'claude-opus', 'muse-full', 'claude-sonnet', 'gemini-flash-high'],
@@ -169,6 +169,175 @@ V12_ACTIVITY_DEFAULTS = {
     'docs_research': ['gemini-flash', 'openai-luna', 'claude-haiku', 'muse-wonder'],
     'deep_review': ['openai-astra', 'claude-opus-high', 'muse-full-high', 'openai-sol-high', 'gemini-flash-high'],
 }
+
+
+
+# Frozen previous package chains: upgrade decisions must not depend on model names alone.
+V13_ACTIVITY_DEFAULTS = {'orchestration': ['openai-sol',
+                   'agy-opus',
+                   'claude-opus',
+                   'gemini-argon',
+                   'muse-full',
+                   'claude-sonnet',
+                   'gemini-flash',
+                   'muse-wonder'],
+ 'planning': ['openai-sol',
+              'agy-opus',
+              'gemini-argon',
+              'claude-opus',
+              'muse-full',
+              'claude-sonnet',
+              'gemini-flash-high'],
+ 'exploration': ['gemini-flash', 'openai-luna', 'agy-sonnet', 'claude-haiku', 'muse-wonder'],
+ 'implementation': ['gemini-flash', 'agy-sonnet', 'muse-wonder', 'claude-sonnet', 'gemini-argon', 'openai-sol'],
+ 'implementation_complex': ['openai-sol-high',
+                            'agy-opus',
+                            'gemini-argon-high',
+                            'muse-full',
+                            'claude-opus',
+                            'claude-sonnet-high',
+                            'gemini-flash-high'],
+ 'implementation_long_horizon': ['muse-full',
+                                 'agy-opus',
+                                 'gemini-argon-high',
+                                 'claude-opus',
+                                 'openai-sol-high',
+                                 'claude-sonnet-high',
+                                 'gemini-flash-high'],
+ 'test_design': ['openai-sol',
+                 'agy-opus',
+                 'gemini-argon',
+                 'claude-opus',
+                 'muse-full',
+                 'claude-sonnet',
+                 'gemini-flash'],
+ 'testing': ['gemini-flash', 'openai-sol', 'agy-sonnet', 'claude-sonnet', 'muse-wonder'],
+ 'verification': ['gemini-flash', 'openai-luna', 'agy-sonnet', 'claude-haiku', 'muse-wonder'],
+ 'independent_review': ['agy-opus',
+                        'gemini-argon',
+                        'claude-opus',
+                        'openai-sol',
+                        'muse-full',
+                        'claude-sonnet',
+                        'gemini-flash',
+                        'muse-wonder'],
+ 'security_review': ['agy-opus-high',
+                     'gemini-argon-high',
+                     'claude-opus-high',
+                     'openai-sol-high',
+                     'muse-full-high',
+                     'claude-sonnet-high',
+                     'gemini-flash-high'],
+ 'refactor_audit': ['openai-luna', 'agy-sonnet', 'gemini-argon', 'claude-sonnet', 'gemini-flash', 'muse-wonder'],
+ 'documentation': ['gemini-flash', 'agy-sonnet', 'openai-luna', 'claude-haiku', 'muse-wonder'],
+ 'docs_research': ['gemini-flash', 'gemini-argon', 'openai-luna', 'claude-haiku', 'muse-wonder'],
+ 'deep_review': ['openai-astra',
+                 'agy-opus-high',
+                 'gemini-argon-high',
+                 'claude-opus-high',
+                 'muse-full-high',
+                 'openai-sol-high',
+                 'gemini-flash-high'],
+ 'structured_thinking': ['claude-sonnet', 'agy-sonnet', 'openai-sol', 'gemini-flash', 'muse-wonder']}
+
+CLAUDE_PRE_HYDROGEN_DEFAULTS = {'orchestration': ['claude-opus', 'muse-full', 'openai-sol', 'gemini-flash'],
+ 'planning': ['claude-opus', 'muse-full', 'openai-sol', 'gemini-flash-high'],
+ 'exploration': ['gemini-flash', 'muse-wonder', 'claude-haiku', 'openai-luna'],
+ 'implementation': ['gemini-flash', 'muse-wonder', 'claude-sonnet', 'openai-luna'],
+ 'implementation_complex': ['muse-full',
+                            'claude-opus',
+                            'openai-sol-high',
+                            'claude-sonnet-high',
+                            'gemini-flash-high'],
+ 'implementation_long_horizon': ['muse-full',
+                                 'claude-opus',
+                                 'openai-sol-high',
+                                 'claude-sonnet-high',
+                                 'gemini-flash-high'],
+ 'test_design': ['muse-full', 'claude-sonnet', 'openai-sol', 'gemini-flash-high'],
+ 'testing': ['gemini-flash', 'muse-wonder', 'claude-sonnet', 'openai-luna'],
+ 'verification': ['gemini-flash', 'muse-wonder', 'claude-haiku', 'openai-luna'],
+ 'independent_review': ['openai-sol',
+                        'muse-full',
+                        'claude-opus',
+                        'gemini-flash-high',
+                        'claude-sonnet',
+                        'muse-wonder'],
+ 'security_review': ['openai-sol-high', 'claude-opus-high', 'muse-full-high', 'gemini-flash-high'],
+ 'refactor_audit': ['gemini-flash', 'muse-wonder', 'openai-luna', 'claude-sonnet'],
+ 'documentation': ['gemini-flash', 'muse-wonder', 'claude-haiku', 'openai-luna'],
+ 'docs_research': ['gemini-flash', 'claude-haiku', 'muse-wonder', 'openai-luna'],
+ 'deep_review': ['claude-opus-high', 'openai-astra', 'muse-full-high', 'openai-sol-high', 'gemini-flash-high']}
+
+def migrate_activity_defaults(config, example, target_version, *, claude_host=False):
+    """Promote only recognized packaged chains with untouched relevant selections.
+
+    Inspect both old and replacement profiles before filling missing defaults, so
+    an unused disabled/custom profile is never activated by a schema upgrade.
+    Legacy Gemini pins remain authoritative for routine implementation as well.
+    """
+    profiles, activities = config['profiles'], config['activities']
+    defaults, replacements = example['profiles'], example['activities']
+    previous = (CLAUDE_PRE_HYDROGEN_DEFAULTS if claude_host else V12_ACTIVITY_DEFAULTS)
+    accumulated = (CLAUDE_PRE_HYDROGEN_DEFAULTS if claude_host else V13_ACTIVITY_DEFAULTS)
+    hydrogen = copy.deepcopy(previous)
+    hydrogen['implementation'] = ['gemini-hydrogen', *previous['implementation']]
+    # v14 released the v12 priorities with Hydrogen added; v13 was the
+    # accumulated Antigravity snapshot. A lookalike from another version is
+    # an operator choice, not evidence of an untouched package.
+    snapshot = (accumulated if target_version == 13 else
+                hydrogen if target_version == 14 else
+                previous if target_version < 13 else replacements)
+
+    def unchanged(name):
+        if name not in profiles:
+            return True
+        saved = profiles[name]
+        if not isinstance(saved, dict) or name not in defaults:
+            return False
+        # Explicit enabled:true and omitted medium effort are equivalent to
+        # the packaged selection; every other field must match in full.
+        saved = {'effort': 'medium', 'enabled': True, **saved}
+        packaged = {'effort': 'medium', 'enabled': True, **defaults[name]}
+        return saved == packaged
+
+    def enabled(profile):
+        saved = profiles.get(profile, defaults.get(profile))
+        # Leave malformed profiles for registry validation to diagnose.
+        return not isinstance(saved, dict) or saved.get('enabled', True)
+
+    def eligible(name, old, new):
+        if not all(unchanged(profile) for profile in set(old) | set(new)):
+            return False
+        if name == 'implementation':
+            gemini = config['providers']['gemini']
+            return (gemini.get('model') == 'gemini-3.8-flash-medium' and
+                    gemini.get('effort', 'medium') == 'medium')
+        return True
+
+    for name, replacement in replacements.items():
+        if name in activities:
+            current = activities[name]
+            if (target_version < 15 and current == snapshot.get(name) and
+                    eligible(name, current, replacement)):
+                activities[name] = copy.deepcopy(replacement)
+        else:
+            # Missing activities are optional. Infer only safe prior routes;
+            # never activate an unused disabled/custom newly added selection.
+            old = snapshot.get(name, replacement)
+            if eligible(name, old, replacement):
+                candidate = replacement
+            else:
+                added = set(old) - set(previous.get(name, []))
+                candidate = [profile for profile in old
+                             if profile not in added or unchanged(profile)]
+                if name == 'implementation':
+                    # Hydrogen must not bypass a saved Flash/legacy selection.
+                    candidate = [profile for profile in candidate
+                                 if profile != 'gemini-hydrogen']
+            candidate = [profile for profile in candidate if enabled(profile)]
+            if candidate:
+                activities[name] = copy.deepcopy(candidate)
 
 
 def merge_muse_profiles(entry, source_defaults):
@@ -243,7 +412,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
 
     source_defaults = example['providers'] if preserving else {}
 
-    target_version = config.get('version', 1) if preserving else 13
+    target_version = config.get('version', 1) if preserving else 15
     if isinstance(target_version, bool) or not isinstance(target_version, int):
         raise PreflightError('Routing configuration version must be an integer.')
 
@@ -365,11 +534,11 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
                     raise PreflightError('retired_secret_env_vars must be a list of environment variable names.')
                 if env_name not in names:
                     names.append(env_name)
-            config['version'] = 13
+            config['version'] = 15
         else:
-            config['version'] = max(target_version, 13)
+            config['version'] = max(target_version, 15)
     else:
-        config['version'] = 13
+        config['version'] = 15
     # v12 adds editable activity chains. Retain explicit operator choices and
     # carry forward legacy provider pin customizations into the routine profile.
     default_profiles = example.get('profiles', {})
@@ -396,19 +565,13 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
         for old, new in (('complex', 'muse-full'), ('escalation', 'muse-full-high')):
             if new not in profiles and old in muse_profiles:
                 profiles[new] = {'provider': 'muse', **copy.deepcopy(muse_profiles[old])}
-    # Migrate exact packaged chains only. A changed profile used by a chain
-    # is also an operator choice, even if the list itself is unchanged.
-    if preserving and target_version < 13:
-        for name, previous in V12_ACTIVITY_DEFAULTS.items():
-            if (activities.get(name) == previous and
-                    all(profiles.get(profile) == default_profiles.get(profile) for profile in previous) and
-                    all(profile not in profiles or profiles[profile] == default_profiles.get(profile)
-                        for profile in default_activities[name])):
-                activities[name] = copy.deepcopy(default_activities[name])
+    if preserving:
+        migrate_activity_defaults(config, example, target_version, claude_host=routing_overlay is not None)
     for name, value in default_profiles.items():
         profiles.setdefault(name, copy.deepcopy(value))
-    for name, value in default_activities.items():
-        activities.setdefault(name, copy.deepcopy(value))
+    if not preserving:
+        for name, value in default_activities.items():
+            activities.setdefault(name, copy.deepcopy(value))
     try:
         validate_activity_registry(config)
     except ValueError as exc:

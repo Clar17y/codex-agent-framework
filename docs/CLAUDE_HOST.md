@@ -31,14 +31,14 @@ Dispatch needs the signed-in CLIs, so it works from Claude Code on the machine w
 
 `claude/routing.overlay.json` replaces only the `activities` key of the shared `routing.example.json`, so profiles, providers and workflow defaults stay in one place. It assumes Claude Max as the orchestrator budget, Codex on the smaller ChatGPT plan, Google AI Pro and Muse Power:
 
-- Routine work (exploration, implementation, testing, verification, documentation, docs research, refactor audit) starts on Gemini Flash, then Muse Wonder, with Claude and Codex Luna last.
+- Routine implementation starts on Gemini Hydrogen medium, followed by Gemini Flash medium as safe fallback, then Muse Wonder, with Claude Sonnet and Codex Luna last. Other routine work (exploration, testing, verification, documentation, docs research, refactor audit) starts on Gemini Flash, then Muse Wonder, with Claude and Codex Luna last.
 - Complex and long-horizon implementation and test design start on Muse Wonder Full, with Claude Opus and Codex Sol high behind it.
 - Independent and security review start on Codex Sol, so Claude-authored work is reviewed by another vendor by default; set `review.author_provider` to `claude` for work done in the Claude session and the dispatcher moves Claude profiles to the back.
 - Planning and orchestration start on Claude Opus; in practice the Claude session plans directly.
 - Structured thinking starts on Claude Sonnet, then Antigravity Sonnet, Codex Sol, Gemini Flash and Muse Wonder; native structured-thinker provides an in-session Sonnet advisory role.
 - Deep review starts on Claude Opus high, then Astra, which may not be available on every ChatGPT plan.
 
-These are quota-driven defaults, not measurements. Edit the chains in the installed `routing.json`; reinstalling preserves your edits.
+These are quota-driven defaults, not measurements. Edit the chains in the installed `routing.json`; reinstalling preserves your edits. Routing version 15 recognizes untouched prior packaged v12/v13 Claude chains and v14 Hydrogen chains, retaining customized relevant profiles, chains, legacy pins and quota bytes. Routine implementation starts with `gemini-hydrogen > gemini-flash`. Hydrogen has no separate framework quota family: unknown model diagnostics remain account-wide. Exact individual limits for known Flash, Claude and Argon IDs stay scoped to those families (Opus/Sonnet share Claude). Unknown requested models conservatively consider all cached family evidence. Confirmed Hydrogen quota blocks all Antigravity routes; settled model errors may fall through to Flash after authoritative terminal failure and resolved ownership. Timeout, cancellation or missing terminals block fallback.
 
 ## Derived roles and skills
 

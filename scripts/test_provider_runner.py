@@ -2011,6 +2011,28 @@ class ProviderTests(unittest.TestCase):
         self.assertIn("--tools", cmd)
         self.assertEqual(cmd[cmd.index("--tools") + 1], "Read,Glob,Grep")
 
+    def test_legacy_gemini_implement_pin_and_activity_hydrogen_command(self):
+        """Legacy implement role requires gemini-3.8-flash-medium pin while activity accepts hydrogen."""
+        flash_provider = {"executable": "agy", "model": "gemini-3.8-flash-medium"}
+        hydrogen_provider = {"executable": "agy", "model": "gemini-4-hydrogen-medium"}
+
+        # Legacy implement role accepts pinned flash model
+        cmd = runner.command_for("implement", flash_provider, "do work", 3600, self.root)
+        self.assertIn("gemini-3.8-flash-medium", cmd)
+        self.assertIn("--mode", cmd)
+        self.assertIn("accept-edits", cmd)
+
+        # Legacy implement role rejects hydrogen model
+        with self.assertRaisesRegex(ValueError, "implement requires pinned model gemini-3.8-flash-medium"):
+            runner.command_for("implement", hydrogen_provider, "do work", 3600, self.root)
+
+        # Activity dispatch accepts hydrogen profile model
+        activity_cmd = runner.command_for("implement", hydrogen_provider, "do work", 3600, self.root,
+                                          activity="implementation")
+        self.assertIn("gemini-4-hydrogen-medium", activity_cmd)
+        self.assertIn("--mode", activity_cmd)
+        self.assertIn("accept-edits", activity_cmd)
+
     def test_stream_telemetry_production_intervals_are_bounded(self):
         self.assertGreaterEqual(runner.STREAM_POLL_SECONDS, 0.5)
         self.assertGreaterEqual(runner.STREAM_PROGRESS_EMIT_SECONDS, 10)

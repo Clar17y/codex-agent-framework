@@ -181,6 +181,25 @@ class ClaudeHostInstallTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["activities"]["implementation"],
                          ["muse-wonder", "gemini-flash"])
 
+    def test_claude_host_upgrade_untouched_chain_promotes_hydrogen(self):
+        """Reinstalling Claude host over untouched pre-v14 chain promotes Hydrogen."""
+        self.install()
+        path = self.root / "agent-framework/routing.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config["version"] = 12
+        config["activities"]["implementation"] = [
+            "gemini-flash", "muse-wonder", "claude-sonnet", "openai-luna"
+        ]
+        config["profiles"].pop("gemini-hydrogen", None)
+        path.write_text(json.dumps(config), encoding="utf-8")
+
+        self.install()
+        upgraded = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded.get("version"), 15)
+        self.assertEqual(upgraded["activities"]["implementation"], [
+            "gemini-hydrogen", "gemini-flash", "muse-wonder", "claude-sonnet", "openai-luna"
+        ])
+
     def test_config_dir_environment_and_mismatched_home_flags(self):
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root)}), mock.patch("builtins.print"):
             install_framework(host="claude", source=str(self.source))
@@ -255,6 +274,19 @@ class ClaudeRoutingDefaultsTests(unittest.TestCase):
         for activity in ("exploration", "implementation", "testing", "verification", "documentation",
                          "docs_research", "refactor_audit"):
             self.assertEqual(first_provider(activity), "gemini", activity)
+
+    def test_claude_host_implementation_promotes_hydrogen_with_flash_fallback(self):
+        """Claude overlay implementation chain starts with Hydrogen then Flash fallback."""
+        impl_chain = self.config["activities"]["implementation"]
+        self.assertEqual(impl_chain, [
+            "gemini-hydrogen", "gemini-flash", "muse-wonder", "claude-sonnet", "openai-luna"
+        ])
+        h_prof = self.config["profiles"][impl_chain[0]]
+        f_prof = self.config["profiles"][impl_chain[1]]
+        self.assertEqual((h_prof["provider"], h_prof["model"], h_prof["effort"]),
+                         ("gemini", "gemini-4-hydrogen-medium", "medium"))
+        self.assertEqual((f_prof["provider"], f_prof["model"], f_prof["effort"]),
+                         ("gemini", "gemini-3.8-flash-medium", "medium"))
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 This package routes bounded coding activities across OpenAI Codex CLI, Claude Code, Google Antigravity (`agy`) and Muse Code. The primary host model remains the user's selection. An explicitly chosen CLI agent can orchestrate by calling the same dispatcher for child tasks; the framework does not run a separate autonomous pipeline.
 
-Install with `python install.py` (Python 3.11+). The additive v12 installer preserves saved provider executables, timing, custom model/profile/chain choices, quota state and credentials. It registers a narrowly named Antigravity reader agent and rejects a conflicting definition. Use `--dry-run` to inspect planned changes; actual signed-in provider access must be checked separately.
+Install with `python install.py` (Python 3.11+). The additive v14 installer promotes Gemini 4 Hydrogen medium as the default routine implementation profile with Flash medium safe fallback, and preserves saved provider executables, timing, custom model/profile/chain choices, quota state and credentials. It registers a narrowly named Antigravity reader agent and rejects a conflicting definition. Use `--dry-run` to inspect planned changes; actual signed-in provider access must be checked separately.
 
 The canonical commands are:
 

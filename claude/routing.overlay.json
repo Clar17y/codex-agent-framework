@@ -19,6 +19,7 @@
       "openai-luna"
     ],
     "implementation": [
+      "gemini-hydrogen",
       "gemini-flash",
       "muse-wonder",
       "claude-sonnet",

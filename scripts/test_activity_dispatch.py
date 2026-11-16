@@ -8,16 +8,33 @@ import unittest
 from unittest import mock
 import io
 import os
+import re
 import sys
 import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
 import provider_runner as runner
 
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+@contextmanager
+def mercury_fixture_environment():
+    # Offline fixtures must not depend on unrelated CI/User credentials. Keep
+    # actual credential classification and strict short-secret checks intact.
+    environment = {name: value for name, value in os.environ.items()
+                   if not re.search(r'(?i)(api_?key|secret|password|token)', name)}
+    with mock.patch.dict(os.environ, environment, clear=True), \
+         mock.patch.object(runner, 'windows_user_secret', return_value=None), \
+         mock.patch.object(runner, 'get_inception_api_key', return_value=None):
+        yield
 
 
 class ActivityDispatchTests(unittest.TestCase):
@@ -52,7 +69,7 @@ class ActivityDispatchTests(unittest.TestCase):
 
     def test_all_activities_have_four_providers_and_registry_is_immutable(self):
         original = copy.deepcopy(self.config)
-        self.assertEqual(len(self.config["activities"]), 15)
+        self.assertEqual(len(self.config["activities"]), 16)
         for activity in self.config["activities"]:
             chain = runner.activity_routes(self.config, activity)
             self.assertEqual({self.config["profiles"][p]["provider"] for p in chain},
@@ -62,6 +79,311 @@ class ActivityDispatchTests(unittest.TestCase):
                 self.assertEqual(effective["model"], self.config["profiles"][name]["model"])
                 self.assertEqual(provider_name, self.config["profiles"][name]["provider"])
         self.assertEqual(self.config, original)
+
+    def test_explicit_muse_api_selection_rejected_without_provider_or_with_profile(self):
+        for updates in ({}, {"provider": "gemini"}, {"profile": "muse-wonder"},
+                        {"provider": "muse", "profile": "muse-wonder"}):
+            args = self.args("implementation", muse_auth="api", **updates)
+            with self.subTest(updates=updates), mock.patch.object(runner, "execute", side_effect=AssertionError("no launch")):
+                for operation in (runner.activity_status, runner.dispatch_activity):
+                    with self.assertRaisesRegex(ValueError, "--provider muse|--profile"):
+                        operation(args)
+
+    def test_api_complex_activities_report_and_launch_supported_wonder_model(self):
+        self.config["workflow"]["require_jev_evidence"] = False
+        runner.write_json(self.config_path, self.config)
+        for activity in ("implementation_complex", "implementation_long_horizon"):
+            with self.subTest(activity=activity):
+                args = self.args(activity, provider="muse", muse_auth="api", dry_run=True)
+                status, _ = runner.activity_status(args)
+                dry, code = runner.dispatch_activity(args)
+                self.assertEqual(code, 0)
+                self.assertTrue(all(row["model"] == "muse-wonder-1.0" for row in status["routes"]))
+                self.assertEqual(dry["attempts"][0]["model"], "muse-wonder-1.0")
+                self.assertEqual(dry["result"]["model"], "muse-wonder-1.0")
+                command = dry["result"]["command"]
+                self.assertEqual(command[command.index("--model") + 1], "muse-wonder-1.0")
+                stored, _ = runner.activity_status(self.args(activity, provider="muse"))
+                self.assertTrue(any(row["model"] == "muse-wonder-full-1.0" for row in stored["routes"]))
+
+    def test_api_status_dispatch_preflight_and_model_retry_use_selected_cache(self):
+        self.config["profiles"]["muse-spark-api-test"] = {"provider": "muse", "model": "muse-spark-1.3", "effort": "medium"}
+        self.config["activities"]["implementation"] = ["muse-wonder", "muse-spark-api-test"]
+        runner.write_json(self.config_path, self.config)
+        state_dir = self.root / "state"
+        runner.write_json(state_dir / "muse-quota.json", {"provider": "muse", "retry_at": time.time() + 5000})
+        args = self.args("implementation", provider="muse", muse_auth="api")
+        status, _ = runner.activity_status(args)
+        self.assertEqual({r["status"] for r in status["routes"]}, {"available_to_try"})
+        self.assertTrue(all(r["muse_auth"] == "api" and r["quota_path"].endswith("muse-api-quota.json") for r in status["routes"]))
+        calls = []
+
+        def fake_execute(route_args):
+            calls.append((route_args.profile, route_args.provider, route_args.muse_auth))
+            if len(calls) == 1:
+                return {"status": "provider_error", "terminal_established": True}, 1
+            return {"status": "completed", "muse_auth": "api"}, 0
+
+        with mock.patch.object(runner, "execute", side_effect=fake_execute):
+            result, code = runner.dispatch_activity(args)
+        self.assertEqual((code, result["selected"]), (0, "muse-spark-api-test"))
+        self.assertEqual(calls, [("muse-wonder", "muse", "api"), ("muse-spark-api-test", "muse", "api")])
+        runner.write_json(state_dir / "muse-api-quota.json", {"provider": "muse", "muse_auth": "api", "retry_at": time.time() + 5000})
+        with mock.patch.object(runner, "execute", side_effect=AssertionError("API cache must block")):
+            result, code = runner.dispatch_activity(args)
+        self.assertEqual((code, result["status"]), (20, "all_routes_unavailable"))
+        self.assertEqual([a["status"] for a in result["attempts"]], ["fallback_required", "skipped_account_block"])
+        self.assertEqual(result["attempts"][0]["muse_auth"], "api")
+
+    def test_api_does_not_retry_duplicate_effective_models(self):
+        self.config["activities"]["implementation"] = ["muse-wonder", "muse-full"]
+        runner.write_json(self.config_path, self.config)
+        with mock.patch.object(runner, "execute", return_value=({"status": "provider_error", "terminal_established": True}, 1)) as launch:
+            result, code = runner.dispatch_activity(self.args("implementation", provider="muse", muse_auth="api"))
+        self.assertEqual((result["status"], code), ("all_routes_unavailable", 20))
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual([a["status"] for a in result["attempts"]],
+                         ["provider_error", "skipped_duplicate_route"])
+
+    def test_mercury_fixture_isolation_keeps_actual_short_secret_guard(self):
+        with mock.patch.dict(os.environ, {'MYSQL_ROOT_PASSWORD': 'root'}), \
+             mock.patch.object(runner, 'windows_user_secret', return_value=None), \
+             mock.patch.object(runner, 'get_inception_api_key', return_value=None):
+            with self.assertRaises(runner.UnsafeSecretError):
+                runner.validate_redaction_secrets(runner.redaction_secrets(self.config, mercury=True))
+            with mercury_fixture_environment():
+                self.assertNotIn('MYSQL_ROOT_PASSWORD', os.environ)
+                runner.validate_redaction_secrets(runner.redaction_secrets(self.config, mercury=True))
+            self.assertEqual(os.environ['MYSQL_ROOT_PASSWORD'], 'root')
+
+    @mercury_fixture_environment()
+    def test_mercury_generic_example_is_redacted_without_false_secret_collision(self):
+        task = runner.read_json(self.task_path)
+        task["objective"] = "Document the example Bearer demo-token-value"
+        runner.write_json(self.task_path, task)
+        args = self.args("exploration", provider="inception", profile="mercury-explorer")
+        args.role = "review"
+        with mock.patch.object(runner, "command_for", side_effect=ValueError("reached command construction")):
+            with self.assertRaisesRegex(ValueError, "reached command construction"):
+                runner.execute(args)
+        prompts = list((self.root / ".llm-output/agent-framework").glob("*/prompt.txt"))
+        self.assertEqual(len(prompts), 1)
+        self.assertNotIn("demo-token-value", prompts[0].read_text(encoding="utf-8"))
+
+    def test_default_dispatch_does_not_automatically_select_api_when_stored_auth_limited(self):
+        self.config["activities"]["implementation"] = ["muse-wonder", "muse-full"]
+        runner.write_json(self.config_path, self.config)
+        runner.write_json(self.root / "state/muse-quota.json", {"retry_at": time.time() + 5000})
+        with mock.patch.dict(os.environ, {"META_API_KEY": "fake-unused-key"}), \
+                mock.patch.object(runner, "execute", side_effect=AssertionError("no API fallback")):
+            result, code = runner.dispatch_activity(self.args("implementation", provider="muse"))
+        self.assertEqual((code, result["status"]), (20, "all_routes_unavailable"))
+        self.assertEqual(result["attempts"][0]["muse_auth"], "stored")
+        self.assertFalse((self.root / "state/muse-api-quota.json").exists())
+
+    def test_api_limit_does_not_poison_default_activity_routes(self):
+        self.config["activities"]["implementation"] = ["muse-wonder", "muse-full", "openai-luna"]
+        # Use an existing OpenAI profile regardless of the packaged profile name.
+        self.config["activities"]["implementation"][-1] = next(n for n, p in self.config["profiles"].items() if p["provider"] == "openai")
+        runner.write_json(self.config_path, self.config)
+        runner.write_json(self.root / "state/muse-api-quota.json", {"retry_at": time.time() + 5000})
+        status, _ = runner.activity_status(self.args("implementation", provider="muse"))
+        self.assertEqual({r["status"] for r in status["routes"]}, {"available_to_try"})
+        # Default routing walks the normal chain; it never adds API auth.
+        seen = []
+
+        def complete(args):
+            seen.append((args.provider, getattr(args, "muse_auth", None)))
+            return {"status": "completed"}, 0
+
+        with mock.patch.object(runner, "execute", side_effect=complete):
+            result, code = runner.dispatch_activity(self.args("implementation"))
+        self.assertEqual((code, result["selected"]), (0, "muse-wonder"))
+        self.assertEqual(seen, [("muse", None)])
+
+    def test_antigravity_review_defaults_and_family_status(self):
+        self.assertEqual(self.config["activities"]["independent_review"][:2], ["agy-opus", "gemini-argon"])
+        for name in ("agy-opus", "agy-opus-high", "agy-sonnet", "agy-sonnet-high", "gemini-argon", "gemini-argon-high"):
+            provider, effective = runner.effective_activity_provider(self.config, name)
+            self.assertEqual(provider, "gemini")
+            self.assertTrue(effective["model"].endswith("-" + effective["effort"]))
+        legacy = self.root / "state/gemini-quota.json"
+        runner.write_json(legacy, {"model": "gemini-3.8-flash-medium", "retry_at": time.time()+400000,
+                                  "error": {"message": "Individual quota reached. Resets in 94h6m29s."}})
+        before = legacy.read_bytes()
+        result, code = runner.activity_status(self.args("independent_review"))
+        statuses = {item["profile"]: item["status"] for item in result["routes"]}
+        self.assertEqual(code, 0)
+        self.assertEqual(statuses["gemini-flash"], "fallback_required")
+        for profile in ("agy-opus", "gemini-argon", "claude-opus"):
+            self.assertEqual(statuses[profile], "available_to_try")
+        status, code = runner.cli_quota_status(self.args(None, provider="gemini"))
+        self.assertEqual((code, status["status"]), (20, "fallback_required"))
+        self.assertEqual(legacy.read_bytes(), before)
+
+    def configure_offline_antigravity(self, chain, activity="independent_review"):
+        helper = self.root / ".gemini/config/agents/framework-reader.md"
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_bytes((ROOT / "agents/framework-reader.md").read_bytes())
+        fake = self.root / "offline_agy.py"
+        fake.write_text('''import sys, json, os, time
+from pathlib import Path
+model = sys.argv[sys.argv.index("--model")+1]
+with Path("launched.txt").open("a") as f: f.write(model+"\\n")
+mode = os.environ.get("OFFLINE_AGY_MODE", "family")
+if mode == "unknown": sys.exit(7)
+if mode == "timeout": time.sleep(10)
+if mode == "auth":
+ print(json.dumps({"status":"ERROR", "error":{"code":"UNAUTHENTICATED", "message":"authentication required"}}), flush=True)
+ sys.exit(1)
+if mode == "rate":
+ print(json.dumps({"status":"ERROR", "error":{"code":"429", "message":"rate limit requests/min"}}), flush=True)
+ sys.exit(1)
+if model.startswith("claude-"):
+ message = "Weekly limit reached" if mode == "account" else "Individual quota reached. Resets in 2h."
+ print(json.dumps({"status":"ERROR", "error":{"code":"QUOTA_EXHAUSTED", "message":message}}), flush=True)
+ sys.exit(1)
+print(json.dumps({"status":"SUCCESS", "response":"offline complete"}), flush=True)
+''')
+        self.config["workflow"]["require_jev_evidence"] = False
+        self.config["providers"]["gemini"].update(executable=[sys.executable, str(fake)],
+            reader_agent_file=str(helper), timeout_seconds=1, termination_grace_seconds=1, heartbeat_seconds=0)
+        self.config["activities"][activity] = chain
+        self.config_path.write_text(json.dumps(self.config))
+
+    def test_offline_opus_family_failure_skips_sonnet_then_runs_argon(self):
+        self.configure_offline_antigravity(["agy-opus", "agy-sonnet", "gemini-argon", "gemini-flash"])
+        with mock.patch.object(runner.Path, "home", return_value=self.root):
+            result, code = runner.dispatch_activity(self.args("independent_review"))
+        self.assertEqual((code, result["selected"]), (0, "gemini-argon"), result)
+        self.assertEqual([a["status"] for a in result["attempts"]], ["fallback_required", "fallback_required", "completed"])
+        self.assertEqual((self.root / "launched.txt").read_text().splitlines(),
+                         ["claude-opus-5-5-medium", "gemini-4-argon-medium"])
+        state, error = runner.quota_state(self.root / "state", "gemini", "claude-sonnet-5-5-high")
+        self.assertIsNone(error)
+        self.assertEqual(state["model_family"], "claude")
+        self.assertEqual(runner.quota_state(self.root / "state", "claude", "claude-opus-5-5"), (None, None))
+        # A subsequent dispatch uses the persisted cache and never launches Claude.
+        with mock.patch.object(runner.Path, "home", return_value=self.root):
+            repeat, code = runner.dispatch_activity(self.args("independent_review"))
+        self.assertEqual((code, repeat["selected"]), (0, "gemini-argon"))
+        self.assertEqual(len((self.root / "launched.txt").read_text().splitlines()), 3)
+
+    def test_offline_account_auth_disabled_and_rate_transitions(self):
+        self.configure_offline_antigravity(["agy-opus", "agy-sonnet", "gemini-argon", "gemini-flash"])
+        for mode in ("account", "auth", "rate", "disabled"):
+            with self.subTest(mode=mode):
+                state_dir = self.root / mode
+                self.config["providers"]["gemini"]["enabled"] = mode != "disabled"
+                self.config_path.write_text(json.dumps(self.config))
+                with mock.patch.object(runner.Path, "home", return_value=self.root), mock.patch.dict(os.environ, {"OFFLINE_AGY_MODE": mode}):
+                    result, code = runner.dispatch_activity(self.args("independent_review", state_dir=str(state_dir)))
+                self.assertEqual((code, result["status"]), (20, "all_routes_unavailable"), result)
+                self.assertEqual([a["status"] for a in result["attempts"]][1:], ["skipped_account_block"]*3 if mode != "rate" else ["provider_error"]*3)
+                self.assertEqual((state_dir / "gemini-quota.json").exists(), mode == "account")
+                statuses, _ = runner.activity_status(self.args("independent_review", state_dir=str(state_dir)))
+                expected = "fallback_required" if mode == "account" else "disabled" if mode == "disabled" else "available_to_try"
+                self.assertEqual({route["status"] for route in statuses["routes"]}, {expected})
+
+    def test_offline_unknown_and_timeout_writer_stop_cross_family_fallback(self):
+        self.configure_offline_antigravity(["agy-opus", "gemini-argon"], activity="implementation")
+        popen = runner.subprocess.Popen
+        for mode in ("unknown", "timeout", "cancelled"):
+            def cancellable(command, *args, **kwargs):
+                process = popen(command, *args, **kwargs)
+                if mode == "cancelled" and str(self.root / "offline_agy.py") in command:
+                    wait = process.wait
+                    def interrupt_once(*args, **kwargs):
+                        process.wait = wait
+                        raise KeyboardInterrupt
+                    process.wait = interrupt_once
+                return process
+            with (self.subTest(mode=mode), mock.patch.dict(os.environ, {"OFFLINE_AGY_MODE": mode}),
+                  mock.patch.object(runner.subprocess, "Popen", side_effect=cancellable)):
+                state_dir = self.root / mode
+                result, code = runner.dispatch_activity(self.args("implementation", state_dir=str(state_dir)))
+                self.assertEqual((code, result["status"], len(result["attempts"])), (1, "blocked_pending_run", 1), result)
+                pending = Path(result["attempts"][0]["pending_path"])
+                self.assertNotEqual(runner.read_json(pending)["status"], "resolved")
+                self.assertFalse(list(state_dir.glob("*-quota.json")))
+                if mode == "cancelled":
+                    self.assertEqual(result["attempts"][0]["status"], "cancelled")
+                before = pending.read_bytes()
+                again, code = runner.dispatch_activity(self.args("implementation", state_dir=str(state_dir)))
+                self.assertEqual((code, again["status"], len(again["attempts"])), (1, "blocked_pending_run", 1))
+                self.assertEqual(pending.read_bytes(), before)
+
+    def test_execution_recheck_observes_family_quota_written_after_preflight(self):
+        self.configure_offline_antigravity(["agy-opus", "gemini-argon"])
+        execute = runner.execute
+        def concurrent_limit(args):
+            if args.profile == "agy-opus":
+                with runner.provider_lock(self.root / "state", 5, "quota.lock"):
+                    runner.quota_record("gemini", {"message": "Individual quota reached. Resets in 2h."},
+                        self.root / "state", "offline", self.config, model="claude-sonnet-5-5-high")
+            return execute(args)
+        with mock.patch.object(runner, "execute", side_effect=concurrent_limit), mock.patch.object(runner.Path, "home", return_value=self.root):
+            result, code = runner.dispatch_activity(self.args("independent_review"))
+        self.assertEqual((code, result["selected"]), (0, "gemini-argon"), result)
+        self.assertEqual((self.root / "launched.txt").read_text().splitlines(), ["gemini-4-argon-medium"])
+        first = runner.read_json(Path(result["attempts"][0]["logs"]) / "result.json")
+        self.assertTrue(first["cached"])
+
+    def test_execution_recheck_account_corruption_and_disable_allow_other_provider(self):
+        self.configure_offline_antigravity(["agy-opus", "gemini-argon", "claude-opus"])
+        execute = runner.execute
+        for mode in ("account", "corrupt", "disabled"):
+            with self.subTest(mode=mode):
+                state_dir = self.root / mode
+                self.config["providers"]["gemini"]["enabled"] = True
+                self.config_path.write_text(json.dumps(self.config))
+                def concurrent_block(args):
+                    if args.profile == "claude-opus":
+                        return {"status": "completed"}, 0
+                    self.assertEqual(args.profile, "agy-opus")
+                    if mode == "disabled":
+                        updated = copy.deepcopy(self.config)
+                        updated["providers"]["gemini"]["enabled"] = False
+                        self.config_path.write_text(json.dumps(updated))
+                    else:
+                        path = state_dir / "gemini-quota.json"
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text("{" if mode == "corrupt" else json.dumps({"retry_at": time.time()+1000}))
+                    return execute(args)
+                with mock.patch.object(runner, "execute", side_effect=concurrent_block), mock.patch.object(runner.Path, "home", return_value=self.root):
+                    result, code = runner.dispatch_activity(self.args("independent_review", state_dir=str(state_dir)))
+                self.assertEqual((code, result.get("selected")), (0, "claude-opus"), result)
+                self.assertFalse((self.root / "launched.txt").exists())
+
+    def test_expired_argon_family_allows_probe_and_keeps_evidence(self):
+        self.configure_offline_antigravity(["gemini-argon"])
+        path = self.root / "state/gemini-argon-quota.json"
+        runner.write_json(path, {"model": "gemini-4-argon-low", "retry_at": time.time()-1,
+                                 "error": {"message": "Individual quota reached. Resets in 2h."}})
+        before = path.read_bytes()
+        with mock.patch.object(runner.Path, "home", return_value=self.root):
+            result, code = runner.dispatch_activity(self.args("independent_review"))
+        self.assertEqual((code, result.get("selected")), (0, "gemini-argon"), result)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_antigravity_review_diversity_and_high_reason_are_preserved(self):
+        task = json.loads(self.task_path.read_text())
+        task["review"]["author_provider"] = "gemini"
+        self.task_path.write_text(json.dumps(task))
+        with mock.patch.object(runner, "execute", return_value=({"status": "completed"}, 0)) as launch:
+            result, code = runner.dispatch_activity(self.args("independent_review"))
+        self.assertEqual((code, result.get("selected")), (0, "claude-opus"))
+        self.assertFalse(result["same_provider_review"])
+        self.config["activities"]["independent_review"] = ["agy-opus-high", "gemini-argon", "claude-opus"]
+        self.config_path.write_text(json.dumps(self.config))
+        task["review"]["author_provider"] = "claude"
+        self.task_path.write_text(json.dumps(task))
+        with mock.patch.object(runner, "execute", return_value=({"status": "completed"}, 0)):
+            result, code = runner.dispatch_activity(self.args("independent_review"))
+        self.assertEqual(result["attempts"][0]["status"], "review_reason_required")
+        self.assertEqual(result.get("selected"), "gemini-argon")
+        with self.assertRaisesRegex(ValueError, "review-reason"):
+            runner.dispatch_activity(self.args("security_review"))
 
     def test_invalid_chain_and_disabled_profile_fail_before_launch(self):
         for bad in (["openai-sol", "openai-sol"], ["missing"], ["openai-sol"]):
@@ -619,6 +941,101 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
         runner.write_json(pending, {"status": "resolved"})
         self.assertEqual(runner.settle_orchestration_parent(parent_path)["status"], "resolved")
 
+    def test_structured_thinking_activity_routes_and_capabilities(self):
+        chain = runner.activity_routes(self.config, "structured_thinking")
+        self.assertEqual(chain, ["claude-sonnet", "agy-sonnet", "openai-sol", "gemini-flash", "muse-wonder"])
+        self.assertIn("structured_thinking", runner.READ_ACTIVITIES)
+        self.assertNotIn("structured_thinking", runner.WRITE_ACTIVITIES)
+
+        # Test registry validation requires nonempty chain and known profiles
+        config = copy.deepcopy(self.config)
+        config["activities"]["structured_thinking"] = []
+        with self.assertRaisesRegex(ValueError, "requires a nonempty chain"):
+            runner.validate_activity_registry(config)
+
+        config["activities"]["structured_thinking"] = ["nonexistent-profile"]
+        with self.assertRaisesRegex(ValueError, "references unknown or disabled profile"):
+            runner.validate_activity_registry(config)
+
+    def test_prompt_for_injects_canonical_protocol_only_for_structured_thinking(self):
+        task = {
+            "objective": "Design advice",
+            "acceptance_criteria": ["Evaluate trade-offs"],
+            "owned_paths": [],
+            "validation": ["echo check"],
+            "instructions_files": []
+        }
+        task_file = self.root / "task.json"
+        task_file.write_text(json.dumps(task))
+
+        prompt = runner.prompt_for(self.root, task_file, task, activity="structured_thinking")
+        self.assertIn("ACTIVITY structured_thinking: Read and search only; do not write or run commands.", prompt)
+        self.assertIn("1. Restate the question in your own words.", prompt)
+        self.assertIn("2. List three plausible interpretations of the question, naming the critical assumption of each.", prompt)
+        self.assertIn("3. List the strongest case against the answer you are about to give.", prompt)
+        self.assertIn("4. Final answer.", prompt)
+        self.assertIn("The earlier sections are committed claims", prompt)
+        self.assertIn("Do not edit files, run commands, or spawn subagents.", prompt)
+        self.assertIn("place the four numbered sections inside its narrative summary", prompt)
+
+        # Other activities do not include structured thinking protocol
+        for other_act in ("planning", "implementation", "independent_review"):
+            with self.subTest(activity=other_act):
+                other_prompt = runner.prompt_for(self.root, task_file, task, activity=other_act)
+                self.assertNotIn("1. Restate the question in your own words.", other_prompt)
+                self.assertNotIn("List three plausible interpretations", other_prompt)
+
+    def test_load_structured_thinker_protocol_for_both_layouts(self):
+        # 1. Codex installed layout:
+        # <root>/agent-framework/scripts/provider_runner.py
+        # <root>/agents/structured-thinker.toml
+        codex_root = self.root / "codex_install"
+        codex_agents = codex_root / "agents"
+        codex_agents.mkdir(parents=True)
+        codex_script_dir = codex_root / "agent-framework" / "scripts"
+        codex_script_dir.mkdir(parents=True)
+        codex_runner = codex_script_dir / "provider_runner.py"
+        codex_runner.write_text("# runner stub")
+        (codex_agents / "structured-thinker.toml").write_text(
+            'name = "structured_thinker"\ndeveloper_instructions = """Codex layout protocol instructions"""'
+        )
+        protocol = runner.load_structured_thinker_protocol(codex_runner)
+        self.assertEqual(protocol, "Codex layout protocol instructions")
+
+        # 2. Claude installed layout (and source repo layout):
+        # <root>/agent-framework/scripts/provider_runner.py
+        # <root>/agent-framework/agents/structured-thinker.toml
+        claude_root = self.root / "claude_install"
+        claude_pkg = claude_root / "agent-framework"
+        claude_agents = claude_pkg / "agents"
+        claude_agents.mkdir(parents=True)
+        claude_script_dir = claude_pkg / "scripts"
+        claude_script_dir.mkdir(parents=True)
+        claude_runner = claude_script_dir / "provider_runner.py"
+        claude_runner.write_text("# runner stub")
+        (claude_agents / "structured-thinker.toml").write_text(
+            'name = "structured_thinker"\ndeveloper_instructions = """Claude layout protocol instructions"""'
+        )
+        protocol = runner.load_structured_thinker_protocol(claude_runner)
+        self.assertEqual(protocol, "Claude layout protocol instructions")
+
+    def test_structured_thinker_protocol_rejects_missing_or_empty_instructions(self):
+        package = self.root / "protocol-package"
+        script = package / "scripts" / "provider_runner.py"
+        with self.assertRaises(FileNotFoundError):
+            runner.load_structured_thinker_protocol(script)
+
+        agents = package / "agents"
+        agents.mkdir(parents=True)
+        role = agents / "structured-thinker.toml"
+        for content in ('name = "structured_thinker"',
+                        'developer_instructions = "   "',
+                        'developer_instructions = []'):
+            with self.subTest(content=content):
+                role.write_text(content, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "Expected nonempty developer_instructions"):
+                    runner.load_structured_thinker_protocol(script)
+
     def test_reader_capabilities_are_flags_not_plan_prompt(self):
         helper = self.root / ".gemini" / "config" / "agents" / "framework-reader.md"
         helper.parent.mkdir(parents=True)
@@ -795,6 +1212,24 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
         self.assertEqual((code, launches), (0, ["openai-sol", "claude-sonnet"]))
         self.assertEqual(result["attempts"][1]["status"], "skipped_account_block")
 
+    def test_revoked_claude_oauth_token_skips_other_claude_profiles(self):
+        self.config["activities"]["implementation"] = ["claude-opus", "claude-sonnet", "openai-sol"]
+        self.config_path.write_text(json.dumps(self.config))
+        launches = []
+        def fake_execute(args):
+            launches.append(args.profile)
+            if args.provider == "claude":
+                return {"status": "provider_error", "terminal_established": True, "error_codes": [],
+                        "error": "Failed to authenticate. API Error: 401 OAuth access token has been revoked."}, 1
+            return {"status": "completed"}, 0
+        with mock.patch.object(runner, "execute", side_effect=fake_execute), mock.patch.object(runner, "quota_state", return_value=(None, None)):
+            result, code = runner.dispatch_activity(self.args("implementation"))
+        self.assertEqual((code, launches), (0, ["claude-opus", "openai-sol"]))
+        self.assertEqual(result["attempts"][1]["status"], "skipped_account_block")
+        self.assertFalse((self.root / "state" / "claude-quota.json").exists())
+        self.assertFalse(runner.account_auth_error({"error": "Model not found", "error_codes": []}))
+        self.assertFalse(runner.account_auth_error({"error": "Rate limit exceeded", "error_codes": ["429"]}))
+
     def test_cached_quota_skips_same_provider_and_all_unavailable_is_explicit(self):
         self.config["activities"]["implementation"] = ["openai-sol", "openai-luna", "claude-sonnet"]
         self.config_path.write_text(json.dumps(self.config))
@@ -833,7 +1268,7 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
         self.config["workflow"]["require_jev_evidence"] = False
         self.config_path.write_text(json.dumps(self.config))
         before = self.config_path.read_bytes()
-        with mock.patch.object(runner, "direct_windows_codex_command", side_effect=lambda argv: argv), mock.patch.object(runner.subprocess, "Popen") as launch:
+        with mock.patch.object(runner, "direct_windows_codex_command", side_effect=lambda argv, **kwargs: argv), mock.patch.object(runner.subprocess, "Popen") as launch:
             result, code = runner.dispatch_activity(self.args("planning", profile="openai-sol", dry_run=True))
         launch.assert_not_called()
         self.assertEqual((result["status"], code), ("dry_run", 0))
@@ -848,6 +1283,266 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
         self.assertEqual(code, 0)
         launch.assert_not_called()
         self.assertTrue(all(x["quota_path"].endswith(x["provider"] + "-quota.json") for x in result["routes"]))
+
+    def test_mercury_explorer_validation_and_activity_restrictions(self):
+        profile = self.config["profiles"].get("mercury-explorer")
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile["provider"], "inception")
+        self.assertEqual(profile["model"], "mercury-3")
+        self.assertEqual(profile["effort"], "low")
+
+        # Exploration allows mercury-explorer when added
+        config = copy.deepcopy(self.config)
+        config["activities"]["exploration"].insert(0, "mercury-explorer")
+        routes = runner.activity_routes(config, "exploration")
+        self.assertIn("mercury-explorer", routes)
+
+        # Other activities reject mercury-explorer / inception
+        for act in ("planning", "implementation", "orchestration"):
+            with self.subTest(activity=act):
+                bad_config = copy.deepcopy(self.config)
+                bad_config["activities"][act].insert(0, "mercury-explorer")
+                with self.assertRaisesRegex(ValueError, "exploration"):
+                    runner.activity_routes(bad_config, act)
+
+        # Unsupported effort for inception is rejected
+        for bad_effort in ("medium", "high", "xhigh"):
+            with self.subTest(effort=bad_effort):
+                bad_config = copy.deepcopy(self.config)
+                bad_config["profiles"]["mercury-explorer"]["effort"] = bad_effort
+                bad_config["activities"]["exploration"].insert(0, "mercury-explorer")
+                with self.assertRaisesRegex(ValueError, "Invalid effort"):
+                    runner.activity_routes(bad_config, "exploration")
+
+        # command_for restrictions
+        provider_name, effective = runner.effective_activity_provider(self.config, "mercury-explorer")
+        out_dir = self.root / "output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Rejects legacy implement/review role without activity
+        with self.assertRaisesRegex(ValueError, "exploration"):
+            runner.command_for("implement", effective, "prompt", 180, self.root, "low", "inception", out_dir)
+        with self.assertRaisesRegex(ValueError, "exploration"):
+            runner.command_for("review", effective, "prompt", 180, self.root, "low", "inception", out_dir)
+        # Rejects non-exploration activity
+        with self.assertRaisesRegex(ValueError, "exploration"):
+            runner.command_for("review", effective, "prompt", 180, self.root, "low", "inception", out_dir,
+                               activity="implementation")
+
+    def test_mercury_child_environment_and_command_construction(self):
+        # Child environment filters INCEPTION_API_KEY for all providers except inception
+        with mock.patch.dict(os.environ, {"INCEPTION_API_KEY": "inception-secret-xyz"}):
+            for p in ("openai", "claude", "gemini", "muse"):
+                env = runner.child_environment(self.config, p)
+                self.assertNotIn("INCEPTION_API_KEY", env)
+            env_inc = runner.child_environment(self.config, "inception")
+            self.assertEqual(env_inc.get("INCEPTION_API_KEY"), "inception-secret-xyz")
+
+        # Command construction for exploration activity
+        _, effective = runner.effective_activity_provider(self.config, "mercury-explorer")
+        out_dir = self.root / "out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        argv = runner.command_for("review", effective, "prompt", 180, self.root, "low", "inception", out_dir,
+                                  activity="exploration")
+        self.assertTrue(any("mercury_provider.py" in arg for arg in argv))
+        self.assertIn("--corpus", argv)
+        self.assertIn(str(self.root), argv)
+        self.assertIn("--task-file", argv)
+        self.assertIn(str(out_dir / "prompt.txt"), argv)
+        self.assertIn("--output", argv)
+        self.assertIn(str(out_dir / "mercury-result.json"), argv)
+        self.assertIn("--temperature", argv)
+        self.assertIn("1.0", argv)
+
+    def test_mercury_dispatch_execution_and_error_handling(self):
+        config = copy.deepcopy(self.config)
+        config["activities"]["exploration"] = ["mercury-explorer", "claude-opus"]
+        self.config_path.write_text(json.dumps(config))
+
+        # Direct quota classification check
+        self.assertIsNone(runner.inception_quota_error(
+            {"status": "rate_limit_error", "error": "Rate limit 429: per-minute limit reached"}, []))
+        self.assertIsNone(runner.inception_quota_error(
+            {"status": "auth_error", "error": "Invalid API key"}, []))
+        self.assertIsNotNone(runner.inception_quota_error(
+            {"status": "quota_exhausted", "error": "You have exceeded your account quota"}, []))
+
+        # 1. Successful exploration
+        def fake_success(args):
+            return {"status": "completed", "logs": "output", "terminal_established": True}, 0
+        with mock.patch.object(runner, "execute", side_effect=fake_success), mock.patch.object(runner, "quota_state", return_value=(None, None)):
+            result, code = runner.dispatch_activity(self.args("exploration"))
+        self.assertEqual(code, 0)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["selected"], "mercury-explorer")
+
+        # 2. Transient 429 rate limit authorizes fallback to next route without caching quota
+        def fake_rate_limit(args):
+            if args.profile == "mercury-explorer":
+                return {"status": "provider_error", "terminal_established": True, "error": "Rate limit 429: requests/min exceeded"}, 1
+            return {"status": "completed", "logs": "fallback_done", "terminal_established": True}, 0
+        with mock.patch.object(runner, "execute", side_effect=fake_rate_limit), mock.patch.object(runner, "quota_state", return_value=(None, None)):
+            result, code = runner.dispatch_activity(self.args("exploration"))
+        self.assertEqual(code, 0)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["selected"], "claude-opus")
+        # Quota file must not have been created
+        self.assertFalse((self.root / "state" / "inception-quota.json").exists())
+
+        # 3. True account quota exhaustion records quota and marks fallback
+        def fake_quota(args):
+            if args.profile == "mercury-explorer":
+                return {"status": "fallback_required", "quota": {"retry_at": 4102444800}, "terminal_established": True}, 20
+            return {"status": "completed", "logs": "fallback_done", "terminal_established": True}, 0
+        with mock.patch.object(runner, "execute", side_effect=fake_quota), mock.patch.object(runner, "quota_state", return_value=(None, None)):
+            result, code = runner.dispatch_activity(self.args("exploration"))
+        self.assertEqual(code, 0)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["selected"], "claude-opus")
+        self.assertEqual(result["attempts"][0]["status"], "fallback_required")
+
+        # 4. Process aborted / unestablished terminal halts dispatch with blocked_pending_run
+        def fake_killed(args):
+            return {"status": "uncertain_exit", "terminal_established": False, "fallback_authorized": False}, 1
+        with mock.patch.object(runner, "execute", side_effect=fake_killed), mock.patch.object(runner, "quota_state", return_value=(None, None)):
+            result, code = runner.dispatch_activity(self.args("exploration"))
+        self.assertEqual(code, 1)
+        self.assertEqual(result["status"], "blocked_pending_run")
+        self.assertEqual(len(result["attempts"]), 1)
+
+    def test_mercury_artifacts_and_host_secret_fingerprints(self):
+        import hashlib
+        output = self.root/'artifacts'
+        output.mkdir()
+        secret = 'opaque host fixture'
+        source = 'api_key = "source-fixture"\nprint("' + secret + '")\n'
+        (output/'prompt.txt').write_text(source)
+        payload = {'response': 'token="response-fixture"', 'nested': [secret]}
+        (output/'mercury-result.json').write_text(json.dumps(payload))
+        (output/'stdout.log').write_text(json.dumps(payload)+'\nmalformed token="log-fixture"\n')
+        (output/'invalid.json').write_text('broken api_key="invalid-fixture"')
+        (output/'diff.txt').write_text('x' * (4*1024*1024+1))
+        runner.sanitize_mercury_artifacts(output, [secret])
+        for path in output.iterdir():
+            text = path.read_text()
+            for value in (secret, 'source-fixture', 'response-fixture', 'log-fixture', 'invalid-fixture'):
+                self.assertNotIn(value, text)
+        self.assertEqual((output/'prompt.txt').read_text().count('\n'), source.count('\n'))
+        self.assertEqual(json.loads((output/'mercury-result.json').read_text())['nested'], ['[REDACTED]'])
+        self.assertIn('Artifact omitted', (output/'diff.txt').read_text())
+        with mock.patch.dict(os.environ, {'TYPESAFE_API_KEY':secret, 'OPENAI_API_KEY':'offline-openai-key',
+                                          'INCEPTION_API_KEY':'offline-inception-key'}):
+            env = runner.child_environment(self.config, 'inception')
+        encoded = env['MERCURY_REDACTION_DIGESTS']
+        self.assertNotIn(secret, encoded)
+        self.assertNotIn('TYPESAFE_API_KEY', env)
+        self.assertIn(hashlib.sha256(secret.encode()).hexdigest(), encoded)
+        self.assertIn(hashlib.sha256(b'offline-openai-key').hexdigest(), encoded)
+        with mock.patch.dict(os.environ, {'MERCURY_REDACTION_DIGESTS':encoded}):
+            self.assertNotIn('MERCURY_REDACTION_DIGESTS', runner.child_environment(self.config, 'claude'))
+
+    @mercury_fixture_environment()
+    def test_mercury_real_subprocess_terminals_and_dispatch_fallback(self):
+        # Both executables are offline fixtures: no provider CLI or network.
+        wrapper = self.root / 'mercury_offline.py'
+        fallback = self.root / 'fallback_offline.py'
+        fixture = self.root / 'transport.json'
+        fallback.write_text('import json\nprint(json.dumps({"type":"result", "subtype":"success", "is_error":False, "result":"offline fallback"}))\n')
+        wrapper.write_text(
+            'import sys, json, io, urllib.request, urllib.error, time\n'
+            f'sys.path.insert(0, {str(ROOT / "scripts")!r})\n'
+            'import mercury_provider as m\n'
+            f'fixture=json.load(open({str(fixture)!r}))\n'
+            'm.get_inception_api_key=lambda: None if fixture.get("missing_key") else "offline-fixture-key"\n'
+            'm.MAX_TURNS=fixture.get("turns", 48)\n'
+            'm.MAX_TOTAL_COMPLETION_TOKENS=fixture.get("tokens", 48000)\n'
+            'm.OVERALL_TIMEOUT_SECONDS=fixture.get("deadline", 180)\n'
+            'if fixture.get("terminal"):\n'
+            ' print(json.dumps(fixture["terminal"]), flush=True)\n'
+            ' sys.exit(fixture.get("exit", 1))\n'
+            'if fixture.get("malformed"):\n'
+            ' print("malformed-json", flush=True)\n'
+            'if fixture.get("killed"):\n'
+            ' sys.exit(7)\n'
+            'class Transport:\n'
+            ' def open(self, req, timeout):\n'
+            '  if fixture.get("http"):\n'
+            '   raise urllib.error.HTTPError(m.INCEPTION_ENDPOINT, fixture["http"], "offline", {}, io.BytesIO(fixture["message"].encode()))\n'
+            '  if fixture.get("slow"):\n'
+            '   class Slow(io.BytesIO):\n'
+            '    def read1(self, n):\n'
+            '     time.sleep(.06)\n'
+            '     return super().read1(n)\n'
+            '   return Slow(fixture["stream"].encode())\n'
+            '  return io.BytesIO(fixture["stream"].encode())\n'
+            'urllib.request.build_opener=lambda *args: Transport()\n'
+            'sys.argv.pop(1)\n'
+            'sys.exit(m.main())\n')
+        config = copy.deepcopy(self.config)
+        config['activities']['exploration'] = ['mercury-explorer', 'claude-opus']
+        config['providers']['inception'].update(executable=[sys.executable, str(wrapper)],
+            timeout_seconds=5, termination_grace_seconds=1, heartbeat_seconds=0)
+        config['providers']['claude'].update(executable=[sys.executable, str(fallback)], heartbeat_seconds=0)
+        self.config_path.write_text(json.dumps(config))
+        answer = json.dumps({'answer':'ok','findings':[{'claim':'found','evidence':[{'path':'module.py','start':1,'end':1}]}], 'tests':[], 'caveats':[]})
+        def stream(content=answer, reason='stop', calls=None):
+            delta = {'content': content} if calls is None else {'tool_calls': calls}
+            return 'data: ' + json.dumps({'choices':[{'index':0,'delta':delta,'finish_reason':reason}],
+                'usage':{'completion_tokens':1,'prompt_tokens':2}}) + '\n\ndata: [DONE]\n\n'
+        call = {'index':0,'id':'c','function':{'name':'list_files','arguments':'{}'}}
+        known = [({'missing_key':True}, 'auth_error', 1),
+                 ({'stream':stream('')}, 'error', 1),
+                 ({'stream':stream('not JSON')}, 'error', 1),
+                 ({'stream':'data: broken\n\n'}, 'error', 1),
+                 ({'stream':stream('partial', 'length')}, 'length_truncated', 1),
+                 ({'stream':stream(reason='tool_calls', calls=[call]), 'turns':1}, 'budget_exhausted', 1),
+                 ({'stream':stream(), 'slow':True, 'deadline':.04}, 'timeout', 1),
+                 ({'stream':stream(), 'tokens':0}, 'budget_exhausted', 1)]
+        for http, message, status in ((401,'invalid_api_key','auth_error'), (404,'model_not_found','model_error'),
+                                      (429,'requests/min exceeded','rate_limit_error'), (429,'insufficient_quota','quota_exhausted'),
+                                      (500,'server failed','error')):
+            known.append(({'http':http,'message':message}, status, 20 if status=='quota_exhausted' else 1))
+            known.append(({'stream':'data: '+json.dumps({'error':{'status':http,'message':message}})+'\n\n'},
+                          status, 20 if status=='quota_exhausted' else 1))
+        for phrase in ('too many requests', 'tokens/min exceeded', 'tokens/sec exceeded', 'concurrency limit reached'):
+            message = 'quota_exceeded: ' + phrase
+            known.extend([
+                ({'http':429, 'message':message}, 'rate_limit_error', 1),
+                ({'stream':'data: '+json.dumps({'error':{'status':429,'message':message}})+'\n\n'}, 'rate_limit_error', 1),
+            ])
+        # Success runs through execute's real Popen and parses the adapter terminal.
+        fixture.write_text(json.dumps({'stream':stream()}))
+        with mock.patch.object(runner, 'get_inception_api_key', return_value='offline-fixture-key'):
+            result, code = runner.dispatch_activity(self.args('exploration'))
+        self.assertEqual((code, result['selected']), (0, 'mercury-explorer'))
+        for scenario, status, exit_code in known:
+            with self.subTest(status=status, scenario=scenario):
+                (self.root / 'state' / 'inception-quota.json').unlink(missing_ok=True)
+                fixture.write_text(json.dumps(scenario))
+                with mock.patch.object(runner, 'get_inception_api_key', return_value='offline-fixture-key'):
+                    result, code = runner.dispatch_activity(self.args('exploration'))
+                self.assertEqual((code, result.get('selected')), (0, 'claude-opus'), result)
+                attempt = result['attempts'][0]
+                logs = Path(attempt['logs'])
+                adapter = json.loads((logs/'mercury-result.json').read_text())
+                execution = json.loads((logs/'result.json').read_text())
+                self.assertEqual(adapter['status'], status)
+                self.assertEqual(execution.get('exit_code', exit_code), exit_code)
+                self.assertTrue(execution['terminal_established'])
+                self.assertEqual((self.root/'state'/'inception-quota.json').exists(), status=='quota_exhausted')
+                self.assertFalse(execution.get('cleanup'), 'Adapter should fail coherently without forced termination')
+        unknown = [{'killed':True}, {'malformed':True, 'stream':stream('not JSON')}, {'terminal':{'event':'mercury.terminal','status':'running','terminal':'running'}},
+                   {'terminal':{'event':'mercury.terminal','status':'error','terminal':'completed','final_parse_valid':False}},
+                   {'terminal':{'event':'mercury.terminal','status':'quota_exhausted','terminal':'quota_exhausted','final_parse_valid':False},'exit':7},
+                   {'terminal':{'event':'mercury.terminal','status':'completed','terminal':'completed','final_parse_valid':False}}]
+        for scenario in unknown:
+            with self.subTest(unknown=scenario):
+                (self.root/'state'/'inception-quota.json').unlink(missing_ok=True)
+                fixture.write_text(json.dumps(scenario))
+                with mock.patch.object(runner, 'get_inception_api_key', return_value='offline-fixture-key'):
+                    result, code = runner.dispatch_activity(self.args('exploration'))
+                self.assertEqual((code, result['status']), (1,'blocked_pending_run'), result)
+                self.assertEqual(len(result['attempts']),1)
+                self.assertFalse((self.root/'state'/'inception-quota.json').exists())
 
     def test_hydrogen_model_unavailable_falls_through_to_flash_success(self):
         """Authoritative terminal model failure on Hydrogen falls through to Flash."""
@@ -931,8 +1626,12 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
         self.assertEqual(result["attempts"][0]["status"], "fallback_required")
         self.assertEqual(result["attempts"][1]["profile"], "gemini-flash")
         self.assertEqual(result["attempts"][1]["status"], "skipped_account_block")
-        self.assertEqual(result["attempts"][2]["profile"], "muse-wonder")
-        self.assertEqual(result["attempts"][2]["status"], "completed")
+        self.assertEqual([(a["profile"], a["status"]) for a in result["attempts"]], [
+            ("gemini-hydrogen", "fallback_required"),
+            ("gemini-flash", "skipped_account_block"),
+            ("agy-sonnet", "skipped_account_block"),
+            ("muse-wonder", "completed"),
+        ])
 
     def test_unknown_or_generic_gemini_quota_remains_account_wide(self):
         """Gemini quota is account-wide; neither profile uses an independent allowance pool."""
@@ -949,16 +1648,17 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
         status_res, code = runner.activity_status(self.args("implementation"))
         self.assertEqual(code, 0)
         gemini_routes = [r for r in status_res["routes"] if r["provider"] == "gemini"]
-        self.assertEqual(len(gemini_routes), 2)
-        for r in gemini_routes:
-            self.assertTrue(r["quota_path"].endswith("gemini-quota.json"))
+        self.assertEqual({r["profile"] for r in gemini_routes},
+                         {"gemini-hydrogen", "gemini-flash", "agy-sonnet", "gemini-argon"})
+        self.assertTrue(gemini_routes[0]["quota_path"].endswith("gemini-quota.json"))
 
         # 3. Setting quota on gemini provider blocks both
         quota_data = {"retry_at": time.time() + 3600, "observed_at": "2026-11-16T18:00:00Z"}
         runner.write_json(state_dir / "gemini-quota.json", quota_data)
         status_after, _ = runner.activity_status(self.args("implementation"))
         gemini_after = [r for r in status_after["routes"] if r["provider"] == "gemini"]
-        self.assertEqual(len(gemini_after), 2)
+        self.assertEqual({r["profile"] for r in gemini_after},
+                         {r["profile"] for r in gemini_routes})
         for r in gemini_after:
             self.assertEqual(r["status"], "fallback_required")
 

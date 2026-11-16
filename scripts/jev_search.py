@@ -58,8 +58,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "model": DEFAULT_MODEL,
     "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
     "deadline_seconds": DEFAULT_DEADLINE_SECONDS,
-    "max_requests": 8,
-    "max_input_tokens": 120000,
+    "max_requests": 32,
+    "max_input_tokens": 500000,
     "max_candidates": 96,
     "max_output_chars": 12000,
     "cache_ttl_seconds": 604800.0,  # 7 days

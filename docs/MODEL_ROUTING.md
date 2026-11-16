@@ -1,10 +1,10 @@
 # Model routing rationale
 
-The editable `profiles` and `activities` in [routing.example.json](../routing.example.json) are recommendations for balanced quality, speed and subscription usage. They are not measured performance or quota weights for this repository. All four providers are eligible for every activity by default. OpenAI Sol 6.1 handles general judgment; Gemini 4 Hydrogen medium starts routine implementation with Flash medium immediately following as safe fallback; Muse Full and Claude Opus appear early for complex or long-horizon work; Luna, Haiku and regular Wonder fill bounded roles; Astra is an exceptional deep-review option. Independent review prefers another provider than the author.
+The editable `profiles` and `activities` in [routing.example.json](../routing.example.json) are recommendations for balanced quality, speed and subscription usage. They are not measured performance or quota weights for this repository. All four providers are eligible for every activity by default. OpenAI Sol 6.1 handles general judgment (and native Codex structured-thinker advisory work); routed structured_thinking prefers cross-provider Sonnet (Claude Sonnet followed by Antigravity Sonnet) before Sol, Flash, and Wonder; Gemini 4 Hydrogen medium starts routine implementation, immediately followed by Flash medium; Muse Full and Claude Opus appear early for complex or long-horizon work; Luna, Haiku and regular Wonder fill bounded roles; Astra is an exceptional deep-review option. Standard Codex independent review starts with Antigravity Opus medium then Argon medium, retaining direct Claude, OpenAI and Muse fallbacks. Flash stays first for other economical routine activities. Opus supplies the first review perspective; Argon supplies a different model family with a separate reported allowance. This is an editable operational choice, not a universal benchmark ranking. Review prefers another provider than the author; both Antigravity families count as provider `gemini`. Claude-host overlays and customized chains can differ.
 
-The user subscriptions are Codex Pro, Claude Pro, Google AI Pro and Muse Power. Account allowances and reset behavior differ by provider and can change. API prices are secondary and cannot be converted to subscription quota. The dispatcher conservatively treats a confirmed usage limit as provider-wide, even if the error mentions one model. The framework conservatively accounts for Gemini 4 Hydrogen and Gemini 3.8 Flash together in `gemini-quota.json`; confirmed or cached quota blocks both profiles and advances to subsequent providers in the chain rather than retrying Flash. A settled terminal model-unavailable error on Hydrogen safely falls through to Flash, while unresolved writer claims, timeouts, or pending executions prevent fallback. It does not redeem credits or switch billing modes.
+The user subscriptions are Codex Pro, Claude Pro, Google AI Pro and Muse Power. Account allowances and reset behavior differ by provider and can change. API prices are secondary and cannot be converted to subscription quota. Account-wide limits block every profile. For Antigravity, exact individual-quota diagnostics on recognized model IDs isolate Flash, Claude and Argon families; effort variants share their family, and Opus/Sonnet share Claude. Unknown models (including Hydrogen), generic or ambiguous scope and manual `quota-set` remain account-wide. Hydrogen has no separate framework allowance family; an unknown requested model conservatively considers all cached Antigravity family evidence. A confirmed Hydrogen quota blocks every Antigravity route. A settled model-unavailable failure can advance to Flash only after authoritative terminal failure and resolved ownership; timeouts, cancellation and missing terminals block fallback. Direct Claude subscription quota is independent from Antigravity Claude. [Google's plans documentation](https://antigravity.google/docs/plans) describes baseline exhaustion for a particular model and usage across models. The three-family mapping follows the reported account behavior and installed model IDs; it is not an entitlement guarantee. It does not redeem credits or switch billing modes.
 
-Upgrading to routing version 14 upgrades untouched prior packaged implementation chains in Codex and Claude hosts to start with `gemini-hydrogen > gemini-flash` only when the effective previous Flash routine selection is uncustomized. Customized implementation chains, custom Flash or Hydrogen profile contents, legacy provider pins, and future version numbers are preserved. An unused customized or disabled Hydrogen profile is not activated during upgrade.
+Routing version 15 integrates exact packaged v12, accumulated v13 and Hydrogen v14 chains for Codex and Claude only when relevant old and replacement profiles are unchanged. It preserves customized chains, profile provider/model/effort/enabled selections, legacy pins, future versions and quota bytes. Missing chains must not activate newly introduced customized or disabled profiles. Reinstalling v15 does not remigrate operator-edited chains. Mercury exploration remains opt-in; API billing requires explicit authorization. Inception has [announced](https://docs.inceptionlabs.ai/get-started) that its API will shut down after 2026-12-28; the optional pilot has no automatic runtime expiry. Missing activities retain safe prior routes, filter disabled profiles, and remain omitted if no valid prior route survives. Historical chains are matched only to their actual version and host, so cross-version lookalikes stay customized.
 
 [OpenAI model guidance](https://developers.openai.com/api/docs/models/compare) describes Sol 6.1 as near Astra on complex work at a lower API price and Luna as a focused high-volume model. [Independent Sol comparison](https://artificialanalysis.ai/articles/gpt-6-1-sol-replaces-gpt-6-sol-after-just-7-days-with-near-astra-intelligence) finds Sol max close to Astra on its intelligence and coding indexes; xhigh coding can differ. Those results do not establish medium-effort performance or subscription usage here. Astra remains a current capable model, retained for exceptional depth.
 
@@ -18,21 +18,22 @@ These are editable in `routing.json`; each named profile pins a model and effort
 
 | Activity | Ordered profiles |
 | --- | --- |
-| orchestration | openai-sol > claude-opus > muse-full > claude-sonnet > gemini-flash > muse-wonder |
-| planning | openai-sol > claude-opus > muse-full > claude-sonnet > gemini-flash-high |
-| exploration | openai-luna > claude-haiku > gemini-flash > muse-wonder |
-| implementation | gemini-hydrogen > gemini-flash > muse-wonder > claude-sonnet > openai-sol |
-| implementation_complex | openai-sol-high > muse-full > claude-opus > claude-sonnet-high > gemini-flash-high |
-| implementation_long_horizon | muse-full > claude-opus > openai-sol-high > claude-sonnet-high > gemini-flash-high |
-| test_design | openai-sol > claude-opus > muse-full > claude-sonnet > gemini-flash |
-| testing | openai-sol > claude-sonnet > gemini-flash > muse-wonder |
-| verification | openai-luna > gemini-flash > claude-haiku > muse-wonder |
-| independent_review | claude-opus > openai-sol > muse-full > claude-sonnet > gemini-flash-high > muse-wonder |
-| security_review | claude-opus-high > openai-sol-high > muse-full-high > claude-sonnet-high > gemini-flash-high |
-| refactor_audit | openai-luna > claude-sonnet > gemini-flash > muse-wonder |
-| documentation | gemini-flash > openai-luna > claude-haiku > muse-wonder |
-| docs_research | gemini-flash > openai-luna > claude-haiku > muse-wonder |
-| deep_review | openai-astra > claude-opus-high > muse-full-high > openai-sol-high > gemini-flash-high |
+| orchestration | openai-sol > agy-opus > claude-opus > gemini-argon > muse-full > claude-sonnet > gemini-flash > muse-wonder |
+| planning | openai-sol > agy-opus > gemini-argon > claude-opus > muse-full > claude-sonnet > gemini-flash-high |
+| exploration | gemini-flash > openai-luna > agy-sonnet > claude-haiku > muse-wonder |
+| implementation | gemini-hydrogen > gemini-flash > agy-sonnet > muse-wonder > claude-sonnet > gemini-argon > openai-sol |
+| implementation_complex | openai-sol-high > agy-opus > gemini-argon-high > muse-full > claude-opus > claude-sonnet-high > gemini-flash-high |
+| implementation_long_horizon | muse-full > agy-opus > gemini-argon-high > claude-opus > openai-sol-high > claude-sonnet-high > gemini-flash-high |
+| test_design | openai-sol > agy-opus > gemini-argon > claude-opus > muse-full > claude-sonnet > gemini-flash |
+| testing | gemini-flash > openai-sol > agy-sonnet > claude-sonnet > muse-wonder |
+| verification | gemini-flash > openai-luna > agy-sonnet > claude-haiku > muse-wonder |
+| independent_review | agy-opus > gemini-argon > claude-opus > openai-sol > muse-full > claude-sonnet > gemini-flash > muse-wonder |
+| security_review | agy-opus-high > gemini-argon-high > claude-opus-high > openai-sol-high > muse-full-high > claude-sonnet-high > gemini-flash-high |
+| refactor_audit | openai-luna > agy-sonnet > gemini-argon > claude-sonnet > gemini-flash > muse-wonder |
+| documentation | gemini-flash > agy-sonnet > openai-luna > claude-haiku > muse-wonder |
+| docs_research | gemini-flash > gemini-argon > openai-luna > claude-haiku > muse-wonder |
+| deep_review | openai-astra > agy-opus-high > gemini-argon-high > claude-opus-high > muse-full-high > openai-sol-high > gemini-flash-high |
+| structured_thinking | claude-sonnet > agy-sonnet > openai-sol > gemini-flash > muse-wonder |
 
 ## Model roles and evidence limits
 
@@ -44,8 +45,9 @@ These are editable in `routing.json`; each named profile pins a model and effort
 | Claude Opus 5.5 | Independent review and long-horizon alternatives. Its 52% FrontierCode max score led that common-harness set, but coding completion is not a direct review-quality test. |
 | Claude Sonnet 5.5 | Fast scoped implementation and review alternative. [Anthropic's TerminalBench 4](https://www.anthropic.com/claude-sonnet-5-5) 70.6% was a high-effort vendor setup; it does not universally outrank Opus. |
 | Claude Haiku 5.5 | Bounded research and verification. The [independent Haiku/Luna comparison](https://artificialanalysis.ai/models/comparisons/claude-haiku-5-5-vs-gpt-6-luna) shows task-dependent differences rather than interchangeable small models. |
-| Gemini 4 Hydrogen | Default routine implementation route with Flash medium retained immediately behind it as safe fallback. [Google's blog post](https://antigravity.google/blog/gemini-4-hydrogen-in-google-antigravity) cites 57% vs 18.2% on Terminal-Bench 4.1 over previous baselines; however, this vendor benchmark is not medium-vs-medium local evidence, and no claims of measured local Hydrogen throughput or entitlement are made. |
-| Gemini 3.8 Flash | Safe implementation fallback immediately behind Hydrogen and first routine documentation route for speed/subscription balance. Legacy implement pin remains pinned to Flash medium. Its [model card](https://deepmind.google/models/model-cards/gemini-3-8-flash/) reports strong DeepSWE and earlier TerminalBench results, with TB4 materially lower; harness versions cannot be mixed. |
+| Gemini 4 Argon | Medium is the second standard independent-review route via Antigravity; high appears in complex and justified high-review work. No repository measurement establishes a universal ranking or subscription weight. |
+| Gemini 4 Hydrogen | First routine implementation route, immediately followed by Flash medium. Offline tests do not establish live entitlement, throughput or a separate physical allowance pool. |
+| Gemini 3.8 Flash | Routine implementation fallback and first documentation route for speed/subscription balance. Its [model card](https://deepmind.google/models/model-cards/gemini-3-8-flash/) reports strong DeepSWE and earlier TerminalBench results, with TB4 materially lower; harness versions cannot be mixed. |
 | Muse Wonder | Routine implementation alternative. [Independent product-harness results](https://artificialanalysis.ai/articles/muse-wonder/) are promising mostly at max effort; medium and Power-account throughput remain unmeasured here. |
 | Muse Wonder Full | Complex/long-horizon alternative. The same independent report shows a stronger product-harness coding index than regular Wonder at max, while [Meta's model card](https://research.meta.ai/static/muse-wonder-model-card) uses xhigh for SWE-Marathon. Long-horizon superiority remains provisional. |
 

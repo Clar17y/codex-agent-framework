@@ -14,7 +14,7 @@ The default root is `~/.claude` (`CLAUDE_CONFIG_DIR` or `--claude-home` override
 | Destination | Content |
 | --- | --- |
 | `~/.claude/CLAUDE.md` | Framework policy inside `<!-- BEGIN/END CLAUDE MULTI-PROVIDER FRAMEWORK -->` markers. Text outside the markers is preserved. |
-| `~/.claude/agents/*.md` | Twelve native roles on Haiku, Sonnet or Opus, rendered from `agents/*.toml` (see below). |
+| `~/.claude/agents/*.md` | Thirteen native roles on Haiku, Sonnet or Opus, rendered from `agents/*.toml` (see below). |
 | `~/.claude/skills/` | `route-activity`, `ask-codex`, `ask-gemini`, `ask-muse`, `framework-simplify`, `jev-search`, `jev-review`. |
 | `~/.claude/agent-framework/` | Runner, Jev helpers, docs, task template, `routing.json` from `routing.example.json` with `claude/routing.overlay.json` applied, and `state/`. |
 | `~/.gemini/config/agents/framework-reader.md` | Antigravity read-only helper, shared with a Codex install; either host's manifest (default roots or `CODEX_HOME`/`CLAUDE_CONFIG_DIR`) counts as ownership when upgrading it. |
@@ -35,9 +35,10 @@ Dispatch needs the signed-in CLIs, so it works from Claude Code on the machine w
 - Complex and long-horizon implementation and test design start on Muse Wonder Full, with Claude Opus and Codex Sol high behind it.
 - Independent and security review start on Codex Sol, so Claude-authored work is reviewed by another vendor by default; set `review.author_provider` to `claude` for work done in the Claude session and the dispatcher moves Claude profiles to the back.
 - Planning and orchestration start on Claude Opus; in practice the Claude session plans directly.
+- Structured thinking starts on Claude Sonnet, then Antigravity Sonnet, Codex Sol, Gemini Flash and Muse Wonder; native structured-thinker provides an in-session Sonnet advisory role.
 - Deep review starts on Claude Opus high, then Astra, which may not be available on every ChatGPT plan.
 
-These are quota-driven defaults, not measurements. Edit the chains in the installed `routing.json`; reinstalling preserves your edits. Routing version 14 upgrades untouched pre-v14 Claude implementation chains (`gemini-flash > muse-wonder > claude-sonnet > openai-luna`) to start with `gemini-hydrogen > gemini-flash`, while preserving any customized chains, custom Flash or Hydrogen profile contents, and legacy provider pins. The framework conservatively accounts for Hydrogen and Flash together in `gemini-quota.json`; active or confirmed quota blocks both profiles and advances to subsequent providers, while settled model errors fall through to Flash.
+These are quota-driven defaults, not measurements. Edit the chains in the installed `routing.json`; reinstalling preserves your edits. Routing version 15 recognizes untouched prior packaged v12/v13 Claude chains and v14 Hydrogen chains, retaining customized relevant profiles, chains, legacy pins and quota bytes. Routine implementation starts with `gemini-hydrogen > gemini-flash`. Hydrogen has no separate framework quota family: unknown model diagnostics remain account-wide. Exact individual limits for known Flash, Claude and Argon IDs stay scoped to those families (Opus/Sonnet share Claude). Unknown requested models conservatively consider all cached family evidence. Confirmed Hydrogen quota blocks all Antigravity routes; settled model errors may fall through to Flash after authoritative terminal failure and resolved ownership. Timeout, cancellation or missing terminals block fallback.
 
 ## Derived roles and skills
 

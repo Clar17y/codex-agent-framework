@@ -70,7 +70,7 @@ class ClaudeHostInstallTests(unittest.TestCase):
             self.assertIsNotNone(match, name)
             self.assertEqual(match.group(1), name)
             if name in ("explorer", "docs-researcher", "planner", "refactor-auditor", "security-reviewer",
-                        "quality-gate-max", "reviewer", "correctness-gate"):
+                        "quality-gate-max", "reviewer", "correctness-gate", "structured-thinker"):
                 self.assertNotIn("Write", match.group(3), name)
                 self.assertNotIn("Edit", match.group(3), name)
         self.assertEqual(sorted(p.name for p in (self.root / "skills").iterdir()),
@@ -96,6 +96,15 @@ class ClaudeHostInstallTests(unittest.TestCase):
         implementer = (self.root / "agents/implementer.md").read_text(encoding="utf-8")
         self.assertIn("native Claude writer", implementer)
         self.assertNotIn("Luna", implementer)
+        st_role = (self.root / "agents/structured-thinker.md").read_text(encoding="utf-8")
+        self.assertIn("model: sonnet", st_role)
+        self.assertIn("tools: Read, Grep, Glob", st_role)
+        self.assertIn("1. Restate the question in your own words.", st_role)
+        self.assertIn("4. Final answer.", st_role)
+        self.assertIn("The earlier sections are committed claims", st_role)
+        self.assertEqual(routing["activities"]["structured_thinking"],
+                         ["claude-sonnet", "agy-sonnet", "openai-sol", "gemini-flash", "muse-wonder"])
+        self.assertIn("Structured thinking protocol for qualifying questions", claude_md)
 
     def test_existing_instructions_are_preserved_and_reinstall_is_idempotent(self):
         self.root.mkdir()
@@ -186,7 +195,7 @@ class ClaudeHostInstallTests(unittest.TestCase):
 
         self.install()
         upgraded = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(upgraded.get("version"), 14)
+        self.assertEqual(upgraded.get("version"), 15)
         self.assertEqual(upgraded["activities"]["implementation"], [
             "gemini-hydrogen", "gemini-flash", "muse-wonder", "claude-sonnet", "openai-luna"
         ])

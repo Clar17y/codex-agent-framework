@@ -1,5 +1,5 @@
 {
-  "version": 14,
+  "version": 15,
   "workflow": {
     "require_jev_evidence": true
   },
@@ -48,6 +48,16 @@
       "timeout_seconds": 3600,
       "termination_grace_seconds": 120,
       "heartbeat_seconds": 60
+    },
+    "inception": {
+      "executable": "python",
+      "model": "mercury-3",
+      "effort": "low",
+      "temperature": 1.0,
+      "timeout_seconds": 180,
+      "termination_grace_seconds": 10,
+      "heartbeat_seconds": 60,
+      "adapter": "scripts/mercury_provider.py"
     }
   },
   "capabilities": {
@@ -58,8 +68,8 @@
       "model": "jev-1.13.0",
       "timeout_seconds": 10,
       "deadline_seconds": 30,
-      "max_requests": 8,
-      "max_input_tokens": 120000,
+      "max_requests": 32,
+      "max_input_tokens": 500000,
       "max_candidates": 96,
       "max_output_chars": 12000,
       "cache_ttl_seconds": 604800
@@ -69,6 +79,11 @@
   "quota_probe_seconds": 3600,
   "lock_timeout_seconds": 30,
   "profiles": {
+    "mercury-explorer": {
+      "provider": "inception",
+      "model": "mercury-3",
+      "effort": "low"
+    },
     "openai-sol": {
       "provider": "openai",
       "model": "gpt-6.1-sol",
@@ -143,12 +158,44 @@
       "provider": "muse",
       "model": "muse-wonder-full-1.0",
       "effort": "high"
+    },
+    "agy-opus": {
+      "provider": "gemini",
+      "model": "claude-opus-5-5-medium",
+      "effort": "medium"
+    },
+    "agy-opus-high": {
+      "provider": "gemini",
+      "model": "claude-opus-5-5-high",
+      "effort": "high"
+    },
+    "agy-sonnet": {
+      "provider": "gemini",
+      "model": "claude-sonnet-5-5-medium",
+      "effort": "medium"
+    },
+    "agy-sonnet-high": {
+      "provider": "gemini",
+      "model": "claude-sonnet-5-5-high",
+      "effort": "high"
+    },
+    "gemini-argon": {
+      "provider": "gemini",
+      "model": "gemini-4-argon-medium",
+      "effort": "medium"
+    },
+    "gemini-argon-high": {
+      "provider": "gemini",
+      "model": "gemini-4-argon-high",
+      "effort": "high"
     }
   },
   "activities": {
     "orchestration": [
       "openai-sol",
+      "agy-opus",
       "claude-opus",
+      "gemini-argon",
       "muse-full",
       "claude-sonnet",
       "gemini-flash",
@@ -156,26 +203,33 @@
     ],
     "planning": [
       "openai-sol",
+      "agy-opus",
+      "gemini-argon",
       "claude-opus",
       "muse-full",
       "claude-sonnet",
       "gemini-flash-high"
     ],
     "exploration": [
-      "openai-luna",
-      "claude-haiku",
       "gemini-flash",
+      "openai-luna",
+      "agy-sonnet",
+      "claude-haiku",
       "muse-wonder"
     ],
     "implementation": [
       "gemini-hydrogen",
       "gemini-flash",
+      "agy-sonnet",
       "muse-wonder",
       "claude-sonnet",
+      "gemini-argon",
       "openai-sol"
     ],
     "implementation_complex": [
       "openai-sol-high",
+      "agy-opus",
+      "gemini-argon-high",
       "muse-full",
       "claude-opus",
       "claude-sonnet-high",
@@ -183,6 +237,8 @@
     ],
     "implementation_long_horizon": [
       "muse-full",
+      "agy-opus",
+      "gemini-argon-high",
       "claude-opus",
       "openai-sol-high",
       "claude-sonnet-high",
@@ -190,32 +246,40 @@
     ],
     "test_design": [
       "openai-sol",
+      "agy-opus",
+      "gemini-argon",
       "claude-opus",
       "muse-full",
       "claude-sonnet",
       "gemini-flash"
     ],
     "testing": [
-      "openai-sol",
-      "claude-sonnet",
       "gemini-flash",
+      "openai-sol",
+      "agy-sonnet",
+      "claude-sonnet",
       "muse-wonder"
     ],
     "verification": [
-      "openai-luna",
       "gemini-flash",
+      "openai-luna",
+      "agy-sonnet",
       "claude-haiku",
       "muse-wonder"
     ],
     "independent_review": [
+      "agy-opus",
+      "gemini-argon",
       "claude-opus",
       "openai-sol",
       "muse-full",
       "claude-sonnet",
-      "gemini-flash-high",
+      "gemini-flash",
       "muse-wonder"
     ],
     "security_review": [
+      "agy-opus-high",
+      "gemini-argon-high",
       "claude-opus-high",
       "openai-sol-high",
       "muse-full-high",
@@ -224,28 +288,41 @@
     ],
     "refactor_audit": [
       "openai-luna",
+      "agy-sonnet",
+      "gemini-argon",
       "claude-sonnet",
       "gemini-flash",
       "muse-wonder"
     ],
     "documentation": [
       "gemini-flash",
+      "agy-sonnet",
       "openai-luna",
       "claude-haiku",
       "muse-wonder"
     ],
     "docs_research": [
       "gemini-flash",
+      "gemini-argon",
       "openai-luna",
       "claude-haiku",
       "muse-wonder"
     ],
     "deep_review": [
       "openai-astra",
+      "agy-opus-high",
+      "gemini-argon-high",
       "claude-opus-high",
       "muse-full-high",
       "openai-sol-high",
       "gemini-flash-high"
+    ],
+    "structured_thinking": [
+      "claude-sonnet",
+      "agy-sonnet",
+      "openai-sol",
+      "gemini-flash",
+      "muse-wonder"
     ]
   }
 }

@@ -1653,6 +1653,26 @@ class ProviderTests(unittest.TestCase):
         self.assertTrue(self.args._account_auth_failure)
         self.assertNotIn("authentication", json.dumps(result))
 
+    def test_mercury_transient_terminal_and_error_array_never_cache_as_account(self):
+        for phrase in ('too many requests', 'tokens/min exceeded', 'tokens/sec exceeded',
+                       'concurrency limit reached', 'requests per minute exceeded', 'rate_limit_exceeded'):
+            message = 'quota_exceeded: ' + phrase
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(runner.inception_quota_error({'status':'quota_exhausted', 'error':message}, []))
+                self.assertIsNone(runner.inception_quota_error(None, [{'code':'QUOTA_EXHAUSTED', 'message':message}]))
+        quota_event = {'code':'QUOTA_EXHAUSTED', 'message':'quota_exceeded'}
+        transient_event = {'code':'429', 'message':'too many requests'}
+        for events in ([quota_event, transient_event], [transient_event, quota_event]):
+            self.assertIsNone(runner.inception_quota_error(None, events))
+            self.assertIsNone(runner.inception_quota_error({'status':'quota_exhausted'}, events))
+        for code in ('401', '404', 'AUTH_ERROR', 'MODEL_ERROR'):
+            self.assertIsNone(runner.inception_quota_error(None, [{'code':code, 'message':'quota_exceeded'}]))
+        for status in ('auth_error', 'model_error', 'rate_limit_error'):
+            self.assertIsNone(runner.inception_quota_error({'status':status, 'error':'insufficient_quota'}, []))
+        for message in ('insufficient_quota', 'account quota exhausted', 'credit balance too low'):
+            self.assertIsNotNone(runner.inception_quota_error({'status':'quota_exhausted', 'error':message}, []))
+            self.assertIsNotNone(runner.inception_quota_error(None, [{'code':'QUOTA_EXHAUSTED', 'message':message}]))
+
     def test_inception_quota_file_redacts_run_specific_secrets(self):
         secret = "dummy-mercury-only-secret-29372"
         config = {"providers": {"inception": {"model": "mercury-3"}}, "quota_probe_seconds": 300}

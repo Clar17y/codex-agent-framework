@@ -11,6 +11,7 @@ Provides CLI and importable functions:
 
 import argparse
 from contextlib import contextmanager, ExitStack
+import errno
 import fnmatch
 import hashlib
 import os
@@ -43,6 +44,13 @@ class _CredentialBlocks:
     def __init__(self):
         self.quote = None
         self.indent = None
+        self.pending = False
+        self.pending_indent = 0
+        self.plain_indent = None
+        self.pending_comment = False
+        self.container = []
+        self.container_quote = None
+        self.container_comment = False
 
     @staticmethod
     def closing(body, quote):
@@ -56,15 +64,33 @@ class _CredentialBlocks:
                 return pos
             offset = pos + len(quote)
 
+    @staticmethod
+    def field_start(value):
+        # YAML requires separation after ':'. URLs and colon/equals-bearing
+        # scalar text inside an indented value are not sibling declarations.
+        return re.match(r"""(?:-[ \t]+)?(?:["'][^"']+["']|[\w.-]+)[ \t]*(?::(?:[ \t]|$)|=(?!=))""", value)
+
     def line(self, line):
         body = line.rstrip('\r\n')
         ending = line[len(body):]
+        if self.container:
+            return self.container_value(body, ending)
         if self.quote:
             close = self.closing(body, self.quote)
             if close < 0:
                 return '[REDACTED]' + ending
             quote, self.quote = self.quote, None
             return '[REDACTED]' + quote + self.line(body[close + len(quote):]) + ending
+        if self.plain_indent is not None:
+            stripped = body.lstrip(' \t')
+            indent = len(body) - len(stripped)
+            if not stripped:
+                return ending
+            if (indent > self.plain_indent or
+                    (not self.field_start(stripped) and not stripped.startswith(('}', ']', ','))
+                     and stripped not in ('---', '...'))):
+                return body[:indent] + '[REDACTED]' + ending
+            self.plain_indent = None
         if self.indent is not None:
             indent = len(body) - len(body.lstrip(' \t'))
             if not body.strip():
@@ -72,23 +98,113 @@ class _CredentialBlocks:
             if indent > self.indent:
                 return body[:indent] + '[REDACTED]' + ending
             self.indent = None
+        if self.pending:
+            offset = 0
+            while True:
+                if self.pending_comment:
+                    close = body.find('*/', offset)
+                    if close < 0:
+                        return line
+                    self.pending_comment = False
+                    offset = close + 2
+                offset += len(body[offset:]) - len(body[offset:].lstrip(' \t'))
+                if not body.startswith('/*', offset):
+                    break
+                self.pending_comment = True
+                offset += 2
+            value = body[offset:]
+            if not value or value.startswith(('#', '//')):
+                return line
+            self.pending = False
+            # Empty/malformed assignments must not consume the next field or
+            # structural closer. A real value is filtered before selection.
+            indent = len(body) - len(body.lstrip(' \t'))
+            if (not value.startswith(('}', ']', ',')) and value not in ('---', '...') and
+                    (indent > self.pending_indent or not self.field_start(value))):
+                return self.value(body[:offset], value, ending, pending=True,
+                                  plain_indent=self.pending_indent)
         match = self.assignment.search(body)
         if not match:
             return line
         value = match[1]
-        triple = re.match(r"(?i)[rubf]{0,2}(\"{3}|'{3})", value)
-        if triple:
-            quote = triple[1]
-            rest = value[triple.end():]
+        prefix = body[:match.start(1)]
+        indent = len(body) - len(body.lstrip(' \t'))
+        key_indent = match.start() if body[:match.start()].strip() == '-' else indent
+        self.pending_indent = key_indent
+        if not value or value.startswith(('#', '//')):
+            self.pending = True
+            return line
+        if value.startswith('/*'):
+            self.pending = True
+            return prefix + self.line(value) + ending
+        yaml_scalar = prefix.rstrip().endswith(':') and body[:match.start()].strip() in ('', '-')
+        return self.value(prefix, value, ending, plain_indent=key_indent if yaml_scalar else None)
+
+    def value(self, prefix, value, ending, *, pending=False, plain_indent=None):
+        if re.fullmatch(r'[|>][1-9+\-]*[ \t]*(?:#.*)?', value):
+            self.indent = len(prefix) - len(prefix.lstrip(' \t'))
+            return prefix + value + ending
+        if value.startswith(('[', '{', '(')):
+            return prefix + self.container_value(value, ending)
+        opening = re.match(r"""(?i)[rubf]{0,2}("{3}|'{3}|"|')""", value)
+        escaped = value.startswith(('\\"', "\\'"))
+        if opening or escaped:
+            quote = value[:2] if escaped else opening[1]
+            end = 2 if escaped else opening.end()
+            rest = value[end:]
             close = self.closing(rest, quote)
-            prefix = body[:match.start(1)] + value[:triple.end()]
+            prefix += value[:end]
             if close < 0:
                 self.quote = quote
                 return prefix + '[REDACTED]' + ending
             return prefix + '[REDACTED]' + quote + self.line(rest[close + len(quote):]) + ending
-        if re.fullmatch(r'[|>][1-9+\-]*[ \t]*(?:#.*)?', value):
-            self.indent = len(body) - len(body.lstrip(' \t'))
-        return line
+        if plain_indent is not None:
+            self.plain_indent = plain_indent
+        # Inline bare values retain the scalar sanitizer below. Detached plain
+        # values and their continuation subtree stay hidden until a real field
+        # or structural/document boundary at the credential key's indentation.
+        return prefix + ('[REDACTED]' if pending or plain_indent is not None else value) + ending
+
+    def container_value(self, body, ending):
+        """Suppress balanced compound values without buffering the source."""
+        pairs = {']': '[', '}': '{', ')': '('}
+        i = 0
+        while i < len(body):
+            if self.container_comment:
+                close = body.find('*/', i)
+                if close < 0:
+                    break
+                self.container_comment = False
+                i = close + 2
+            elif self.container_quote:
+                close = self.closing(body[i:], self.container_quote)
+                if close < 0:
+                    break
+                i += close + len(self.container_quote)
+                self.container_quote = None
+            elif body.startswith('/*', i):
+                self.container_comment = True
+                i += 2
+            elif body.startswith('//', i) or body[i] == '#':
+                break
+            elif body[i] in ('"', "'"):
+                self.container_quote = body[i] * (3 if body.startswith(body[i] * 3, i) else 1)
+                i += len(self.container_quote)
+            elif body[i] in '[{(':
+                self.container.append(body[i])
+                if len(self.container) > 64:
+                    raise ReaderLimitError('Credential nesting ceiling exceeded')
+                i += 1
+            elif body[i] in ']})':
+                if not self.container or self.container.pop() != pairs[body[i]]:
+                    raise ValueError('Malformed credential container')
+                i += 1
+                if not self.container:
+                    return '[REDACTED]' + self.line(body[i:]) + ending
+            else:
+                i += 1
+        return '[REDACTED]' + ending
+
 
 
 def redact_text(text, secrets=(), fingerprints=()):
@@ -115,10 +231,10 @@ def redact_text(text, secrets=(), fingerprints=()):
     text = re.sub(r'\bsk-[A-Za-z0-9_-]{16,}\b', '[REDACTED]', text)
     # Covers source assignments, JSON/YAML/env fields and quoted key names.
     text = re.sub(
-        r'''(?ix)(["']?\b(?:[\w-]*(?:api[_-]?key|secret|password|passwd|token|credential|authorization)[\w-]*)\b["']?\s*[:=]\s*)(\\?["'])([^\r\n]*?)\2''',
+        r'''(?ix)(["']?\b(?:[\w-]*(?:api[_-]?key|secret|password|passwd|token|credential|authorization)[\w-]*)\b["']?[ \t]*[:=][ \t]*)(\\?["'])([^\r\n]*?)\2''',
         lambda m: m[1] + m[2] + '[REDACTED]' + m[2], text)
     text = re.sub(
-        r'(?im)(\b[\w-]*(?:api[_-]?key|secret|password|passwd|token|credential|authorization)[\w-]*\s*[:=]\s*)(?![\\\x27"\s])[^\s,;\}\]]+',
+        r'(?im)(\b[\w-]*(?:api[_-]?key|secret|password|passwd|token|credential|authorization)[\w-]*[ \t]*[:=][ \t]*)(?![\\\x27"\s])[^\s,;\}\]]+',
         r'\1[REDACTED]', text)
     return text
 
@@ -247,7 +363,7 @@ def _validate_scope(root: Path, raw: Optional[str], is_glob: bool = False) -> st
             or (':' in normalized and not Path(raw_str).is_absolute())):
         raise ValueError('Windows special/drive/stream path rejected')
 
-    target = Path(raw_str)
+    target = Path(normalized)
     if target.is_absolute():
         try:
             rel = target.relative_to(root)
@@ -288,7 +404,7 @@ def _relative(root, path):
     if (normalized.startswith('//') or any(c in raw for c in '\x00*?')
             or ':' in normalized[2:] or (':' in normalized and not Path(raw).is_absolute())):
         raise ValueError('Windows special/drive/stream path rejected')
-    target = Path(raw)
+    target = Path(normalized)
     if '..' in target.parts:
         raise ValueError('Parent traversal rejected')
     rel = target.relative_to(root) if target.is_absolute() else target
@@ -334,6 +450,15 @@ def _windows_handle(path, directory=False):
         close(handle)
 
 
+def _nofollow_open(path, flags, **kwargs):
+    try:
+        return os.open(path, flags, **kwargs)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError('Symlink or non-directory path rejected') from exc
+        raise
+
+
 @contextmanager
 def _directory(root, parts=()):
     with ExitStack() as stack:
@@ -345,10 +470,10 @@ def _directory(root, parts=()):
                 stack.enter_context(_windows_handle(current, True))
             yield current
         else:
-            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fd = _nofollow_open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             stack.callback(os.close, fd)
             for part in parts:
-                fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                fd = _nofollow_open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                 stack.callback(os.close, fd)
             yield fd
 
@@ -375,7 +500,7 @@ def _open_file(root, rel, budget):
                     raise ctypes.WinError(ctypes.get_last_error())
                 fd = msvcrt.open_osfhandle(duplicate.value, os.O_RDONLY | os.O_BINARY)
             else:
-                fd = os.open(rel.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                fd = _nofollow_open(rel.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             stream = stack.enter_context(os.fdopen(fd, 'rb'))
             st = os.fstat(stream.fileno())
             if not stat.S_ISREG(st.st_mode):

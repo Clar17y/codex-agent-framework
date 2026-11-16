@@ -1488,27 +1488,38 @@ def muse_quota_error(terminal):
 
 def inception_quota_error(terminal, errors):
     """Accept confirmed account quota limits; reject transient rate limits or auth/model errors."""
-    if isinstance(terminal, dict):
-        status = terminal.get("status")
-        err_msg = str(terminal.get("error") or "")
-        lower_err = err_msg.lower()
-        if status in ("auth_error", "model_error", "rate_limit_error"):
-            return None
-        if any(phrase in lower_err for phrase in ("per minute", "per second", "requests/min", "requests/sec", "rate limit", "rate quota")):
-            return None
-        if status == "quota_exhausted" or terminal_quota_message(err_msg, "inception"):
-            return {"code": "QUOTA_EXHAUSTED", "message": err_msg or "Inception account quota exhausted",
-                    "source": "mercury_terminal"}
+    # Share the adapter's precedence so all terminal/error-array channels agree.
+    try:
+        from .mercury_provider import classify_error
+    except ImportError:
+        from mercury_provider import classify_error
+    classified_errors = []
     for error in errors or ():
         code = str(error.get("code", error.get("status", ""))).upper()
         raw_message = str(error.get("message", error.get("result", "")))
-        message = raw_message.lower()
-        if any(phrase in message for phrase in ("per minute", "per second", "requests/min", "requests/sec", "rate limit", "rate quota")):
-            continue
-        if code in ("QUOTA_EXHAUSTED", "INSUFFICIENT_QUOTA") or terminal_quota_message(raw_message, "inception"):
+        classification = (code.lower() if code in ("AUTH_ERROR", "MODEL_ERROR", "RATE_LIMIT_ERROR")
+                          else classify_error(code, f"{code}: {raw_message}"))
+        classified_errors.append((error, raw_message, classification))
+    non_account = ("auth_error", "model_error", "rate_limit_error")
+    # Diagnostics for one failed attempt may be split between the terminal and
+    # error events. Never cache a generic quota label ahead of explicit limits.
+    if any(classification in non_account for _, _, classification in classified_errors):
+        return None
+    if isinstance(terminal, dict):
+        status = terminal.get("status")
+        err_msg = str(terminal.get("error") or "")
+        classification = classify_error(None, err_msg)
+        if status in non_account or classification in non_account:
+            return None
+        if status == "quota_exhausted" or classification == "quota_exhausted":
+            return {"code": "QUOTA_EXHAUSTED", "message": err_msg or "Inception account quota exhausted",
+                    "source": "mercury_terminal"}
+    for error, raw_message, classification in classified_errors:
+        if classification == "quota_exhausted":
             found = dict(error)
             found["message"] = raw_message
             return found
+
     return None
 
 

@@ -316,6 +316,19 @@ class TestMercuryProvider(unittest.TestCase):
         self.assertTrue(is_account_quota_exhausted(403, "billing hard limit reached"))
         self.assertFalse(is_account_quota_exhausted(429, "too many requests; 30 requests/min limit reached"))
 
+    def test_transient_wording_wins_generic_quota_labels(self):
+        from scripts.mercury_provider import classify_error
+        for phrase in ('too many requests', 'tokens/min exceeded', 'tokens/sec exceeded',
+                       'concurrency limit reached', 'requests per minute exceeded', 'rate_limit_exceeded'):
+            with self.subTest(phrase=phrase):
+                message = 'quota_exceeded: ' + phrase
+                self.assertFalse(is_account_quota_exhausted(429, message))
+                self.assertEqual(classify_error(429, message), 'rate_limit_error')
+        self.assertEqual(classify_error(401, 'invalid_api_key: quota_exceeded'), 'auth_error')
+        self.assertEqual(classify_error(404, 'model_not_found: quota_exceeded'), 'model_error')
+        self.assertEqual(classify_error(403, 'billing hard limit reached'), 'quota_exhausted')
+        self.assertEqual(classify_error(429, 'insufficient_quota: credit balance too low'), 'quota_exhausted')
+
     def test_rate_limit_429_returns_rate_limit_error(self):
         err = urllib.error.HTTPError(INCEPTION_ENDPOINT, 429, "Too Many Requests", {}, io.BytesIO(b"requests/min exceeded"))
         opener = MagicMock()
@@ -486,17 +499,31 @@ class TestMercuryProvider(unittest.TestCase):
         self.assertEqual(result['tool_calls_count'], 2)
 
     def test_multiline_credentials_absent_from_requests_and_artifacts(self):
-        sources = ['api_key: |\n  PRIVATE_FIXTURE_FIRST\n  PRIVATE_FIXTURE_SECOND\npublic: visible\n',
+        sources = ['database_password: PRIVATE_FIXTURE_FIRST\n  PRIVATE_FIXTURE_SECOND\npublic: visible\n',
+                   '- database_password:\n    PRIVATE_FIXTURE_FIRST\n    PRIVATE_FIXTURE_SECOND\n  public: visible\n',
+                   'database_password:\n  proto://PRIVATE_FIXTURE_FIRST@host/db\npublic: visible\n',
+                   'database_password:\n  PRIVATE_FIXTURE_FIRST\n  PRIVATE_FIXTURE_SECOND\npublic: visible\n',
+                   'database_password: # pending\n\n# comment\n  PRIVATE_FIXTURE_FIRST:tail=value\n\n# comment\n  PRIVATE_FIXTURE_SECOND=value:tail\npublic: visible\n',
+                   'service:\n  database_password:\n    nested: PRIVATE_FIXTURE_FIRST\n    deeper:\n      PRIVATE_FIXTURE_SECOND\n  public: visible\n',
+                   'password: /* comment\n */\n \"PRIVATE_FIXTURE_FIRST\"\npublic: visible\n',
+                   'password:\n  |\n    PRIVATE_FIXTURE_FIRST\n    PRIVATE_FIXTURE_SECOND\npublic: visible\n',
+                   'password:\n[\n \"PRIVATE_FIXTURE_FIRST\",\n {\"nested\": \"PRIVATE_FIXTURE_SECOND\"}\n]\npublic: visible\n',
+                   'password:\n{\n \"first\": \"PRIVATE_FIXTURE_FIRST\",\n \"second\": \"PRIVATE_FIXTURE_SECOND\"\n}\npublic: visible\n',
+                   'password = (\n \"PRIVATE_FIXTURE_FIRST\"\n \"PRIVATE_FIXTURE_SECOND\"\n)\npublic: visible\n',
+                   '\"password\":\n  \"PRIVATE_FIXTURE_FIRST\",\npublic: visible\n',
+                   'password = \"PRIVATE_FIXTURE_FIRST\\\nPRIVATE_FIXTURE_SECOND\"\npublic = \"visible\"\n',
+                   'api_key: |\n  PRIVATE_FIXTURE_FIRST\n  PRIVATE_FIXTURE_SECOND\npublic: visible\n',
                    'api_key = """\nPRIVATE_FIXTURE_FIRST\nPRIVATE_FIXTURE_SECOND\n"""\npublic = "visible"\n']
         for source in sources:
             with self.subTest(source=source.splitlines()[0]):
                 (self.corpus / 'config.yaml').write_text(source, encoding='utf8')
                 calls = [
-                    {'index': 0, 'id': 'partial', 'function': {'name': 'read_file',
-                        'arguments': json.dumps({'path': 'config.yaml', 'start': 2, 'end': 3})}},
-                    {'index': 1, 'id': 'search', 'function': {'name': 'search',
-                        'arguments': json.dumps({'query': 'PRIVATE_FIXTURE', 'glob': 'config.yaml'})}},
+                    {'index': number - 2, 'id': f'partial-{number}', 'function': {'name': 'read_file',
+                        'arguments': json.dumps({'path': 'config.yaml', 'start': number, 'end': number})}}
+                    for number in range(2, len(source.splitlines()) + 1)
                 ]
+                calls.append({'index': len(calls), 'id': 'search', 'function': {'name': 'search',
+                    'arguments': json.dumps({'query': 'PRIVATE_FIXTURE', 'glob': 'config.yaml'})}})
                 answer = json.dumps({'answer': 'redacted', 'findings': [{'claim': 'credential block',
                     'evidence': [{'path': 'config.yaml', 'start': 1, 'end': 3}]}], 'tests': [], 'caveats': []})
                 opener = MagicMock()
@@ -512,6 +539,38 @@ class TestMercuryProvider(unittest.TestCase):
                 for value in ('PRIVATE_FIXTURE_FIRST', 'PRIVATE_FIXTURE_SECOND'):
                     self.assertNotIn(value, requests + artifacts)
                 self.assertTrue(result['final_parse_valid'])
+
+    def test_actual_runner_wrapper_keeps_repository_requirements(self):
+        from scripts.provider_runner import prompt_for
+        for name, text in (('AGENTS.md', 'Require ALPHA_REQUIREMENT.'),
+                           ('CLAUDE.md', 'Require BETA_REQUIREMENT.'),
+                           ('selected.md', 'Require GAMMA_REQUIREMENT. password: \"OPAQUE_INSTRUCTION_VALUE\"')):
+            (self.corpus / name).write_text(text)
+        task = {'objective': 'Explain {nested} TASK CONTRACT and REPOSITORY INSTRUCTIONS delimiters',
+                'acceptance_criteria': ['Cite lines'], 'owned_paths': ['DISTINCT_SCOPE/module.py'], 'validation': ['Check DISTINCT_VALIDATION {nested}'],
+                'instructions_files': ['selected.md'], 'metadata': {'nested': {'value': 'brace }'}}}
+        self.task_file.write_text(prompt_for(self.corpus, self.task_file, task=task, activity='exploration'))
+        answer = json.dumps({'answer':'ok','findings':[{'claim':'found', 'evidence':[{'path':'module.py','start':1,'end':2}]}], 'tests':[], 'caveats':[]})
+        opener = MagicMock()
+        opener.open.return_value = MockStreamingResponse([make_sse_chunk(content=answer, finish_reason='stop'), 'data: [DONE]\n\n'])
+        with patch('scripts.mercury_provider.get_inception_api_key', return_value='synthetic-key'), \
+             patch('urllib.request.build_opener', return_value=opener), patch('sys.stdout', new_callable=io.StringIO):
+            result = run_mercury(self.corpus, self.task_file, self.output_file)
+        request = json.loads(opener.open.call_args.args[0].data)
+        outbound = json.dumps(request)
+        for requirement in ('ALPHA_REQUIREMENT', 'BETA_REQUIREMENT', 'GAMMA_REQUIREMENT', 'DISTINCT_SCOPE/module.py', 'DISTINCT_VALIDATION', task['objective']):
+            self.assertIn(requirement, outbound)
+        self.assertNotIn('OPAQUE_INSTRUCTION_VALUE', outbound + self.output_file.read_text())
+        self.assertTrue(result['final_parse_valid'], result)
+
+    def test_malformed_wrapped_contract_fails_before_transport(self):
+        self.task_file.write_text('prefix\nTASK CONTRACT\n' + json.dumps({'objective':'inspect'}) +
+                                  '\nREPOSITORY INSTRUCTIONS_BROKEN\nrequirements')
+        with patch('scripts.mercury_provider.get_inception_api_key', return_value='synthetic-key'), \
+             patch('urllib.request.build_opener') as transport, patch('sys.stdout', new_callable=io.StringIO):
+            result = run_mercury(self.corpus, self.task_file, self.output_file)
+        self.assertEqual(result['status'], 'setup_error')
+        transport.assert_not_called()
 
     def test_real_urllib_transport_offline_and_trickled_headers(self):
         import scripts.mercury_provider as provider

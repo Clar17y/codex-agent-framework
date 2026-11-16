@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 import io
 import os
+import re
 import sys
 import time
 from contextlib import contextmanager
@@ -22,6 +23,18 @@ import provider_runner as runner
 
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+@contextmanager
+def mercury_fixture_environment():
+    # Offline fixtures must not depend on unrelated CI/User credentials. Keep
+    # actual credential classification and strict short-secret checks intact.
+    environment = {name: value for name, value in os.environ.items()
+                   if not re.search(r'(?i)(api_?key|secret|password|token)', name)}
+    with mock.patch.dict(os.environ, environment, clear=True), \
+         mock.patch.object(runner, 'windows_user_secret', return_value=None), \
+         mock.patch.object(runner, 'get_inception_api_key', return_value=None):
+        yield
 
 
 class ActivityDispatchTests(unittest.TestCase):
@@ -132,6 +145,18 @@ class ActivityDispatchTests(unittest.TestCase):
         self.assertEqual([a["status"] for a in result["attempts"]],
                          ["provider_error", "skipped_duplicate_route"])
 
+    def test_mercury_fixture_isolation_keeps_actual_short_secret_guard(self):
+        with mock.patch.dict(os.environ, {'MYSQL_ROOT_PASSWORD': 'root'}), \
+             mock.patch.object(runner, 'windows_user_secret', return_value=None), \
+             mock.patch.object(runner, 'get_inception_api_key', return_value=None):
+            with self.assertRaises(runner.UnsafeSecretError):
+                runner.validate_redaction_secrets(runner.redaction_secrets(self.config, mercury=True))
+            with mercury_fixture_environment():
+                self.assertNotIn('MYSQL_ROOT_PASSWORD', os.environ)
+                runner.validate_redaction_secrets(runner.redaction_secrets(self.config, mercury=True))
+            self.assertEqual(os.environ['MYSQL_ROOT_PASSWORD'], 'root')
+
+    @mercury_fixture_environment()
     def test_mercury_generic_example_is_redacted_without_false_secret_collision(self):
         task = runner.read_json(self.task_path)
         task["objective"] = "Document the example Bearer demo-token-value"
@@ -1415,6 +1440,7 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
         with mock.patch.dict(os.environ, {'MERCURY_REDACTION_DIGESTS':encoded}):
             self.assertNotIn('MERCURY_REDACTION_DIGESTS', runner.child_environment(self.config, 'claude'))
 
+    @mercury_fixture_environment()
     def test_mercury_real_subprocess_terminals_and_dispatch_fallback(self):
         # Both executables are offline fixtures: no provider CLI or network.
         wrapper = self.root / 'mercury_offline.py'
@@ -1477,6 +1503,12 @@ if os.environ["FAKE_PARENT_MODE"] == "failed":
             known.append(({'http':http,'message':message}, status, 20 if status=='quota_exhausted' else 1))
             known.append(({'stream':'data: '+json.dumps({'error':{'status':http,'message':message}})+'\n\n'},
                           status, 20 if status=='quota_exhausted' else 1))
+        for phrase in ('too many requests', 'tokens/min exceeded', 'tokens/sec exceeded', 'concurrency limit reached'):
+            message = 'quota_exceeded: ' + phrase
+            known.extend([
+                ({'http':429, 'message':message}, 'rate_limit_error', 1),
+                ({'stream':'data: '+json.dumps({'error':{'status':429,'message':message}})+'\n\n'}, 'rate_limit_error', 1),
+            ])
         # Success runs through execute's real Popen and parses the adapter terminal.
         fixture.write_text(json.dumps({'stream':stream()}))
         with mock.patch.object(runner, 'get_inception_api_key', return_value='offline-fixture-key'):

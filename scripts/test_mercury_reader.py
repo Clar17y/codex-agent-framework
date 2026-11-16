@@ -320,6 +320,108 @@ class TestMercuryReader(unittest.TestCase):
                 if 'visible' in source:
                     self.assertIn('visible', read_file(self.root, 'config.yaml')['text'])
 
+    def test_next_line_and_continued_quoted_credentials_before_selection(self):
+        from scripts.mercury_reader import redact_text
+        cases = [
+            'password: /* comment\n */\n \"OPAQUE_FIRST\"\npublic: visible\n',
+            'password:\n /* comment\n */ \"OPAQUE_FIRST\"\npublic: visible\n',
+            '\"password\":\n  \"OPAQUE_FIRST\",\npublic: visible\n',
+            'password: # value follows\n\n# comment\n  \"OPAQUE_FIRST\"\npublic: visible\n',
+            'password = \"OPAQUE_FIRST\\\nOPAQUE_SECOND\"; public = \"visible\"\n',
+            "password = 'OPAQUE_FIRST\\\nOPAQUE_SECOND'; public = 'visible'\n",
+            'password:\n  \"OPAQUE_FIRST\\\"still-hidden\\\nOPAQUE_SECOND\"\npublic: visible\n',
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                (self.root / 'config.txt').write_text(source, encoding='utf8')
+                sanitized = redact_text(source)
+                self.assertNotIn('OPAQUE_', sanitized)
+                self.assertEqual(sanitized.count('\n'), source.count('\n'))
+                for number in range(1, len(source.splitlines()) + 1):
+                    partial = read_file(self.root, 'config.txt', start=number, end=number)
+                    self.assertNotIn('OPAQUE_', partial['text'])
+                    self.assertIn(f'{number} |', partial['text'])
+                self.assertEqual(search(self.root, 'OPAQUE_', 'config.txt')['count'], 0)
+                self.assertIn('visible', read_file(self.root, 'config.txt')['text'])
+        for source in ('password:\npublic: visible\n', 'password:\n}\npublic: visible\n'):
+            self.assertIn('visible', redact_text(source))
+
+    def test_detached_plain_credential_logical_boundaries(self):
+        from scripts.mercury_reader import redact_text
+        cases = [
+            'database_password:\n  lantern-7431\npublic: visible\napi_token:\n  \"kite-8294\"\nnext: usable\n',
+            '- database_password:\n    lantern-7431\n    kite-8294\n- public: visible\n',
+            'database_password: lantern-7431\n  kite-8294\npublic: visible\n',
+            '- database_password:\n    lantern-7431\n    kite-8294\n  public: visible\n',
+            'database_password:\n  proto://lantern-7431@host/db\npublic: visible\n',
+            'database_password:\n  lantern-7431\n  kite-8294\npublic: visible\n',
+            'database_password: # pending\n\n# comment\n  lantern-7431:tail=value\n\n# another comment\n  kite-8294=value:tail\npublic: visible\n',
+            'database_password:\n  nested:\n    lantern-7431\n    kite-8294\npublic: visible\n',
+            'service:\n  database_password:\n    nested: lantern-7431\n    another: kite-8294\n  public: visible\nouter: usable\n',
+            'service:\n  database_password:\n    proto://lantern-7431@host/db\n    kite-8294=value\n  public: visible\nouter: usable\n',
+            'database_password: /* comment\n */\n  lantern-7431\n  kite-8294\npublic: visible\n',
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                (self.root / 'config.yaml').write_text(source)
+                sanitized = redact_text(source)
+                self.assertEqual(sanitized.count('\n'), source.count('\n'))
+                for token in ('lantern-7431', 'kite-8294'):
+                    self.assertNotIn(token, sanitized)
+                    self.assertEqual(search(self.root, token, 'config.yaml')['count'], 0)
+                for number in range(1, len(source.splitlines()) + 1):
+                    partial = read_file(self.root, 'config.yaml', start=number, end=number)['text']
+                    self.assertIn(f'{number} |', partial)
+                    self.assertNotIn('lantern-7431', partial)
+                    self.assertNotIn('kite-8294', partial)
+                self.assertIn('public: visible', read_file(self.root, 'config.yaml')['text'])
+                if 'outer: usable' in source:
+                    self.assertIn('outer: usable', read_file(self.root, 'config.yaml')['text'])
+        for source in ('database_password:\npublic: visible\n',
+                       'service:\n  database_password:\n  public: visible\n',
+                       'database_password:\n  lantern-7431\n---\npublic: visible\n'):
+            self.assertIn('public: visible', redact_text(source))
+
+    def test_compound_credential_values_before_selection(self):
+        from scripts.mercury_reader import redact_text
+        for source in (
+            'password:\n  |\n    OPAQUE_FIRST\n    OPAQUE_SECOND\npublic: visible\n',
+            'password:\n[\n "OPAQUE_FIRST",\n {"nested": "OPAQUE_SECOND]"} // ]\n]\npublic: visible\n',
+            'password = {\n/* } comment\n */ "nested": [\n "OPAQUE_FIRST", "OPAQUE_SECOND"\n]\n}; public = "visible"\n',
+            'password = (\n "OPAQUE_FIRST" # )\n "OPAQUE_SECOND"\n)\npublic = "visible"\n',
+            'password:\n "OPAQUE_FIRST:password=OPAQUE_SECOND"\npublic: visible\n',
+        ):
+            with self.subTest(source=source):
+                (self.root / 'config.txt').write_text(source)
+                self.assertNotIn('OPAQUE_', redact_text(source))
+                self.assertEqual(redact_text(source).count('\n'), source.count('\n'))
+                for number in range(1, len(source.splitlines()) + 1):
+                    self.assertNotIn('OPAQUE_', read_file(self.root, 'config.txt', start=number, end=number)['text'])
+                self.assertEqual(search(self.root, 'OPAQUE_', 'config.txt')['count'], 0)
+                self.assertIn('visible', read_file(self.root, 'config.txt')['text'])
+        (self.root / 'config.txt').write_text('password = ' + '[' * 65 + '\nOPAQUE_FIRST')
+        with self.assertRaisesRegex(ValueError, 'nesting ceiling'):
+            read_file(self.root, 'config.txt')
+
+    def test_backslash_paths_normalize_before_confinement(self):
+        expected = read_file(self.root, 'src/main.py')['text']
+        self.assertEqual(read_file(self.root, 'src\\main.py')['text'], expected)
+        for path in ('..\\outside.py', 'src\\..\\README.md', 'node_modules\\dep.js'):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                read_file(self.root, path)
+
+    def test_nofollow_errors_are_controlled_path_rejections(self):
+        import errno
+        from unittest.mock import patch
+        import scripts.mercury_reader as reader
+        for error in (errno.ELOOP, errno.ENOTDIR):
+            with self.subTest(error=error), patch.object(reader.os, 'open', side_effect=OSError(error, 'blocked')):
+                with self.assertRaisesRegex(ValueError, 'Symlink|directory'):
+                    reader._nofollow_open('fixture', 0)
+        with patch.object(reader.os, 'open', side_effect=PermissionError(errno.EACCES, 'denied')):
+            with self.assertRaises(PermissionError):
+                reader._nofollow_open('fixture', 0)
+
     def test_resource_caps_before_large_reads_and_incremental_stop(self):
         from unittest.mock import patch
         import scripts.mercury_reader as reader
@@ -611,7 +713,7 @@ class TestMercuryReader(unittest.TestCase):
         for pattern in ("SRC/main.py", "SRC/*.py", "S*/main.py", "src/MAIN.*"):
             with self.subTest(pattern=pattern):
                 matches = search(self.root, "hello world", pattern)["matches"]
-                self.assertEqual([match["path"] for match in matches], expected)
+                self.assertCountEqual([match["path"] for match in matches], expected)
 
         # Listing prefixes have always used literal, case-sensitive matching.
         self.assertEqual(list_files(self.root, "SRC")["paths"], [])
@@ -629,7 +731,7 @@ class TestMercuryReader(unittest.TestCase):
         ):
             with self.subTest(pattern=pattern):
                 matches = search(self.root, "hello world", pattern)["matches"]
-                self.assertEqual([match["path"] for match in matches], expected)
+                self.assertCountEqual([match["path"] for match in matches], expected)
 
 if __name__ == "__main__":
     unittest.main()

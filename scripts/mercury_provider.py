@@ -117,13 +117,19 @@ def classify_error(code, message):
     if isinstance(code, str) and code.isdigit():
         code = int(code)
     msg = message.lower()
-    if is_account_quota_exhausted(code, message):
-        return 'quota_exhausted'
-    if code in (401, 403) or any(s in msg for s in ('invalid_api_key', 'authentication', 'unauthorized')):
+    # Explicit authentication/model diagnostics and transient throughput limits
+    # are not account exhaustion, even when a generic quota label accompanies them.
+    if code == 401 or any(s in msg for s in ('invalid_api_key', 'authentication', 'unauthorized')):
         return 'auth_error'
     if code == 404 or any(s in msg for s in ('model_not_found', 'invalid_model')):
         return 'model_error'
-    if code == 429 or is_transient_rate_limit(message):
+    if is_transient_rate_limit(message):
+        return 'rate_limit_error'
+    if is_account_quota_exhausted(code, message):
+        return 'quota_exhausted'
+    if code == 403:
+        return 'auth_error'
+    if code == 429:
         return 'rate_limit_error'
     return 'error'
 
@@ -535,7 +541,7 @@ def execute_reader_tool(corpus_root: Path, tool_name: str, arguments_str: str, *
 
 def is_transient_rate_limit(err_message: str) -> bool:
     """Check if 429 message describes transient rate limiting rather than account quota exhaustion."""
-    msg = err_message.lower()
+    msg = err_message.lower().replace('_', ' ')
     transient_phrases = (
         "per minute", "per second", "requests/min", "requests/sec",
         "tokens/min", "tokens/sec", "rate limit", "rate quota",
@@ -546,6 +552,8 @@ def is_transient_rate_limit(err_message: str) -> bool:
 
 def is_account_quota_exhausted(status_code: int, err_message: str) -> bool:
     """Check if error indicates account quota/balance exhaustion."""
+    if is_transient_rate_limit(err_message):
+        return False
     msg = err_message.lower()
     quota_phrases = (
         "insufficient_quota", "quota_exhausted", "quota_exceeded", "quota exceeded",
@@ -639,17 +647,24 @@ def run_mercury(corpus_root: str | Path,
             raw_task_text = task_stream.read(MAX_TASK_BYTES + 1).decode('utf-8-sig')
             if len(raw_task_text.encode()) > MAX_TASK_BYTES:
                 raise ValueError('Task size ceiling exceeded')
+        repository_instructions = ''
         try:
             task_data = json.loads(raw_task_text)
         except json.JSONDecodeError:
-            # Extract JSON block if task_file is a prompt wrapper
-            match = re.search(r"TASK CONTRACT\s*(\{.*?\})\s*REPOSITORY INSTRUCTIONS", raw_task_text, re.DOTALL)
-            if not match:
-                match = re.search(r"(\{.*\})", raw_task_text, re.DOTALL)
-            if match:
-                task_data = json.loads(match.group(1))
+            # Decode the actual JSON object, not a regex-delimited brace span:
+            # objectives may contain nested objects or delimiter-like text.
+            header = re.search(r'(?:^|\n)TASK CONTRACT[ \t]*\r?\n', raw_task_text)
+            if header:
+                contract = raw_task_text[header.end():].lstrip()
+                task_data, end = json.JSONDecoder().raw_decode(contract)
+                suffix = contract[end:]
+                boundary = re.match(r'\s*REPOSITORY INSTRUCTIONS[ \t]*\r?\n', suffix)
+                if not boundary:
+                    raise ValueError('Malformed wrapped repository instructions')
+                repository_instructions = suffix[boundary.end():]
             else:
-                task_data = {"objective": raw_task_text}
+                match = re.search(r"(\{.*\})", raw_task_text, re.DOTALL)
+                task_data = json.loads(match.group(1)) if match else {"objective": raw_task_text}
         if not isinstance(task_data, dict):
             raise ValueError('Task contract must be an object')
         if not isinstance(task_data.get('objective', ''), str) or not isinstance(task_data.get('instructions', ''), str):
@@ -689,10 +704,6 @@ def run_mercury(corpus_root: str | Path,
             out_path.write_text(json.dumps(redact_obj(result, api_key), indent=2), encoding="utf-8")
         return redact_obj(result, api_key)
 
-    objective = task_data.get("objective", "")
-    instructions = task_data.get("instructions", "")
-    acceptance_criteria = task_data.get("acceptance_criteria", [])
-
     system_prompt = (
         "You are an expert repository-exploration investigator with read-only access to a code repository. "
         "Investigate the codebase using ONLY the provided tools: list_files, search, read_file. "
@@ -709,11 +720,12 @@ def run_mercury(corpus_root: str | Path,
         "Return ONLY the JSON object as your final text."
     )
 
-    user_prompt = objective
-    if acceptance_criteria:
-        user_prompt += "\n\nAcceptance Criteria:\n" + "\n".join(f"- {c}" for c in acceptance_criteria)
-    if instructions:
-        user_prompt += f"\n\nAdditional instructions:\n{instructions}"
+    # Preserve the complete bounded contract, including ownership/scope and
+    # validation requirements, without trying to reinterpret its constraints.
+    user_prompt = "Task contract:\n" + json.dumps(task_data, indent=2, ensure_ascii=False)
+
+    if repository_instructions:
+        user_prompt += "\n\nRepository instructions:\n" + repository_instructions
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -819,7 +831,9 @@ def run_mercury(corpus_root: str | Path,
         except urllib.error.HTTPError as exc:
             try:
                 body = read_error_body(exc, deadline)
-                status = classify_error(exc.code, body + " " + str(exc.reason))
+                # The generic HTTP reason (e.g. 429 "Too Many Requests")
+                # must not override an explicit account/balance response body.
+                status = classify_error(exc.code, body if body.strip() else str(exc.reason))
                 errors.append(f"HTTP {exc.code}: {body}")
             except (TimeoutError, OSError) as body_error:
                 status = "timeout" if isinstance(body_error, TimeoutError) else "error"

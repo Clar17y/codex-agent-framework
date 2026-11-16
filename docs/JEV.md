@@ -61,8 +61,8 @@ Jev defaults to enabled across coding repositories and Git worktrees. With `TYPE
   "model": "jev-1.13.0",
   "timeout_seconds": 10,
   "deadline_seconds": 30,
-  "max_requests": 8,
-  "max_input_tokens": 120000,
+  "max_requests": 32,
+  "max_input_tokens": 500000,
   "max_candidates": 96,
   "max_output_chars": 12000,
   "cache_ttl_seconds": 604800

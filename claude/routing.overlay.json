@@ -94,6 +94,13 @@
       "muse-full-high",
       "openai-sol-high",
       "gemini-flash-high"
+    ],
+    "structured_thinking": [
+      "claude-sonnet",
+      "agy-sonnet",
+      "openai-sol",
+      "gemini-flash",
+      "muse-wonder"
     ]
   }
 }

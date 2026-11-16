@@ -68,7 +68,8 @@ class TestConfigAndAuthorization(unittest.TestCase):
         self.assertTrue(is_remote_authorized(self.temp_path, cfg, allow_remote=False))
         self.assertEqual(cfg["allowed_roots"], [])
         self.assertEqual(cfg["model"], "jev-1.13.0")
-        self.assertEqual(cfg["max_requests"], 8)
+        self.assertEqual(cfg["max_requests"], 32)
+        self.assertEqual(cfg["max_input_tokens"], 500000)
         self.assertEqual(cfg["max_candidates"], 96)
 
     def test_load_framework_capabilities_jev(self):
@@ -80,6 +81,7 @@ class TestConfigAndAuthorization(unittest.TestCase):
                     "allowed_roots": [str(self.temp_path)],
                     "model": "jev-1.13.0",
                     "max_requests": 5,
+                    "max_input_tokens": 150000,
                     "timeout_seconds": 15.0,
                 }
             }
@@ -89,6 +91,7 @@ class TestConfigAndAuthorization(unittest.TestCase):
         self.assertTrue(cfg["enabled"])
         self.assertEqual(cfg["allowed_roots"], [str(self.temp_path)])
         self.assertEqual(cfg["max_requests"], 5)
+        self.assertEqual(cfg["max_input_tokens"], 150000)
         self.assertEqual(cfg["timeout_seconds"], 15.0)
 
     def test_malformed_config_errors(self):

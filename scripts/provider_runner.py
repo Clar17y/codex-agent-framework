@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 
 UTC = dt.timezone.utc
@@ -35,13 +36,15 @@ MAX_EVIDENCE_BYTES = 1024 * 1024
 MUSE_PROFILE_NAMES = ("routine", "complex", "escalation")
 MUSE_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 READ_ACTIVITIES = frozenset(("planning", "exploration", "test_design", "independent_review",
-                             "security_review", "refactor_audit", "docs_research", "deep_review"))
+                             "security_review", "refactor_audit", "docs_research", "deep_review",
+                             "structured_thinking"))
 WRITE_ACTIVITIES = frozenset(("implementation", "implementation_complex", "implementation_long_horizon",
                               "testing", "verification", "documentation"))
-PROVIDERS = frozenset(("openai", "claude", "gemini", "muse"))
+PROVIDERS = frozenset(("openai", "claude", "gemini", "muse", "inception"))
 ACTIVITY_EFFORTS = {"gemini": frozenset(("low", "medium", "high")),
                     "claude": frozenset(("medium", "high")),
-                    "openai": frozenset(MUSE_EFFORTS), "muse": frozenset(MUSE_EFFORTS)}
+                    "openai": frozenset(MUSE_EFFORTS), "muse": frozenset(MUSE_EFFORTS),
+                    "inception": frozenset(("low",))}
 
 
 def validate_activity_registry(config):
@@ -79,6 +82,10 @@ def validate_activity_registry(config):
             raise ValueError(f"Activity {name} requires a nonempty chain without duplicates")
         if any(profile not in profiles or not profiles[profile].get("enabled", True) for profile in chain):
             raise ValueError(f"Activity {name} references unknown or disabled profile")
+        for profile in chain:
+            p_entry = profiles.get(profile, {})
+            if p_entry.get("provider") == "inception" and name != "exploration":
+                raise ValueError(f"Inception provider only supports exploration activity; found in {name}")
 
 
 def activity_routes(config, activity):
@@ -92,12 +99,21 @@ def activity_routes(config, activity):
     return activities[activity]
 
 
-def effective_activity_provider(config, profile_name):
+def muse_model_for_auth(model, muse_auth):
+    """Pin an API-supported Wonder model for Full or an unknown CLI default."""
+    if muse_auth == "api" and model in ("muse-wonder-full-1.0", "cli-default"):
+        return "muse-wonder-1.0"
+    return model
+
+
+def effective_activity_provider(config, profile_name, muse_auth="stored"):
     profile = config["profiles"][profile_name]
     provider_name = profile["provider"]
     provider = copy.deepcopy(config["providers"][provider_name])
     provider.pop("profiles", None)
     provider.update(model=profile["model"], effort=profile.get("effort", "medium"))
+    if provider_name == "muse":
+        provider["model"] = muse_model_for_auth(provider["model"], muse_auth)
     return provider_name, provider
 
 
@@ -142,7 +158,7 @@ def validate_gemini_reader(provider, workspace):
         raise ValueError("Gemini reader agent does not have the enforced read/search-only capability definition")
 
 
-def resolve_muse_profile(config, profile_name=None):
+def resolve_muse_profile(config, profile_name=None, muse_auth="stored"):
     """Return a copy of the Muse provider with the selected profile applied.
 
     The base entry supplies routine model/effort plus all shared controls
@@ -182,9 +198,10 @@ def resolve_muse_profile(config, profile_name=None):
             if profile["effort"] not in MUSE_EFFORTS:
                 raise ValueError(f"providers.muse.profiles.{selected}.effort is unsupported: {profile['effort']!r}")
             effective["effort"] = profile["effort"]
-    model = effective.get("model")
+    model = muse_model_for_auth(effective.get("model"), muse_auth)
     if not isinstance(model, str) or not model.strip():
         raise ValueError("Muse model must be a nonempty CLI model ID or cli-default")
+    effective["model"] = model
     effort = effective.get("effort", "medium")
     if effort not in MUSE_EFFORTS:
         raise ValueError(f"Unsupported Muse reasoning effort: {effort!r}")
@@ -639,6 +656,23 @@ def validate_coverage_task(task):
             raise ValueError(f"{label} with status 'planned' cannot claim execution evidence")
 
 
+def load_structured_thinker_protocol(base_file=__file__):
+    """Load canonical structured-thinker protocol from adjacent installed or source agents."""
+    here = Path(base_file).resolve().parent
+    candidates = [
+        here.parent / "agents" / "structured-thinker.toml",
+        here.parent.parent / "agents" / "structured-thinker.toml",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            data = tomllib.loads(candidate.read_text(encoding="utf-8"))
+            protocol = data.get("developer_instructions")
+            if not isinstance(protocol, str) or not protocol.strip():
+                raise ValueError(f"Expected nonempty developer_instructions in {candidate}")
+            return protocol.strip()
+    raise FileNotFoundError(f"Could not find structured-thinker.toml near {base_file}")
+
+
 def prompt_for(workspace, task_path, task=None, activity=None):
     task = read_json(task_path) if task is None else task
     for field in ("objective", "acceptance_criteria", "owned_paths", "validation", "instructions_files"):
@@ -662,8 +696,12 @@ def prompt_for(workspace, task_path, task=None, activity=None):
         capabilities = ("Read and search only; do not write or run commands." if activity in READ_ACTIVITIES else
                         "Orchestrate child tasks by calling this framework's dispatch command with explicit nonoverlapping ownership; wait for results and integrate evidence. Do not claim the whole workspace." if activity == "orchestration" else
                         "Write only owned paths and complete assigned checks; do not delegate unless task explicitly authorizes it.")
-        return (f"ACTIVITY {activity}: {capabilities} Use the pinned provider/model. "
-                "Preserve unrelated changes and partial work. Report checks, unresolved issues and evidence.\nTASK CONTRACT\n"
+        prefix = (f"ACTIVITY {activity}: {capabilities} Use the pinned provider/model. "
+                  "Preserve unrelated changes and partial work. Report checks, unresolved issues and evidence.")
+        if activity == "structured_thinking":
+            protocol = load_structured_thinker_protocol()
+            prefix += f"\nROLE PROTOCOL\n{protocol}"
+        return (prefix + "\nTASK CONTRACT\n"
                 + json.dumps(task, indent=2) + "\nREPOSITORY INSTRUCTIONS\n" + "\n".join(instructions))
     return ("USER ROUTING OVERRIDE: Execute the assigned task yourself with the pinned provider. "
             "Never spawn subagents or invoke another AI provider. Never use Sonnet or Fable. "
@@ -831,7 +869,7 @@ def validate_jev_task(task, workspace, role):
     return jev_meta
 
 
-def direct_windows_codex_command(command, platform_name=None):
+def direct_windows_codex_command(command, platform_name=None, helper_env=None):
     """Replace an npm .cmd shim with its direct Node argv, without invoking cmd.exe."""
     if (platform_name or os.name) != "nt":
         return command
@@ -850,7 +888,8 @@ def direct_windows_codex_command(command, platform_name=None):
     if re.search(r"\bvolta run\b", shim, re.I):
         try:
             resolved = subprocess.run(["volta", "which", "codex"], capture_output=True, text=True,
-                                      timeout=5, check=False)
+                                      timeout=5, check=False,
+                                      env=helper_env if helper_env is not None else helper_environment())
         except subprocess.TimeoutExpired as exc:
             raise ValueError("Volta Codex launcher discovery timed out before provider launch") from exc
         binary = Path(resolved.stdout.strip())
@@ -930,7 +969,7 @@ def orchestration_writable_roots(provider, state_dir, workspace):
     return [str(path) for path in roots]
 
 
-def command_for(role, provider, prompt, timeout, workspace, effort="medium", provider_name=None, output_dir=None, activity=None, state_dir=None):
+def command_for(role, provider, prompt, timeout, workspace, effort="medium", provider_name=None, output_dir=None, activity=None, state_dir=None, helper_env=None):
     executable = provider["executable"]
     command = [executable] if isinstance(executable, str) else list(executable)
     if not command or not all(isinstance(arg, str) for arg in command):
@@ -940,10 +979,13 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
         provider_name = "claude" if role == "review" else "gemini"
 
     if provider_name == "openai":
-        command = direct_windows_codex_command(command)
+        command = (direct_windows_codex_command(command, helper_env=helper_env)
+                   if helper_env is not None else direct_windows_codex_command(command))
     elif provider_name == "muse":
         command = (direct_windows_muse_config_command(command) if activity in READ_ACTIVITIES
                    else direct_windows_muse_command(command))
+    elif provider_name == "inception" and not activity:
+        raise ValueError(f"Inception provider does not support legacy role {role}; only exploration activity is accepted")
 
     model = provider["model"]
     if activity:
@@ -1013,6 +1055,25 @@ def command_for(role, provider, prompt, timeout, workspace, effort="medium", pro
             if model != "cli-default":
                 base += ["--model", model]
             return command + base
+        if provider_name == "inception":
+            if activity != "exploration":
+                raise ValueError(f"Inception provider only supports exploration activity; got {activity}")
+            if output_dir is None:
+                raise ValueError("Inception requires an output directory")
+            adapter = provider.get("adapter")
+            if adapter:
+                adapter_path = Path(adapter)
+                if not adapter_path.is_absolute():
+                    adapter_path = (Path(__file__).resolve().parent.parent / adapter).resolve()
+            else:
+                adapter_path = (Path(__file__).resolve().parent / "mercury_provider.py").resolve()
+            prompt_file = output_dir / "prompt.txt"
+            output_file = output_dir / "mercury-result.json"
+            temperature = provider.get("temperature", 1.0)
+            args = ["--corpus", str(workspace), "--task-file", str(prompt_file), "--output", str(output_file), "--temperature", str(temperature)]
+            if any("mercury_provider" in arg for arg in command):
+                return command + args
+            return command + [str(adapter_path)] + args
         raise ValueError(f"Unsupported activity provider: {provider_name}")
     if role == "review":
         if provider_name != "claude":
@@ -1097,10 +1158,10 @@ def structured_error_message(errors):
 def account_auth_error(result):
     """Classify account login failures without confusing throttles or model errors."""
     codes = {str(code).upper() for code in result.get("error_codes", [])}
-    if codes & {"UNAUTHENTICATED", "AUTHENTICATION_ERROR", "INVALID_CREDENTIALS", "AUTH_REQUIRED", "OAUTH_TOKEN_EXPIRED"}:
+    if codes & {"UNAUTHENTICATED", "AUTHENTICATION_ERROR", "INVALID_CREDENTIALS", "AUTH_REQUIRED", "OAUTH_TOKEN_EXPIRED", "OAUTH_TOKEN_REVOKED"}:
         return True
     message = str(result.get("error", "")).lower()
-    return bool(re.search(r"authentication required|not logged in|login required|invalid credentials|unauthorized|oauth token (?:has )?expired|please run /login|please (?:log in|login)", message))
+    return bool(re.search(r"authentication required|not logged in|login required|invalid credentials|unauthorized|oauth (?:access |refresh )?token (?:(?:has (?:been )?|is ))?(?:expired|revoked)|please run /login|please (?:log in|login)", message))
 
 
 def parse_openai_terminal(stdout_text, truncated=False):
@@ -1323,7 +1384,7 @@ def terminal_quota_message(message, provider=None):
     prefix = r"(?:error:\s*)?"
     patterns = [r"(?:daily|plan|monthly|weekly|session) (?:quota (?:exhausted|exceeded)|(?:usage )?limit (?:reached|exceeded|exhausted))(?:[.!]|[.!]?\s+resets?\s+[^\n]+)?"]
     if provider in (None, "gemini"):
-        patterns.append(r"individual quota reached(?:\.[ ]+Please upgrade your subscription to increase your limits\.)?(?:\s+Resets in [^\n]+)?[.!]?")
+        patterns.append(r"individual quota reached(?:\.[ ]+Please upgrade your subscription to increase your limits)?\.?(?:\s+Resets in [^\n]+)?[.!]?")
     if provider in (None, "claude"):
         patterns.append(r"you['’]ve hit your(?: (?:session|weekly|plan|monthly|opus))? limit(?:[.!]|\s*[·-]\s*resets?\s+[^\n]+)?")
         patterns.append(r"opus (?:usage )?limit (?:reached|exceeded|exhausted)[.!]?")
@@ -1332,6 +1393,9 @@ def terminal_quota_message(message, provider=None):
         patterns.append(r"you['’]ve hit your (?:usage|weekly|plan) limit" + suffix)
         patterns.append(r"you['’]ve reached your (?:weekly |plan )?usage limit" + suffix)
         patterns.append(r"your chatgpt plan has reached its usage limit[.!]?")
+    if provider in (None, "inception"):
+        patterns.append(r"(?:insufficient|account|credit)\s+quota(?:\s+exhausted|\s+exceeded)?[.!]?")
+        patterns.append(r"(?:insufficient\s+funds|credit\s+balance\s+too\s+low|billing\s+hard\s+limit|account\s+quota\s+exhausted)[.!]?")
     return any(re.fullmatch(prefix + pattern, message.strip(), re.I) for pattern in patterns)
 
 
@@ -1422,6 +1486,32 @@ def muse_quota_error(terminal):
             "source": "muse_root_terminal", "http_status": int(match.group(1))}
 
 
+def inception_quota_error(terminal, errors):
+    """Accept confirmed account quota limits; reject transient rate limits or auth/model errors."""
+    if isinstance(terminal, dict):
+        status = terminal.get("status")
+        err_msg = str(terminal.get("error") or "")
+        lower_err = err_msg.lower()
+        if status in ("auth_error", "model_error", "rate_limit_error"):
+            return None
+        if any(phrase in lower_err for phrase in ("per minute", "per second", "requests/min", "requests/sec", "rate limit", "rate quota")):
+            return None
+        if status == "quota_exhausted" or terminal_quota_message(err_msg, "inception"):
+            return {"code": "QUOTA_EXHAUSTED", "message": err_msg or "Inception account quota exhausted",
+                    "source": "mercury_terminal"}
+    for error in errors or ():
+        code = str(error.get("code", error.get("status", ""))).upper()
+        raw_message = str(error.get("message", error.get("result", "")))
+        message = raw_message.lower()
+        if any(phrase in message for phrase in ("per minute", "per second", "requests/min", "requests/sec", "rate limit", "rate quota")):
+            continue
+        if code in ("QUOTA_EXHAUSTED", "INSUFFICIENT_QUOTA") or terminal_quota_message(raw_message, "inception"):
+            found = dict(error)
+            found["message"] = raw_message
+            return found
+    return None
+
+
 def retry_at(error, cooldown, observed=None):
     observed = time.time() if observed is None else observed
     if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
@@ -1468,8 +1558,64 @@ def retry_at(error, cooldown, observed=None):
     return observed + cooldown, "probe_cooldown"
 
 
-def quota_path(state_dir, provider):
-    return state_dir / f"{provider}-quota.json"
+ANTIGRAVITY_FAMILIES = ("flash", "claude", "argon")
+
+
+def antigravity_family(model):
+    """Only installed Antigravity model IDs establish an allowance family."""
+    if not isinstance(model, str):
+        return None
+    for pattern, family in ((r"gemini-3\.8-flash-(?:low|medium|high)", "flash"),
+                            (r"claude-(?:opus|sonnet)-5-5-(?:low|medium|high)", "claude"),
+                            (r"gemini-4-argon-(?:low|medium|high)", "argon")):
+        if re.fullmatch(pattern, model):
+            return family
+    return None
+
+
+def individual_quota_family(model, error):
+    if not isinstance(error, dict) or error.get("source") == "operator":
+        return None
+    # Explicit account/unknown scope must never be narrowed by message text.
+    if (error.get("quota_scope") not in (None, "model_family")
+            or error.get("scope") not in (None, "model_family")
+            or error.get("model", model) != model):
+        return None
+    code = str(error.get("code") or error.get("status") or "").upper()
+    if code not in ("", "ERROR", "FAILED", "FAILURE", "BLOCKED", "429", "RESOURCE_EXHAUSTED",
+                    "QUOTA_EXHAUSTED", "INSUFFICIENT_QUOTA", "USAGE_LIMIT_REACHED", "WEEKLY_LIMIT_REACHED"):
+        return None
+    message = str(error.get("message", "")).strip()
+    diagnostic = (r"(?:error:\s*)?individual quota reached"
+                  r"(?:\.[ ]+Please upgrade your subscription to increase your limits)?[.!]?"
+                  r"(?:\s+Resets in (?:\d+h)?(?:\d+m)?(?:\d+s)?[.!]?)?")
+    if (re.fullmatch(diagnostic, message, re.I)
+            and ("resets in" not in message.lower() or _duration_seconds(message) is not None)):
+        return antigravity_family(model)
+    return None
+
+
+def quota_family(state):
+    """Interpret new and legacy evidence without rewriting the legacy file."""
+    if (state.get("quota_scope") == "account" or state.get("provenance") == "operator_report"
+            or state.get("source_logs") == "operator" or state.get("scope") not in (None, "model_family")):
+        return None
+    if state.get("quota_scope") not in (None, "model_family"):
+        raise ValueError("Unknown quota scope")
+    errors = [state[key] for key in ("confirmed_error", "error") if key in state]
+    families = [individual_quota_family(state.get("model"), error) for error in errors]
+    family = families[0] if families and all(x == families[0] for x in families) else None
+    if (state.get("quota_scope") == "model_family" or state.get("model_family") is not None) and (
+            family is None or state.get("model_family") != family):
+        raise ValueError("Invalid model-family quota evidence")
+    return family
+
+
+def quota_path(state_dir, provider, family=None, muse_auth="stored"):
+    suffix = f"-{family}" if provider == "gemini" and family else ""
+    if provider == "muse" and muse_auth == "api":
+        suffix = "-api"
+    return state_dir / f"{provider}{suffix}-quota.json"
 
 
 def luna_fallback():
@@ -1477,7 +1623,7 @@ def luna_fallback():
 
 
 def quota_fallback(provider, config=None):
-    if provider in ("gemini", "muse"):
+    if provider in ("gemini", "muse", "inception"):
         return luna_fallback()
     return {"model": "gpt-6-astra", "effort": "low"}
 
@@ -1500,12 +1646,23 @@ def _sanitize_all_secrets(text, secrets=None):
         for s in secrets:
             if s and isinstance(s, str):
                 raw = s.strip()
-                if len(raw) >= 4:
+                if raw:
                     res = res.replace(s, "[REDACTED]")
                     res = res.replace(raw, "[REDACTED]")
     res = re.sub(r"(Bearer\s+)[^\s,'\"\\]+", r"\1[REDACTED]", res, flags=re.IGNORECASE)
     res = re.sub(r"\bsk-[A-Za-z0-9_-]{16,}\b", "[REDACTED]", res)
     return res
+
+
+def sanitize_secret_values(value, secrets):
+    if isinstance(value, str):
+        return _sanitize_all_secrets(value, secrets)
+    if isinstance(value, dict):
+        return {_sanitize_all_secrets(key, secrets): sanitize_secret_values(item, secrets)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_secret_values(item, secrets) for item in value]
+    return value
 
 
 def retired_secrets(config):
@@ -1522,50 +1679,143 @@ def retired_secrets(config):
     return [(name, os.environ[name]) for name in names if os.environ.get(name) and os.environ[name].strip()]
 
 
+def windows_user_secret(name):
+    """Read a persisted User environment value without spawning a shell."""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
+                value, _ = winreg.QueryValueEx(key, name)
+                return value if isinstance(value, str) else None
+        except (OSError, ImportError):
+            pass
+    return None
+
+
+def muse_auth_mode(args, *, activity_execution=False):
+    selected = getattr(args, "muse_auth", None)
+    if selected is not None:
+        if selected != "api":
+            raise ValueError("--muse-auth only supports explicit api selection")
+        if getattr(args, "provider", None) != "muse":
+            raise ValueError("--muse-auth api requires --provider muse")
+        if getattr(args, "profile", None) and not activity_execution:
+            raise ValueError("Choose one of --profile or --provider muse with --muse-auth api")
+    return selected or "stored"
+
+
+def get_meta_api_key():
+    # An explicitly blank process override fails closed, even if User has a key.
+    value = os.environ.get("META_API_KEY")
+    if value is None:
+        value = windows_user_secret("META_API_KEY")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def muse_secrets(config):
-    """Known Muse API-key overrides are excluded from every external child."""
-    names = {"META_API_KEY", "MUSE_API_KEY", "META_MODEL_API_KEY"}
+    """Protect both process and persisted Muse credentials, including custom names."""
+    names = {"META_API_KEY", "MUSE_API_KEY", "META_MODEL_API_KEY", "MODEL_API_KEY"}
     providers = config.get("providers", {}) if isinstance(config, dict) else {}
     muse = providers.get("muse", {}) if isinstance(providers, dict) else {}
     if isinstance(muse, dict) and isinstance(muse.get("api_key_env"), str):
         names.add(muse["api_key_env"])
-    return [(name, os.environ[name]) for name in names if os.environ.get(name) and os.environ[name].strip()]
+    return [(name, value) for name in names
+            for value in (os.environ.get(name), windows_user_secret(name))
+            if isinstance(value, str) and value.strip()]
 
 
 def framework_secrets(config):
     """Credentials used by framework helpers, never by execution-provider children."""
-    secrets = dict(retired_secrets(config) + muse_secrets(config))
+    secrets = retired_secrets(config) + muse_secrets(config)
     # Anthropic API credentials (including a host-only overflow key) belong to
     # the Claude host, never to subscription CLI children of any vendor.
     for name in ("TYPESAFE_API_KEY", *ANTHROPIC_SECRET_ENV):
         if os.environ.get(name, "").strip():
-            secrets[name] = os.environ[name]
-    return list(secrets.items())
+            secrets.append((name, os.environ[name]))
+    return secrets
 
 
 ANTHROPIC_SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY")
 CLAUDE_OAUTH_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 
 
-def redaction_secrets(config):
+def get_inception_api_key():
+    key = os.environ.get("INCEPTION_API_KEY")
+    if key and key.strip():
+        return key.strip()
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as rkey:
+                val, _ = winreg.QueryValueEx(rkey, "INCEPTION_API_KEY")
+                if val and str(val).strip():
+                    return str(val).strip()
+        except (OSError, FileNotFoundError):
+            pass
+    return None
+
+
+def redaction_secrets(config, *, mercury=False):
     """Secret values never persisted in artifacts, including ones a child legitimately receives."""
     secrets = [value.strip() for _, value in framework_secrets(config)]
     if os.environ.get(CLAUDE_OAUTH_ENV, "").strip():
         secrets.append(os.environ[CLAUDE_OAUTH_ENV].strip())
-    return secrets
+    inception_key = get_inception_api_key()
+    if inception_key:
+        secrets.append(inception_key)
+    # Known credential values can occur in otherwise ordinary source files.
+    if mercury:
+        for name, value in os.environ.items():
+            if re.search(r"(?i)(api_?key|secret|password|token)", name) and value.strip():
+                secrets.append(value.strip())
+    return list(dict.fromkeys(secrets))
+
+
+class UnsafeSecretError(ValueError):
+    """A secret cannot be redacted without corrupting framework control text."""
+
+
+def validate_redaction_secrets(secrets):
+    # Tiny values can occur inside protocol fields, status names and paths.
+    # Refuse a run instead of silently rewriting control data or leaking them.
+    control_labels = (
+        "completed", "provider_error", "setup_error", "state_error", "uncertain_exit",
+        "fallback_required", "blocked_pending_run", "all_routes_unavailable", "permission_denied",
+        "available_to_try", "skipped_account_block", "skipped_duplicate_route", "review_reason_required",
+        "operator_resolved_child", "unreadable", "timeout", "cancelled", "running", "resolved",
+        "unresolved", "launching", "recorded", "disabled", "failed", "blocked", "dry_run",
+        "terminal_established", "fallback_authorized", "fallback_blocked_by_pending", "muse_auth",
+        "same_provider_review", "stream_terminal_seen", "review_effort", "review_reason",
+        "quota_path", "cached_evidence", "pending_path", "progress_path", "started_at", "finished_at",
+        "provider", "model", "status", "attempts", "result", "error_codes", "evidence", "activity",
+    )
+    for value in secrets:
+        if isinstance(value, str):
+            raw = value.strip()
+            if raw and (len(raw) < 8 or any(raw in label for label in control_labels)):
+                raise UnsafeSecretError("A configured credential is too short or overlaps framework control text; replace it with a full credential.")
 
 
 def child_environment(config, provider_name):
     """Keep helper credentials out of external execution-provider environments."""
     env = dict(os.environ)
+    env.pop("MERCURY_REDACTION_DIGESTS", None)
+    if provider_name == "inception":
+        # One-way filters carry host secret identities, never host credentials.
+        by_length = {}
+        for value in redaction_secrets(config, mercury=True):
+            by_length.setdefault(len(value), []).append(hashlib.sha256(value.encode()).hexdigest())
+        env["MERCURY_REDACTION_DIGESTS"] = json.dumps(list(by_length.items()))
     env.pop("FRAMEWORK_PARENT_RUN_ID", None)
     # Host instruction files (for example ~/.claude/CLAUDE.md) can reach a
     # child CLI. This marker tells host policy that the process is a bounded
     # worker, not the primary orchestrator; orchestration launches override it.
     env["FRAMEWORK_DISPATCHED_WORKER"] = "1"
     env.pop("TYPESAFE_API_KEY", None)
-    for name in ("META_API_KEY", "MUSE_API_KEY", "META_MODEL_API_KEY"):
+    for name in ("META_API_KEY", "MUSE_API_KEY", "META_MODEL_API_KEY", "MODEL_API_KEY"):
         env.pop(name, None)
+    if provider_name != "inception":
+        env.pop("INCEPTION_API_KEY", None)
     if provider_name == "openai":
         # The desktop host exports IPC, permission and task-session controls as
         # CODEX_* variables. A nested Codex CLI must keep only CODEX_HOME for
@@ -1599,6 +1849,72 @@ def child_environment(config, provider_name):
     return env
 
 
+def helper_environment(config=None, secrets=None):
+    """Keep provider credentials out of local discovery and cleanup helpers."""
+    config = config or {}
+    env = child_environment(config, "helper")
+    values = [value.strip() for value in (secrets if secrets is not None else redaction_secrets(config))
+              if isinstance(value, str) and value.strip()]
+    for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "CODEX_BASE_URL"):
+        value = env.pop(name, None)
+        if name.endswith("API_KEY") and isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    for name, value in list(env.items()):
+        if (re.search(r"(?i)(api_?key|secret|password|token|(?:^|_)key(?:_|$))", name) or
+                isinstance(value, str) and any(secret in value for secret in values)):
+            env.pop(name, None)
+    return env
+
+
+def mercury_clean(value, secrets):
+    try:
+        from mercury_reader import redact_text
+    except ImportError:
+        from scripts.mercury_reader import redact_text
+    if isinstance(value, str):
+        return redact_text(value, secrets or ())
+    if isinstance(value, dict):
+        return {mercury_clean(key, secrets): mercury_clean(item, secrets) for key, item in value.items()}
+    if isinstance(value, list):
+        return [mercury_clean(item, secrets) for item in value]
+    return value
+
+
+def sanitize_mercury_artifacts(output, secrets):
+    for path in Path(output).iterdir():
+        if path.suffix not in ('.json', '.txt', '.log') or not path.is_file() or path.is_symlink():
+            continue
+        # Adapter output is bounded. Oversized framework evidence is omitted
+        # instead of loading an arbitrary git diff into memory for sanitizing.
+        with path.open('rb') as source:
+            content = source.read(4 * 1024 * 1024 + 1)
+        if len(content) > 4 * 1024 * 1024:
+            cleaned = '[Artifact omitted: size ceiling exceeded]\n'
+        else:
+            text = content.decode('utf-8', errors='replace')
+            if path.suffix == '.json':
+                try:
+                    cleaned = json.dumps(mercury_clean(json.loads(text), secrets), indent=2)
+                except ValueError:
+                    cleaned = mercury_clean(text, secrets)
+            elif path.name == 'stdout.log':
+                lines = []
+                for line in text.splitlines():
+                    try:
+                        lines.append(json.dumps(mercury_clean(json.loads(line), secrets)))
+                    except ValueError:
+                        lines.append(mercury_clean(line, secrets))
+                cleaned = '\n'.join(lines) + '\n'
+            else:
+                cleaned = mercury_clean(text, secrets)
+        temporary = path.with_name(str(uuid.uuid4()) + '.tmp')
+        try:
+            temporary.write_text(cleaned, encoding='utf-8', newline='')
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def sanitize_run_artifacts(output, secrets):
     if not Path(output).exists():
         return []
@@ -1607,7 +1923,7 @@ def sanitize_run_artifacts(output, secrets):
     for secret in secrets or ():
         if secret and isinstance(secret, str):
             stripped = secret.strip()
-            if len(stripped) >= 4:
+            if stripped:
                 exact.add(secret.encode("utf-8"))
                 exact.add(stripped.encode("utf-8"))
     exact_pattern = None
@@ -1706,8 +2022,7 @@ def sanitize_run_artifacts(output, secrets):
     return errors
 
 
-def quota_state(state_dir, provider):
-    path = quota_path(state_dir, provider)
+def _read_quota_state(path):
     try:
         state = read_json(path)
         retry = state.get("retry_at") if isinstance(state, dict) else None
@@ -1721,7 +2036,59 @@ def quota_state(state_dir, provider):
         return None, str(exc)
 
 
-def quota_record(provider, error, state_dir, logs, config, model=None, muse_profile=None, effort=None):
+def _quota_records(state_dir, provider, muse_auth="stored"):
+    paths = [(quota_path(state_dir, provider, muse_auth=muse_auth), None)]
+    if provider == "gemini":
+        paths += [(quota_path(state_dir, provider, "account"), "account")]
+        paths += [(quota_path(state_dir, provider, family), family) for family in ANTIGRAVITY_FAMILIES]
+    records = []
+    for path, expected in paths:
+        state, error = _read_quota_state(path)
+        if error:
+            return [], f"{path}: {error}"
+        if state is None:
+            continue
+        try:
+            if state.get("provider", provider) != provider:
+                raise ValueError("Quota provider does not match its state file")
+            if provider == "muse" and state.get("muse_auth", muse_auth) != muse_auth:
+                raise ValueError("Muse quota auth mode does not match its state file")
+            family = quota_family(state) if provider == "gemini" else None
+            if expected and (family or "account") != expected:
+                raise ValueError("Quota scope does not match its state file")
+        except ValueError as exc:
+            return [], f"{path}: {exc}"
+        records.append((path, state, family))
+    return records, None
+
+
+def _gemini_quota_view(path, state, family):
+    return {**state, "quota_scope": "model_family" if family else "account",
+            "model_family": family, "quota_path": str(path)}
+
+
+def _muse_quota_view(path, state, muse_auth):
+    return {**state, "muse_auth": muse_auth, "quota_path": str(path)}
+
+
+def quota_state(state_dir, provider, model=None, muse_auth="stored"):
+    records, error = _quota_records(state_dir, provider, muse_auth)
+    if error:
+        return None, error
+    requested = antigravity_family(model) if provider == "gemini" else None
+    applicable = [(path, state, family) for path, state, family in records
+                  if family is None or requested is None or family == requested]
+    if not applicable:
+        return None, None
+    path, state, family = max(applicable, key=lambda record: record[1]["retry_at"])
+    if provider == "gemini":
+        state = _gemini_quota_view(path, state, family)
+    elif provider == "muse":
+        state = _muse_quota_view(path, state, muse_auth)
+    return state, None
+
+
+def quota_record(provider, error, state_dir, logs, config, model=None, muse_profile=None, effort=None, muse_auth="stored", secrets=None):
     observed = time.time()
     retry, reason = retry_at(error, quota_cooldown(config), observed)
     reset = retry if reason == "provider_reset" else None
@@ -1737,22 +2104,43 @@ def quota_record(provider, error, state_dir, logs, config, model=None, muse_prof
         state["muse_profile"] = muse_profile
     if provider == "muse" and effort is not None:
         state["effort"] = effort
-    existing, state_error = quota_state(state_dir, provider)
+    if provider == "muse":
+        state["muse_auth"] = muse_auth
+    family = individual_quota_family(model, error) if provider == "gemini" and logs != "operator" else None
+    if provider == "gemini":
+        state.update(quota_scope="model_family" if family else "account", model_family=family)
+    records, state_error = _quota_records(state_dir, provider, muse_auth)
     if state_error:
         raise ValueError("Refusing to overwrite malformed quota state: " + state_error)
-    if existing and existing.get("retry_at", 0) > observed and existing.get("retry_at", 0) > retry:
-        return existing
-    write_json(quota_path(state_dir, provider), state)
-    return state
+    matching = [record for record in records if record[2] == family]
+    existing = max(matching, key=lambda record: record[1]["retry_at"]) if matching else None
+    if existing and existing[1].get("retry_at", 0) > observed and existing[1].get("retry_at", 0) > retry:
+        old_path, old_state, old_family = existing
+        if provider == "muse":
+            return _muse_quota_view(old_path, old_state, muse_auth)
+        return _gemini_quota_view(old_path, old_state, old_family) if provider == "gemini" else old_state
+    path = quota_path(state_dir, provider, family, muse_auth)
+    if provider == "gemini" and family is None and any(
+            old_path == path and old_family is not None for old_path, _, old_family in records):
+        # A pre-family cache is evidence owned by the operator. Keep its bytes.
+        path = quota_path(state_dir, provider, "account")
+    redactions = redaction_secrets(config, mercury=provider == "inception")
+    redactions.extend(secrets or [])
+    state = sanitize_secret_values(state, redactions)
+    write_json(path, state)
+    if provider == "muse":
+        return _muse_quota_view(path, state, muse_auth)
+    return _gemini_quota_view(path, state, family) if provider == "gemini" else state
 
 
-def stop_process(process):
+def stop_process(process, helper_env=None):
     evidence = {"tree_termination_attempted": True, "tree_termination_outcome": "unknown",
                 "tree_cessation_verified": False}
     if os.name == "nt":
         try:
             run = subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                                 capture_output=True, timeout=30, check=False)
+                                 capture_output=True, timeout=30, check=False,
+                                 env=helper_env if helper_env is not None else helper_environment())
             evidence["tree_termination_outcome"] = "taskkill_exit_" + str(run.returncode)
         except Exception as exc:
             evidence["tree_termination_outcome"] = "taskkill_error: " + str(exc)
@@ -2039,8 +2427,47 @@ def update_progress(state, value, observed_at):
         update_claude_progress(state, value, observed_at)
     elif provider == "openai":
         update_openai_progress(state, value, observed_at)
+    elif provider == "inception":
+        update_mercury_progress(state, value, observed_at)
     else:
         update_gemini_progress(state, value, observed_at)
+
+
+def update_mercury_progress(state, value, observed_at):
+    """Summarize Mercury JSONL telemetry events."""
+    if not isinstance(value, dict):
+        return
+    if state.get("mercury_terminal"):
+        state["mercury_terminal_invalid"] = True
+    state["event_count"] += 1
+    event = value.get("event") or value.get("type")
+    summary = compact_label(event, default="unknown", limit=80)
+    state["last_event"] = {"event": event, "summary": summary}
+    state["last_event_at"] = observed_at
+    if "usage" in value and isinstance(value["usage"], dict):
+        state["usage"] = compact_usage(value["usage"])
+    elif "tokens" in value and isinstance(value["tokens"], dict):
+        state["usage"] = compact_usage(value["tokens"])
+    if event == "mercury.tool_call":
+        tool_name = value.get("tool") or "tool"
+        state["active_step"] = {"step_type": "tool", "tool_name": tool_name, "summary": f"tool {tool_name}"}
+    elif event == "mercury.tool_result":
+        tool_name = value.get("tool") or "tool"
+        state["completed_steps"].add(("tool", tool_name, state["event_count"]))
+        state["active_step"] = None
+        state["last_event"] = {"event": event, "summary": f"tool {tool_name} DONE"}
+    elif event == "mercury.terminal":
+        term_status = value.get("status") or value.get("terminal")
+        state["mercury_terminal"] = {
+            "status": term_status,
+            "terminal": value.get("terminal"),
+            "final_parse_valid": value.get("final_parse_valid", False),
+            "response": value.get("response") or value.get("final_text") or "",
+            "error": value.get("error") or "",
+            "tokens": value.get("tokens") or value.get("usage") or {}
+        }
+        state["terminal"] = {"status": term_status, "summary": f"mercury {term_status}"}
+        state["active_step"] = None
 
 
 def update_openai_progress(state, value, observed_at):
@@ -2121,7 +2548,7 @@ def progress_snapshot(state, started_wall, started_monotonic, adapter_state):
         "conversation_id": state["conversation_id"],
     }
     if state.get("provider") == "muse":
-        for key in ("muse_profile", "model", "effort"):
+        for key in ("muse_profile", "model", "effort", "muse_auth", "quota_path"):
             if state.get(key) is not None:
                 snapshot[key] = state[key]
     return snapshot
@@ -2208,7 +2635,9 @@ def refresh_progress(output, state, started_wall, started_monotonic,
     if final:
         new_events += _consume_progress_chunk(state, b"", observed_at, final=True)
 
-    snapshot = progress_snapshot(state, started_wall, started_monotonic, adapter_state)
+    snapshot = sanitize_secret_values(
+        progress_snapshot(state, started_wall, started_monotonic, adapter_state),
+        state.get("_redaction_secrets", []))
     if new_events or final or state["malformed_event_count"] != malformed_before:
         write_json(Path(output) / "progress.json", snapshot)
     return snapshot, new_events
@@ -2304,6 +2733,7 @@ def heartbeat(output, provider_name, provider, process, state, started_wall, sta
     now = time.time()
     muse_meta = {}
     if provider_name == "muse":
+        muse_meta["muse_auth"] = provider.get("muse_auth", "stored")
         if provider.get("muse_profile"):
             muse_meta["muse_profile"] = provider["muse_profile"]
         muse_meta["effort"] = provider.get("effort", "medium")
@@ -2360,13 +2790,7 @@ def safe_heartbeat(result, *args):
 
 
 def git_evidence(workspace, output, secrets=None):
-    environment = dict(os.environ)
-    secret_values = {value.strip() for value in (secrets or [])
-                     if isinstance(value, str) and value.strip()}
-    if secret_values:
-        for name, value in list(environment.items()):
-            if isinstance(value, str) and value.strip() in secret_values:
-                environment.pop(name, None)
+    environment = helper_environment(secrets=secrets or [])
     paths = {}
     for name, args in (("status", ["status", "--short"]),
                        ("diff", ["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"]),
@@ -2383,6 +2807,7 @@ def git_evidence(workspace, output, secrets=None):
 
 
 def execute(args):
+    muse_auth = muse_auth_mode(args, activity_execution=bool(getattr(args, "activity", None)))
     workspace = Path(args.workspace).resolve(strict=True)
     if not workspace.is_dir():
         raise ValueError("Workspace must be a directory")
@@ -2402,6 +2827,8 @@ def execute(args):
         expected_role = "implement" if activity in WRITE_ACTIVITIES else "review"
         if args.role != expected_role or config["profiles"][args.profile]["provider"] != provider_name:
             raise ValueError("Activity role/profile/provider mismatch")
+        if provider_name == "inception" and activity != "exploration":
+            raise ValueError(f"Inception provider only supports exploration activity; got {activity}")
     elif getattr(args, "profile", None):
         raise ValueError("--profile is only valid with dispatch")
     if not activity and args.role == "review" and provider_name != "claude":
@@ -2414,11 +2841,14 @@ def execute(args):
     require_muse_profile_allowed(muse_profile_arg, provider_name, role=args.role)
     muse_meta = {}
     if activity:
-        _, provider = effective_activity_provider(config, args.profile)
+        _, provider = effective_activity_provider(config, args.profile, muse_auth)
     elif provider_name == "muse":
-        provider, muse_meta = resolve_muse_profile(config, muse_profile_arg)
+        provider, muse_meta = resolve_muse_profile(config, muse_profile_arg, muse_auth)
     else:
         provider = config["providers"][provider_name]
+    if provider_name == "muse":
+        provider = {**provider, "muse_auth": muse_auth}
+        muse_meta["muse_auth"] = muse_auth
     timeout, termination_grace, heartbeat_seconds = provider_timing(config, provider_name, provider=provider)
     review_effort_arg = getattr(args, "review_effort", None)
     review_reason_arg = getattr(args, "review_reason", None)
@@ -2460,6 +2890,11 @@ def execute(args):
         raise ValueError("Orchestration requires explicit owned_paths")
     owned_claims = [os.path.normcase(str((workspace / path).resolve())) for path in owned_paths]
     state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state")).resolve()
+    if provider_name == "muse":
+        muse_meta["quota_path"] = str(quota_path(state_dir, provider_name, muse_auth=muse_auth))
+    secrets = redaction_secrets(config, mercury=provider_name == "inception")
+    validate_redaction_secrets(secrets)
+    safe_helper_env = helper_environment(config, secrets)
     prompt = prompt_for(workspace, args.task_file, task, activity=activity)
     if activity == "orchestration":
         prompt += ("\nDISPATCH COMMAND: " + sys.executable + " " + str(Path(__file__).resolve()) +
@@ -2474,7 +2909,8 @@ def execute(args):
         prompt += "\nPrevious route attempts (preserve partial edits and finish remaining checks):\n" + json.dumps(args.prior_context)
     if args.dry_run:
         command = command_for(args.role, provider, prompt, timeout, workspace, review_effort or "medium", provider_name=provider_name,
-                              output_dir=workspace / ".llm-output", activity=activity, state_dir=state_dir)
+                              output_dir=workspace / ".llm-output", activity=activity, state_dir=state_dir,
+                              helper_env=safe_helper_env)
         dry_run_meta = {"status": "dry_run", "provider": provider_name, "model": provider["model"],
                         **muse_meta,
                         "cwd": str(workspace), "command": command, "state_dir": str(state_dir),
@@ -2486,23 +2922,31 @@ def execute(args):
             dry_run_meta["review_reason"] = review_reason
         if jev_meta is not None:
             dry_run_meta["jev"] = jev_meta
-        return dry_run_meta, 0
+        return sanitize_secret_values(dry_run_meta, secrets), 0
 
-    secrets = redaction_secrets(config)
+    meta_api_key = get_meta_api_key() if provider_name == "muse" and muse_auth == "api" else None
+    if provider_name == "muse" and muse_auth == "api" and not meta_api_key:
+        raise ValueError("--muse-auth api requires a nonempty META_API_KEY in the process or Windows User environment")
+    if meta_api_key:
+        secrets.append(meta_api_key)
+    if provider_name == "muse" and activity != "orchestration":
+        prompt += "\nExecute this bounded task yourself. Do not spawn subagents or invoke another AI provider.\n"
+    if any(isinstance(value, str) and value.strip() and value.strip() in prompt for value in secrets):
+        raise UnsafeSecretError("The task text overlaps a protected credential; remove it before dispatching.")
+    if provider_name == "inception":
+        prompt = mercury_clean(prompt, secrets)
     # Command construction itself is deliberately side-effect free.
     output = workspace / ".llm-output" / "agent-framework" / str(uuid.uuid4())
     output.mkdir(parents=True, exist_ok=True)
     # Avoid Windows' command-line length limit; providers have a Read tool.
     prompt_path = output / "prompt.txt"
-    if provider_name == "muse" and activity != "orchestration":
-        prompt += "\nExecute this bounded task yourself. Do not spawn subagents or invoke another AI provider.\n"
     prompt_path.write_text(prompt, encoding="utf-8")
     run_prompt = (f"Read the complete task contract and instructions in {prompt_path} and follow them. " +
                   ("Use the shared framework dispatcher for authorized child tasks and wait for their results." if activity == "orchestration" else
                    "Execute the task yourself; never spawn subagents or use another AI provider."))
     command = command_for(args.role, provider, run_prompt,
                           timeout, workspace, review_effort or "medium", provider_name=provider_name, output_dir=output,
-                          activity=activity, state_dir=state_dir)
+                          activity=activity, state_dir=state_dir, helper_env=safe_helper_env)
     result = {"provider": provider_name, "model": provider["model"], **muse_meta, "logs": str(output),
               "soft_timeout_seconds": timeout, "termination_grace_seconds": termination_grace,
               "outer_timeout_seconds": timeout + termination_grace,
@@ -2521,7 +2965,7 @@ def execute(args):
                          "gemini.lock" if claims_writer else "quota.lock")
     try:
         with lock as release_claim_lock:
-            state_path = quota_path(state_dir, provider_name)
+            state_path = quota_path(state_dir, provider_name, muse_auth=muse_auth)
             pending_path = workspace_state / "gemini-pending" / (str(uuid.uuid4()) + ".json")
             if args.role == "implement":
                 pending_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2563,8 +3007,12 @@ def execute(args):
                                       error="An unresolved orchestrator owns overlapping paths")
                         release_claim_lock()
                         return finish(result, output, workspace, 1, secrets=secrets)
-            if provider_name in ("gemini", "claude", "muse", "openai"):
-                state, state_error = quota_state(state_dir, provider_name)
+            if provider_name in ("gemini", "claude", "muse", "openai", "inception"):
+                if provider.get("enabled", True) is False:
+                    result.update(status="disabled", fallback=quota_fallback(provider_name, config))
+                    release_claim_lock()
+                    return finish(result, output, workspace, 20, secrets=secrets)
+                state, state_error = quota_state(state_dir, provider_name, provider["model"], muse_auth)
                 if state_error:
                     result.update(status="state_error", fallback=luna_fallback() if provider_name == "gemini" else quota_fallback(provider_name, config),
                                   quota_path=str(state_path), error="Malformed or unreadable quota state: " + state_error)
@@ -2602,11 +3050,14 @@ def execute(args):
                 started_wall = None
                 started_monotonic = None
                 stream_state = new_progress_state(provider_name)
+                stream_state["_redaction_secrets"] = secrets
                 if muse_meta:
                     stream_state.update(muse_meta)
                 progress_snapshot = None
                 try:
                     child_env = child_environment(config, provider_name)
+                    if meta_api_key:
+                        child_env["META_API_KEY"] = meta_api_key
                     if orchestration_id:
                         child_env["FRAMEWORK_PARENT_RUN_ID"] = orchestration_id
                         child_env["FRAMEWORK_DISPATCHED_WORKER"] = "orchestration"
@@ -2675,7 +3126,7 @@ def execute(args):
                         cleanup_error = None
                         cleanup_evidence = {"tree_termination_attempted": True, "tree_termination_outcome": "unknown", "tree_cessation_verified": False}
                         try:
-                            cleanup_evidence = stop_process(process)
+                            cleanup_evidence = stop_process(process, helper_env=safe_helper_env)
                         except BaseException as cleanup_exc:
                             cleanup_error = str(cleanup_exc)
                         if started_wall is not None:
@@ -2714,7 +3165,7 @@ def execute(args):
                                 result["pending_write_error"] = str(pending_exc)
                     elif args.role == "implement" and isinstance(exc, OSError):
                         # Popen raised before returning a process: no writer was launched.
-                        write_json(pending_path, {"status": "resolved", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "launch_error": str(exc), "provider": provider_name, **muse_meta})
+                        write_json(pending_path, {"status": "resolved", "workspace": str(workspace), "owned_paths": owned_paths, "logs": str(output), "launch_error": _sanitize_all_secrets(str(exc), secrets), "provider": provider_name, **muse_meta})
                         result.pop("_claim_unresolved", None)
                     raise
 
@@ -2729,8 +3180,6 @@ def execute(args):
             stderr_file = output / "stderr.log"
             stdout_text, stdout_truncated = read_text_tail(stdout_file)
             stderr_text, stderr_truncated = read_text_tail(stderr_file)
-            stdout_text = _sanitize_all_secrets(stdout_text, secrets)
-            stderr_text = _sanitize_all_secrets(stderr_text, secrets)
 
             gemini_output = None
             claude_output = None
@@ -2755,10 +3204,6 @@ def execute(args):
                 valid_success = successful_response(provider_output_text, "review")
             elif provider_name == "muse":
                 muse_terminal = stream_state.get("muse_terminal")
-                if muse_terminal:
-                    muse_terminal = {**muse_terminal,
-                                     "text": _sanitize_all_secrets(muse_terminal["text"], secrets),
-                                     "reason": _sanitize_all_secrets(muse_terminal["reason"], secrets)}
                 muse_terminal_coherent = bool(muse_terminal and
                     ((muse_terminal.get("terminal") == "completed" and code == 0) or
                      (muse_terminal.get("terminal") in ("failed", "cancelled") and code != 0)))
@@ -2773,11 +3218,51 @@ def execute(args):
                 else:
                     provider_output_text = ""
                     valid_success = False
+            elif provider_name == "inception":
+                mercury_terminal = stream_state.get("mercury_terminal") if stream_state else None
+                mercury_json_file = output / "mercury-result.json"
+                if not mercury_terminal and mercury_json_file.exists():
+                    try:
+                        with mercury_json_file.open('rb') as source:
+                            data = source.read(2 * 1024 * 1024 + 1)
+                        if len(data) > 2 * 1024 * 1024:
+                            raise ValueError('Mercury result size ceiling exceeded')
+                        m_data = json.loads(data)
+                        mercury_terminal = {
+                            "status": m_data.get("status"),
+                            "terminal": m_data.get("terminal"),
+                            "final_parse_valid": m_data.get("final_parse_valid", False),
+                            "response": m_data.get("final_text") or "",
+                            "error": m_data.get("errors", [""])[0] if m_data.get("errors") else "",
+                            "tokens": m_data.get("tokens", {})
+                        }
+                    except Exception:
+                        pass
+                mercury_terminal_coherent = bool(
+                    mercury_terminal and
+                    not stream_state.get("mercury_terminal_invalid") and
+                    not stream_state.get("malformed_event_count") and
+                    mercury_terminal.get("terminal") == mercury_terminal.get("status") and
+                    ((mercury_terminal.get("status") == "completed" and mercury_terminal.get("final_parse_valid") is True and code == 0) or
+                     (mercury_terminal.get("status") == "quota_exhausted" and mercury_terminal.get("final_parse_valid") is False and code == 20) or
+                     (mercury_terminal.get("status") in ("failed", "error", "auth_error", "model_error", "timeout", "budget_exhausted", "rate_limit_error", "length_truncated", "setup_error") and mercury_terminal.get("final_parse_valid") is False and code == 1))
+                )
+                if mercury_terminal_coherent:
+                    if mercury_terminal.get("status") == "completed":
+                        provider_output_text = json.dumps({"status": "SUCCESS", "response": mercury_terminal.get("response", "")})
+                        valid_success = bool(mercury_terminal.get("response", "").strip()) and code == 0
+                    else:
+                        err_msg = mercury_terminal.get("error") or mercury_terminal.get("status") or "Mercury run failed"
+                        provider_output_text = json.dumps({"status": "FAILED", "error": {"message": err_msg}})
+                        valid_success = False
+                else:
+                    provider_output_text = ""
+                    valid_success = False
             else:
                 valid_success = successful_response(stdout_text, args.role)
 
             errors = error_objects(provider_output_text)
-            if provider_name not in ("muse", "openai"):
+            if provider_name not in ("muse", "openai", "inception"):
                 errors += error_objects(stderr_text)
             if provider_name in ("gemini", "claude", "openai") and (gemini_output is None if provider_name == "gemini" else claude_output is None if provider_name == "claude" else codex_terminal is None):
                 errors.extend(error for error in stream_errors if isinstance(error, dict))
@@ -2786,20 +3271,19 @@ def execute(args):
             # terminal event. Either case prevents stderr from establishing a
             # standalone terminal failure.
             plain_error = None if stderr_truncated or stdout_truncated else plain_terminal_error(stderr_text, code)
-            if provider_name == "muse" and plain_error and plain_error.get("code") != "CLI_SETUP_ERROR":
+            if provider_name in ("muse", "inception") and plain_error and plain_error.get("code") != "CLI_SETUP_ERROR":
                 plain_error = None
             provider_without_terminal = (
                 (provider_name == "openai" and codex_terminal is None) or
                 (provider_name == "gemini" and gemini_output is None and not gemini_result_event) or
                 (provider_name == "claude" and claude_output is None and not claude_result_event) or
-                (provider_name == "muse" and not muse_terminal_coherent)
+                (provider_name == "muse" and not muse_terminal_coherent) or
+                (provider_name == "inception" and not mercury_terminal_coherent)
             )
             plain_error_applies = plain_error
-            if provider_name == "muse" and stdout_text.strip():
+            if provider_name in ("muse", "openai", "inception") and stdout_text.strip():
                 plain_error_applies = None
-            if provider_name == "openai" and stdout_text.strip():
-                plain_error_applies = None
-            if provider_name in ("gemini", "claude", "muse", "openai") and stdout_text.strip() and not provider_without_terminal:
+            if provider_name in ("gemini", "claude", "muse", "openai", "inception") and stdout_text.strip() and not provider_without_terminal:
                 # A malformed event=result is not repaired by unrelated stderr;
                 # keep ownership unresolved instead of authorizing a fallback.
                 plain_error_applies = None
@@ -2807,18 +3291,21 @@ def execute(args):
                 errors.append(plain_error_applies)
             denied = permission_denials(provider_output_text)
             complete_failure = complete_terminal_failure(provider_output_text)
-            if (provider_name != "muse" and (not stdout_text.strip() or provider_without_terminal) and
+            if (provider_name not in ("muse", "inception") and (not stdout_text.strip() or provider_without_terminal) and
                     not stderr_truncated and not stdout_truncated):
                 complete_failure = complete_failure or complete_terminal_failure(stderr_text)
             terminal_established = (denied or valid_success or plain_error_applies is not None or
                                     (provider_name in ("gemini", "claude") and complete_failure) or
                                     (provider_name == "openai" and codex_terminal is not None) or
-                                    (provider_name == "muse" and muse_terminal_coherent))
+                                    (provider_name == "muse" and muse_terminal_coherent) or
+                                    (provider_name == "inception" and mercury_terminal_coherent))
             result["terminal_established"] = bool(terminal_established)
             if provider_name == "openai":
                 result["stream_terminal_seen"] = codex_seen
             elif provider_name == "muse":
                 result["stream_terminal_seen"] = muse_terminal is not None
+            elif provider_name == "inception":
+                result["stream_terminal_seen"] = mercury_terminal is not None
             elif provider_name in ("gemini", "claude"):
                 result["stream_terminal_seen"] = gemini_result_event if provider_name == "gemini" else claude_result_event
             if args.role == "implement":
@@ -2841,6 +3328,7 @@ def execute(args):
                 return finish(result, output, workspace, 1, secrets=secrets)
 
             quota = (muse_quota_error(muse_terminal) if provider_name == "muse" and muse_terminal_coherent else
+                     inception_quota_error(mercury_terminal, errors) if provider_name == "inception" and mercury_terminal_coherent else
                      quota_error(stream_errors if provider_name == "openai" else errors, provider_name)
                      if terminal_established and not valid_success else None)
             if quota:
@@ -2848,13 +3336,16 @@ def execute(args):
                     state = quota_record(provider_name, quota, state_dir, output, config,
                                          model=provider["model"],
                                          muse_profile=muse_meta.get("muse_profile"),
-                                         effort=muse_meta.get("effort"))
+                                         effort=muse_meta.get("effort"), muse_auth=muse_auth, secrets=secrets)
                 result.update(status="fallback_required", fallback=quota_fallback(provider_name, config), quota=state, cached=False)
                 return finish(result, output, workspace, 20, secrets=secrets)
             result.update(status="completed" if code == 0 and not errors and valid_success else "provider_error", exit_code=code)
             if result["status"] == "provider_error" and errors:
                 result["error"] = structured_error_message(errors)
                 result["error_codes"] = [str(error.get("code", error.get("status"))) for error in errors if error.get("code", error.get("status")) is not None]
+                # Keep retry classification on the unredacted in-memory result;
+                # finish() sanitizes all externally returned and saved values.
+                args._account_auth_failure = account_auth_error(result)
             if args.role == "implement" and not valid_success:
                 if not terminal_established:
                     result.update(status="uncertain_exit", fallback_authorized=False, fallback_blocked_by_pending=True)
@@ -2956,18 +3447,12 @@ def finish(result, output, workspace, code, secrets=None):
     try:
         for error in sanitize_run_artifacts(output, secrets):
             artifact_errors.append("artifact sanitization: " + error)
+        if result.get("provider") == "inception":
+            sanitize_mercury_artifacts(output, secrets)
+            result = mercury_clean(result, secrets)
     except Exception as exc:
         artifact_errors.append("artifact sanitization: " + str(exc))
-    if secrets:
-        def clean(value):
-            if isinstance(value, str):
-                return _sanitize_all_secrets(value, secrets)
-            if isinstance(value, dict):
-                return {key: clean(item) for key, item in value.items()}
-            if isinstance(value, list):
-                return [clean(item) for item in value]
-            return value
-        result = clean(result)
+    result = sanitize_secret_values(result, secrets)
     if artifact_errors:
         result["artifact_errors"] = artifact_errors
     try:
@@ -2978,12 +3463,14 @@ def finish(result, output, workspace, code, secrets=None):
 
 
 def cli_quota_status(args):
+    muse_auth = muse_auth_mode(args)
     config = read_json(args.config)
+    validate_redaction_secrets(redaction_secrets(config))
     if not isinstance(config, dict) or not isinstance(config.get("providers"), dict):
         raise ValueError("Routing configuration must contain a providers object")
     muse_profile_arg = getattr(args, "muse_profile", None)
     require_muse_profile_allowed(muse_profile_arg, getattr(args, "provider", None))
-    providers = [args.provider] if args.provider else [p for p in ("gemini", "claude", "muse", "openai") if p in config["providers"]]
+    providers = [args.provider] if args.provider else [p for p in ("gemini", "claude", "muse", "openai", "inception") if p in config["providers"]]
     state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
     output = {}
     code = 0
@@ -2998,17 +3485,24 @@ def cli_quota_status(args):
         muse_meta = {}
         if provider == "muse":
             try:
-                _, muse_meta = resolve_muse_profile(config, muse_profile_arg)
+                _, muse_meta = resolve_muse_profile(config, muse_profile_arg, muse_auth)
+                muse_meta["muse_auth"] = muse_auth
             except ValueError as exc:
                 output[provider] = {"provider": provider, "status": "state_error", "available_to_try": 0,
                                     "fallback": quota_fallback(provider, config), "error": str(exc)}
                 code = 1
                 continue
-        state, error = quota_state(state_dir, provider)
-        item = {"provider": provider, "model": muse_meta.get("model", config["providers"][provider].get("model")),
+        model = muse_meta.get("model", config["providers"][provider].get("model"))
+        state, error = quota_state(state_dir, provider, model, muse_auth)
+        item = {"provider": provider, "model": model,
                 **muse_meta,
-                "quota_path": str(quota_path(state_dir, provider)), "available_to_try": 1}
-        if error:
+                "quota_path": state.get("quota_path", str(quota_path(state_dir, provider, muse_auth=muse_auth))) if state else str(quota_path(state_dir, provider, muse_auth=muse_auth)),
+                "available_to_try": 1}
+        if config["providers"][provider].get("enabled", True) is False:
+            item.update(status="disabled", available_to_try=0)
+            if code == 0:
+                code = 20
+        elif error:
             fallback = quota_fallback(provider, config)
             item.update(status="state_error", available_to_try=0, fallback=fallback, error="Malformed or unreadable quota state: " + error)
             code = 1
@@ -3028,15 +3522,17 @@ def cli_quota_status(args):
         output[provider] = item
 
     if args.provider:
-        return output[args.provider], code
-    return {"providers": output}, code
+        return sanitize_secret_values(output[args.provider], redaction_secrets(config)), code
+    return sanitize_secret_values({"providers": output}, redaction_secrets(config)), code
 
 
 def cli_quota_set(args):
+    muse_auth = muse_auth_mode(args)
     config = read_json(args.config)
+    validate_redaction_secrets(redaction_secrets(config))
     quota_cooldown(config)
     provider = args.provider
-    if provider not in ("gemini", "claude", "muse", "openai"):
+    if provider not in ("gemini", "claude", "muse", "openai", "inception"):
         raise ValueError(f"quota-set only supports subscription quota providers; got '{provider}'")
     if provider not in config.get("providers", {}):
         raise ValueError("Provider is missing from config")
@@ -3044,7 +3540,8 @@ def cli_quota_set(args):
     require_muse_profile_allowed(muse_profile_arg, provider)
     muse_meta = {}
     if provider == "muse":
-        _, muse_meta = resolve_muse_profile(config, muse_profile_arg)
+        _, muse_meta = resolve_muse_profile(config, muse_profile_arg, muse_auth)
+        muse_meta["muse_auth"] = muse_auth
     reason = args.reason.strip() if isinstance(args.reason, str) else ""
     if not reason:
         raise ValueError("reason must be non-empty")
@@ -3063,16 +3560,20 @@ def cli_quota_set(args):
         state = quota_record(provider, error, state_dir, "operator", config,
                              model=muse_meta.get("model"),
                              muse_profile=muse_meta.get("muse_profile"),
-                             effort=muse_meta.get("effort"))
-    return {"status": "recorded", "provider": provider, **muse_meta, "quota": state, "quota_path": str(quota_path(state_dir, provider))}, 0
+                             effort=muse_meta.get("effort"), muse_auth=muse_auth)
+    return sanitize_secret_values({"status": "recorded", "provider": provider, **muse_meta, "quota": state,
+                                   "quota_path": state.get("quota_path", str(quota_path(state_dir, provider, muse_auth=muse_auth)))},
+                                  secret_values), 0
 
 
 def activity_status(args):
+    muse_auth = muse_auth_mode(args)
     if getattr(args, "muse_profile", None):
         raise ValueError("Activity status is local only and does not accept --muse-profile")
     if getattr(args, "profile", None) and getattr(args, "provider", None):
         raise ValueError("Choose one of --profile or --provider")
     config = read_json(args.config)
+    validate_redaction_secrets(redaction_secrets(config))
     chain = activity_routes(config, args.activity)
     if getattr(args, "profile", None):
         if args.profile not in chain:
@@ -3083,22 +3584,25 @@ def activity_status(args):
     if not chain:
         raise ValueError("No profiles match the requested activity/provider")
     state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
-    blocked = set()
     entries = []
     for name in chain:
-        provider_name, effective = effective_activity_provider(config, name)
-        state, error = quota_state(state_dir, provider_name)
+        provider_name, effective = effective_activity_provider(config, name, muse_auth)
+        state, error = quota_state(state_dir, provider_name, effective["model"], muse_auth)
+        path = str(quota_path(state_dir, provider_name, muse_auth=muse_auth))
         status = ("state_error" if error else "disabled" if config["providers"][provider_name].get("enabled", True) is False
                   else "fallback_required" if state and state.get("retry_at", 0) > time.time() else "available_to_try")
-        if status != "available_to_try":
-            blocked.add(provider_name)
         entries.append({"profile": name, "provider": provider_name, "model": effective["model"],
-                        "effort": effective["effort"], "status": status, "quota_path": str(quota_path(state_dir, provider_name)),
+                        "effort": effective["effort"], "status": status, "quota_path": path,
+                        **({"muse_auth": muse_auth} if provider_name == "muse" else {}),
+                        **({"quota": state, "quota_path": state.get("quota_path", path)} if state else {}),
                         **({"error": error} if error else {})})
-    return {"activity": args.activity, "routes": entries, "available_to_try": int(any(x["status"] == "available_to_try" for x in entries))}, 0
+    return sanitize_secret_values({"activity": args.activity, "routes": entries,
+                                   "available_to_try": int(any(x["status"] == "available_to_try" for x in entries))},
+                                  redaction_secrets(config)), 0
 
 
 def _dispatch_activity_core(args):
+    muse_auth = muse_auth_mode(args)
     config = read_json(args.config)
     if not args.activity:
         raise ValueError("dispatch requires --activity")
@@ -3131,8 +3635,9 @@ def _dispatch_activity_core(args):
     state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state"))
     attempts = []
     blocked = set()
+    attempted_api_routes = set()
     for name in chain:
-        provider_name, effective = effective_activity_provider(config, name)
+        provider_name, effective = effective_activity_provider(config, name, muse_auth)
         if (args.activity in ("independent_review", "security_review", "deep_review") and
                 effective.get("effort") in ("high", "xhigh", "max", "ultra") and
                 not (args.review_reason and args.review_reason.strip())):
@@ -3141,13 +3646,26 @@ def _dispatch_activity_core(args):
         if provider_name in blocked:
             attempts.append({"profile": name, "provider": provider_name, "status": "skipped_account_block"})
             continue
-        state, error = quota_state(state_dir, provider_name)
+        state, error = quota_state(state_dir, provider_name, effective["model"], muse_auth)
+        muse_meta = ({"muse_auth": muse_auth,
+                      "quota_path": str(quota_path(state_dir, provider_name, muse_auth=muse_auth))}
+                     if provider_name == "muse" else {})
         if error or (state and state.get("retry_at", 0) > time.time()) or config["providers"][provider_name].get("enabled", True) is False:
-            blocked.add(provider_name)
-            attempts.append({"profile": name, "provider": provider_name,
-                             "status": "state_error" if error else "fallback_required" if state else "disabled",
+            if error or not state or state.get("quota_scope") != "model_family" or config["providers"][provider_name].get("enabled", True) is False:
+                blocked.add(provider_name)
+            attempts.append({"profile": name, "provider": provider_name, **muse_meta,
+                             "status": "state_error" if error else "disabled" if config["providers"][provider_name].get("enabled", True) is False else "fallback_required",
+                             **({"quota": state} if state else {}),
                              **({"error": error} if error else {})})
             continue
+        if provider_name == "muse" and muse_auth == "api":
+            route_key = (effective["model"], effective["effort"])
+            if route_key in attempted_api_routes:
+                attempts.append({"profile": name, "provider": provider_name,
+                                 "model": effective["model"], **muse_meta,
+                                 "status": "skipped_duplicate_route"})
+                continue
+            attempted_api_routes.add(route_key)
         route_args = copy.copy(args)
         route_args.role = "implement" if args.activity in WRITE_ACTIVITIES else "review"
         route_args.activity = args.activity
@@ -3157,10 +3675,12 @@ def _dispatch_activity_core(args):
         route_args.muse_profile = None
         try:
             result, code = execute(route_args)
+        except UnsafeSecretError:
+            raise
         except (ValueError, KeyError, TypeError, OSError) as exc:
             # execute's prelaunch validation cannot leave a writer behind.
             result, code = {"status": "setup_error", "error": str(exc)}, 1
-        attempts.append({"profile": name, "provider": provider_name, "model": effective["model"],
+        attempts.append({"profile": name, "provider": provider_name, "model": effective["model"], **muse_meta,
                          "status": result.get("status"), "logs": result.get("logs"),
                          "error": result.get("error"), "evidence": result.get("evidence"),
                          "pending_path": result.get("pending_path")})
@@ -3169,25 +3689,31 @@ def _dispatch_activity_core(args):
                     "same_provider_review": bool(author == provider_name), "attempts": attempts, "result": result}, 0
         if args.dry_run:
             return {"status": "dry_run", "activity": args.activity, "selected": name, "attempts": attempts, "result": result}, 0
-        if result.get("status") == "fallback_required":
+        if result.get("status") == "disabled" or (result.get("status") == "fallback_required" and not (
+                provider_name == "gemini" and isinstance(result.get("quota"), dict)
+                and quota_family(result["quota"]) is not None)):
             blocked.add(provider_name)
-        if result.get("status") in ("provider_error", "setup_error") and account_auth_error(result):
+        if result.get("status") in ("provider_error", "setup_error") and (
+                getattr(route_args, "_account_auth_failure", False) or account_auth_error(result)):
             blocked.add(provider_name)
         if (result.get("fallback_blocked_by_pending") or result.get("fallback_authorized") is False or
                 result.get("status") in ("uncertain_exit", "timeout", "cancelled", "blocked_pending_run") or
                 result.get("status") == "provider_error" and not result.get("terminal_established")):
             return {"status": "blocked_pending_run", "activity": args.activity, "attempts": attempts,
                     "error": "Previous route is not authoritatively resolved; inspect pending state before another writer."}, 1
-        if result.get("status") not in ("fallback_required", "provider_error", "permission_denied", "setup_error", "state_error"):
+        if result.get("status") not in ("fallback_required", "provider_error", "permission_denied", "setup_error", "state_error", "disabled"):
             return {"status": "blocked", "activity": args.activity, "attempts": attempts}, 1
     return {"status": "all_routes_unavailable", "activity": args.activity, "attempts": attempts,
             "error": "No eligible route completed; inspect route logs and account state."}, 20
 
 
 def dispatch_activity(args):
+    muse_auth_mode(args)
+    validate_redaction_secrets(redaction_secrets(read_json(args.config)))
     run_id = getattr(args, "parent_run_id", None) or os.environ.get("FRAMEWORK_PARENT_RUN_ID")
     if not run_id or args.dry_run:
-        return _dispatch_activity_core(args)
+        result, code = _dispatch_activity_core(args)
+        return sanitize_secret_values(result, redaction_secrets(read_json(args.config))), code
     workspace = Path(args.workspace).resolve(strict=True)
     state_dir = Path(args.state_dir or (Path(args.config).resolve().parent / "state")).resolve()
     owned_paths = normalized_owned_paths(workspace, read_json(args.task_file).get("owned_paths"))
@@ -3200,7 +3726,16 @@ def dispatch_activity(args):
         resolve_child_dispatch(state_dir, child_path, {"status": "unresolved"})
         raise
     resolve_child_dispatch(state_dir, child_path, result)
-    return result, code
+    return sanitize_secret_values(result, redaction_secrets(read_json(args.config))), code
+
+
+def print_result(result, config_path=None):
+    # Also cover prelaunch/setup errors, which do not pass through finish().
+    try:
+        config = read_json(config_path) if config_path else {}
+    except (OSError, ValueError, TypeError):
+        config = {}
+    print(json.dumps(sanitize_secret_values(result, redaction_secrets(config)), indent=2))
 
 
 def main():
@@ -3220,20 +3755,22 @@ def main():
             code = 0
         except (OSError, ValueError, KeyError, TypeError) as exc:
             result, code = {"status": "state_error", "error": str(exc)}, 1
-        print(json.dumps(result, indent=2))
+        print_result(result)
         return code
     if len(sys.argv) > 1 and sys.argv[1] in ("status", "quota-set"):
         command = sys.argv[1]
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--config", required=True)
         parser.add_argument("--state-dir")
+        parser.add_argument("--muse-auth", choices=("api",), default=None,
+                            help="Explicit Meta Model API billing via META_API_KEY; requires --provider muse")
         if command == "status":
-            parser.add_argument("--provider", choices=("gemini", "claude", "muse", "openai"))
+            parser.add_argument("--provider", choices=("gemini", "claude", "muse", "openai", "inception"))
             parser.add_argument("--activity")
             parser.add_argument("--profile")
             parser.add_argument("--muse-profile", choices=MUSE_PROFILE_NAMES, default=None)
         if command == "quota-set":
-            parser.add_argument("--provider", choices=("gemini", "claude", "muse", "openai"), required=True)
+            parser.add_argument("--provider", choices=("gemini", "claude", "muse", "openai", "inception"), required=True)
             parser.add_argument("--muse-profile", choices=MUSE_PROFILE_NAMES, default=None)
             parser.add_argument("--reason", required=True)
             parser.add_argument("--reset-at")
@@ -3241,16 +3778,19 @@ def main():
         try:
             args = parser.parse_args(sys.argv[2:])
             result, code = (activity_status(args) if args.activity else cli_quota_status(args)) if command == "status" else cli_quota_set(args)
+        except UnsafeSecretError as exc:
+            print(json.dumps({"status": "state_error", "available_to_try": 0, "error": str(exc)}))
+            return 1
         except (OSError, ValueError, KeyError, TypeError) as exc:
             result = {"status": "state_error", "available_to_try": 0, "error": str(exc)}
             if getattr(args, "provider", None):
-                result["fallback"] = luna_fallback() if args.provider in ("gemini", "muse") else {"model": "gpt-6-astra", "effort": "low"}
+                result["fallback"] = luna_fallback() if args.provider in ("gemini", "muse", "inception") else {"model": "gpt-6-astra", "effort": "low"}
             code = 1
-        print(json.dumps(result, indent=2))
+        print_result(result, args.config)
         return code
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("role", choices=("implement", "review", "dispatch"))
-    parser.add_argument("--provider", choices=("gemini", "claude", "muse", "openai"), default=None)
+    parser.add_argument("--provider", choices=("gemini", "claude", "muse", "openai", "inception"), default=None)
     parser.add_argument("--activity")
     parser.add_argument("--profile")
     parser.add_argument("--parent-run-id")
@@ -3260,6 +3800,8 @@ def main():
     parser.add_argument("--state-dir")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--muse-profile", choices=MUSE_PROFILE_NAMES, default=None)
+    parser.add_argument("--muse-auth", choices=("api",), default=None,
+                        help="Explicit Meta Model API billing via META_API_KEY; requires --provider muse")
     parser.add_argument("--review-effort", choices=("medium", "high"), default=None)
     parser.add_argument("--review-reason", default=None)
     args = parser.parse_args()
@@ -3267,9 +3809,12 @@ def main():
         if args.role != "dispatch" and (args.activity or args.profile or args.parent_run_id):
             raise ValueError("--activity, --profile and --parent-run-id require dispatch; legacy implement/review remain pinned")
         result, code = dispatch_activity(args) if args.role == "dispatch" else execute(args)
+    except UnsafeSecretError as exc:
+        print(json.dumps({"status": "setup_error", "error": str(exc)}))
+        return 1
     except (OSError, ValueError, KeyError, TypeError) as exc:
         result, code = {"status": "setup_error", "error": str(exc)}, 1
-    print(json.dumps(result, indent=2))
+    print_result(result, args.config)
     return code
 
 

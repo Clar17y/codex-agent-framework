@@ -57,6 +57,10 @@ new = "For high-risk changes, identify concrete unresolved correctness questions
 tools = "Read, Grep, Glob"
 model = "opus"
 
+[agents.structured-thinker]
+tools = "Read, Grep, Glob"
+model = "sonnet"
+
 [agents.test-engineer]
 tools = "Read, Grep, Glob, Bash, Write, Edit"
 model = "sonnet"

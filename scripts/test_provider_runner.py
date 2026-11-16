@@ -178,6 +178,184 @@ class CoverageContractTests(unittest.TestCase):
             self.execute("review")
 
 
+class AntigravityQuotaTests(unittest.TestCase):
+    """Persisted offline evidence, including old caches, drives every decision."""
+    MODELS = {"flash": [f"gemini-3.8-flash-{e}" for e in ("low", "medium", "high")],
+              "claude": [f"claude-{m}-5-5-{e}" for m in ("opus", "sonnet") for e in ("low", "medium", "high")],
+              "argon": [f"gemini-4-argon-{e}" for e in ("low", "medium", "high")]}
+    ERROR = {"code": "QUOTA_EXHAUSTED", "message": "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 94h6m29s."}
+
+    def setUp(self):
+        self.root = Path(__file__).resolve().parent.parent / ".llm-output" / str(uuid.uuid4())
+        self.root.mkdir(parents=True)
+        self.config = {"providers": {"gemini": {"model": self.MODELS["flash"][1]}}}
+
+    def record(self, model, error=None, logs="offline-terminal"):
+        with runner.provider_lock(self.root, 5, "quota.lock"):
+            return runner.quota_record("gemini", error or self.ERROR, self.root, logs, self.config, model=model)
+
+    def test_all_known_families_and_effort_variants_are_isolated(self):
+        for family, models in self.MODELS.items():
+            for model in models:
+                with self.subTest(model=model):
+                    state = self.record(model)
+                    self.assertEqual((state["quota_scope"], state["model_family"]), ("model_family", family))
+                    for other, variants in self.MODELS.items():
+                        # Only this family's evidence exists in this fixture.
+                        for variant in variants:
+                            found, error = runner.quota_state(self.root, "gemini", variant)
+                            self.assertIsNone(error)
+                            self.assertEqual(found is not None, other == family)
+                    self.assertEqual(runner.quota_state(self.root, "claude", "claude-opus-5-5"), (None, None))
+            # Remove only this test's generated fixture before the next family.
+            runner.quota_path(self.root, "gemini", family).unlink()
+
+    def test_legacy_individual_cache_is_read_only_and_coexists_with_new_scopes(self):
+        path = self.root / "gemini-quota.json"
+        legacy = {"model": self.MODELS["flash"][1], "retry_at": time.time() + 400000,
+                  "confirmed_error": self.ERROR, "error": self.ERROR, "reset_at": "2099-01-01T00:00:00Z"}
+        path.write_text(json.dumps(legacy, indent=3))
+        before = path.read_bytes()
+        self.record(self.MODELS["claude"][0])
+        self.assertIsNone(runner.quota_state(self.root, "gemini", self.MODELS["argon"][0])[0])
+        # A manual report remains account-wide even if its message looks individual.
+        account = self.record(self.MODELS["argon"][0], logs="operator")
+        self.assertEqual(account["quota_scope"], "account")
+        self.assertTrue((self.root / "gemini-account-quota.json").exists())
+        for models in self.MODELS.values():
+            for model in models:
+                self.assertIsNotNone(runner.quota_state(self.root, "gemini", model)[0])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(json.loads(path.read_bytes())["reset_at"], legacy["reset_at"])
+
+    def test_legacy_unknown_generic_operator_and_conflicting_evidence_are_account_wide(self):
+        base = {"model": self.MODELS["flash"][1], "retry_at": time.time() + 1000,
+                "confirmed_error": self.ERROR}
+        variants = [{"model": "gemini-future"}, {"confirmed_error": {"message": "Daily quota exhausted"}},
+                    {"confirmed_error": "Individual quota reached"}, {"quota_scope": "account"},
+                    {"provenance": "operator_report"}, {"error": {"message": "Weekly limit reached"}},
+                    {"scope": "account"}, {"scope": "unknown"}, {"source_logs": "operator"},
+                    {"confirmed_error": {**self.ERROR, "scope": "account"}},
+                    {"confirmed_error": {**self.ERROR, "model": self.MODELS["argon"][0]}},
+                    {"confirmed_error": {**self.ERROR, "code": "UNKNOWN_SCOPE"}},
+                    {"confirmed_error": {"message": "Individual quota reached. Resets in 2h for the whole account"}},
+                    {"confirmed_error": {"message": "Individual quota reached. Resets in an unknown time"}}]
+        path = self.root / "gemini-quota.json"
+        for change in variants:
+            with self.subTest(change=change):
+                path.write_text(json.dumps({**base, **change}))
+                before = path.read_bytes()
+                for models in self.MODELS.values():
+                    state, error = runner.quota_state(self.root, "gemini", models[0])
+                    self.assertIsNone(error)
+                    self.assertEqual(state["quota_scope"], "account")
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_direct_claude_subscription_limit_does_not_block_antigravity(self):
+        path = self.root / "claude-quota.json"
+        runner.write_json(path, {"model": "claude-opus-5-5", "retry_at": time.time()+1000})
+        before = path.read_bytes()
+        for models in self.MODELS.values():
+            for model in models:
+                self.assertEqual(runner.quota_state(self.root, "gemini", model), (None, None))
+        self.record("claude-sonnet-5-5-medium")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_unknown_model_and_generic_terminal_record_account_wide(self):
+        for model, error in (("unknown", self.ERROR), (self.MODELS["claude"][0], {"message": "Weekly limit reached"}),
+                             (self.MODELS["argon"][0], {**self.ERROR, "quota_scope": "account"})):
+            with self.subTest(model=model, error=error):
+                state = self.record(model, error)
+                self.assertEqual(state["quota_scope"], "account")
+                for models in self.MODELS.values():
+                    self.assertIsNotNone(runner.quota_state(self.root, "gemini", models[0])[0])
+
+    def test_corrupt_or_mismatched_scope_blocks_all_and_is_never_overwritten(self):
+        cases = [("gemini-quota.json", '{"retry_at": NaN}'),
+                 ("gemini-account-quota.json", "[]"),
+                 ("gemini-claude-quota.json", "{"),
+                 ("gemini-argon-quota.json", json.dumps({"retry_at": time.time()+1000, "quota_scope": "model_family",
+                     "model_family": "argon", "model": self.MODELS["flash"][0], "error": self.ERROR})),
+                 ("gemini-quota.json", json.dumps({"retry_at": time.time()+1000, "quota_scope": "unknown"}))]
+        cases.append(("gemini-quota.json", json.dumps({"retry_at": time.time()+1000,
+            "model": self.MODELS["flash"][0], "model_family": "argon", "error": self.ERROR})))
+        for name, content in cases:
+            with self.subTest(name=name, content=content):
+                path = self.root / name
+                path.write_text(content)
+                for models in self.MODELS.values():
+                    state, error = runner.quota_state(self.root, "gemini", models[0])
+                    self.assertIsNone(state)
+                    self.assertTrue(error)
+                with self.assertRaisesRegex(ValueError, "Refusing to overwrite"):
+                    self.record(self.MODELS["argon"][0])
+                self.assertEqual(path.read_text(), content)
+                path.unlink()
+
+    def test_concurrent_family_updates_preserve_latest_retry_and_account_evidence(self):
+        observed = time.time()
+        legacy = self.root / "gemini-quota.json"
+        runner.write_json(legacy, {"retry_at": observed+2000, "quota_scope": "account"})
+        before = legacy.read_bytes()
+        jobs = [(model, observed+seconds) for models in self.MODELS.values()
+                for model, seconds in zip(models[:2], (3000, 5000))]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(lambda job: self.record(job[0], {**self.ERROR, "reset_at": job[1]}), jobs))
+        self.assertEqual(len(results), 6)
+        for family, models in self.MODELS.items():
+            state, error = runner.quota_state(self.root, "gemini", models[0])
+            self.assertIsNone(error)
+            self.assertEqual((state["retry_at"], state["reason"]), (observed+5000, "provider_reset"))
+            retained = self.record(models[0], {**self.ERROR, "reset_at": observed+1000})
+            self.assertEqual(retained["retry_at"], observed+5000)
+        self.assertEqual(legacy.read_bytes(), before)
+
+    def test_retained_longer_quota_reports_its_actual_path_and_scope(self):
+        legacy = self.root / "gemini-quota.json"
+        runner.write_json(legacy, {"model": self.MODELS["flash"][1], "retry_at": time.time()+400000,
+                                   "error": self.ERROR})
+        legacy_bytes = legacy.read_bytes()
+        short = {"message": "Individual quota reached. Resets in 2h."}
+        retained = self.record(self.MODELS["flash"][0], short)
+        self.assertEqual((retained["quota_path"], retained["quota_scope"], retained["model_family"]),
+                         (str(legacy), "model_family", "flash"))
+        self.assertEqual(legacy.read_bytes(), legacy_bytes)
+
+        family = self.record(self.MODELS["claude"][0])
+        family_bytes = Path(family["quota_path"]).read_bytes()
+        retained = self.record(self.MODELS["claude"][1], short)
+        self.assertEqual((retained["quota_path"], retained["model_family"]),
+                         (family["quota_path"], "claude"))
+        self.assertEqual(Path(family["quota_path"]).read_bytes(), family_bytes)
+
+        account = self.record(self.MODELS["argon"][0], logs="operator")
+        account_path = self.root / "gemini-account-quota.json"
+        self.assertEqual(account["quota_path"], str(account_path))
+        account_bytes = account_path.read_bytes()
+        config_path = self.root / "routing.json"
+        runner.write_json(config_path, self.config)
+        args = argparse.Namespace(provider="gemini", config=str(config_path), state_dir=str(self.root),
+                                  reason="Operator observed account limit", reset_at=None)
+        result, code = runner.cli_quota_set(args)
+        self.assertEqual((code, result["quota_path"], result["quota"]["quota_scope"],
+                          result["quota"]["model_family"]), (0, str(account_path), "account", None))
+        self.assertEqual(account_path.read_bytes(), account_bytes)
+
+    def test_expired_family_evidence_probes_without_clearing_other_scopes(self):
+        state = self.record(self.MODELS["flash"][0])
+        state["retry_at"] = time.time()-1
+        path = runner.quota_path(self.root, "gemini", "flash")
+        runner.write_json(path, state)
+        before = path.read_bytes()
+        found, error = runner.quota_state(self.root, "gemini", self.MODELS["flash"][2])
+        self.assertIsNone(error)
+        self.assertLess(found["retry_at"], time.time())
+        self.record(self.MODELS["claude"][0])
+        self.assertEqual(path.read_bytes(), before)
+        # Unknown requested models cannot bypass any existing family evidence.
+        self.assertIsNotNone(runner.quota_state(self.root, "gemini", "unknown")[0])
+
+
 class ProviderTests(unittest.TestCase):
     def setUp(self):
         # Scratch is retained for inspection; never delete repository scratch files.
@@ -906,7 +1084,7 @@ class ProviderTests(unittest.TestCase):
         self.fake.write_text("import time\ntime.sleep(30)", encoding="utf-8")
         self.settings["providers"]["gemini"].update(timeout_seconds=.05, termination_grace_seconds=0)
         captured = []
-        def fail_without_stopping(process):
+        def fail_without_stopping(process, **kwargs):
             captured.append(process)
             raise OSError("cleanup failed")
         try:
@@ -1432,6 +1610,58 @@ class ProviderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "direct npm Node entrypoint could not be found"):
             runner.direct_windows_codex_command([str(shim)], platform_name="nt")
+
+    def test_helpers_do_not_inherit_meta_keys_or_embedded_secret_values(self):
+        secret = "dummy-meta-helper-secret-12345"
+        shim = self.root / "codex.cmd"
+        shim.write_text("volta run codex", encoding="utf-8")
+        binary = self.root / "codex.exe"
+        binary.write_bytes(b"")
+        completed = subprocess.CompletedProcess([], 0, stdout=str(binary), stderr="")
+        with mock.patch.dict(os.environ, {"META_API_KEY": secret, "EMBEDDED_VALUE": "prefix-" + secret}), \
+                mock.patch.object(runner.subprocess, "run", return_value=completed) as call:
+            runner.direct_windows_codex_command([str(shim)], platform_name="nt")
+        self.assertNotIn("META_API_KEY", call.call_args.kwargs["env"])
+        self.assertNotIn("EMBEDDED_VALUE", call.call_args.kwargs["env"])
+
+        process = mock.Mock(pid=123)
+        process.poll.return_value = 0
+        with mock.patch.dict(os.environ, {"META_API_KEY": secret, "EMBEDDED_VALUE": "prefix-" + secret}), \
+                mock.patch.object(runner.os, "name", "nt"), \
+                mock.patch.object(runner.subprocess, "run", return_value=completed) as call:
+            runner.stop_process(process)
+        self.assertNotIn("META_API_KEY", call.call_args.kwargs["env"])
+        self.assertNotIn("EMBEDDED_VALUE", call.call_args.kwargs["env"])
+
+    def test_git_helper_strips_openai_credentials_and_aliases(self):
+        secret = "dummy-openai-helper-secret-38272"
+        output = self.root / "helper-env-output"
+        output.mkdir()
+        completed = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": secret, "OTHER_SETTING": "prefix-" + secret}), \
+                mock.patch.object(runner.subprocess, "run", return_value=completed) as call:
+            runner.git_evidence(self.root, output, [])
+        for invocation in call.call_args_list:
+            self.assertNotIn("OPENAI_API_KEY", invocation.kwargs["env"])
+            self.assertNotIn("OTHER_SETTING", invocation.kwargs["env"])
+
+    def test_non_muse_auth_classification_uses_raw_terminal_error(self):
+        self.fake_result({"status": "ERROR", "error": {"message": "authentication required"}}, 1)
+        with mock.patch.dict(os.environ, {"META_API_KEY": "authentication"}):
+            result, code = self.run_provider()
+        self.assertEqual((result["status"], code), ("provider_error", 1))
+        self.assertTrue(self.args._account_auth_failure)
+        self.assertNotIn("authentication", json.dumps(result))
+
+    def test_inception_quota_file_redacts_run_specific_secrets(self):
+        secret = "dummy-mercury-only-secret-29372"
+        config = {"providers": {"inception": {"model": "mercury-3"}}, "quota_probe_seconds": 300}
+        error = {"code": "QUOTA_EXHAUSTED", "message": "insufficient quota " + secret}
+        with mock.patch.dict(os.environ, {"OTHER_SECRET_TOKEN": secret}):
+            state = runner.quota_record("inception", error, self.root / "inception-state", "operator", config,
+                                        secrets=runner.redaction_secrets(config, mercury=True))
+        self.assertNotIn(secret, json.dumps(state))
+        self.assertNotIn(secret, (self.root / "inception-state/inception-quota.json").read_text(encoding="utf-8"))
 
     def test_child_environment_strips_retired_deepseek_credentials(self):
         config = {"retired_secret_env_vars": ["CUSTOM_DEEPSEEK_KEY"]}
@@ -2837,6 +3067,76 @@ class JevGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "without links or hardlinks"):
             runner.execute(self.args)
         self.assertFalse(self.marker.exists())
+
+
+class MuseApiCliTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).resolve().parent.parent / ".llm-output" / ("meta_cli_" + uuid.uuid4().hex)
+        self.root.mkdir(parents=True)
+        self.config_path = self.root / "routing.json"
+        config = runner.read_json(Path(__file__).resolve().parent.parent / "routing.example.json")
+        config["providers"]["muse"]["executable"] = [sys.executable, "offline-muse.py"]
+        runner.write_json(self.config_path, config)
+        self.task = self.root / "task.json"
+        runner.write_json(self.task, {"objective": "Offline", "owned_paths": ["owned.py"],
+                                      "acceptance_criteria": [], "validation": [], "instructions_files": [],
+                                      "jev": {"search": {"status": "not_applicable", "reason": "Offline CLI authentication fixture"}}})
+
+    def cli(self, command):
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["runner", *command, "--config", str(self.config_path),
+                                             "--state-dir", str(self.root / "state")]), \
+                mock.patch.object(sys, "stdout", output), \
+                mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("local only")):
+            code = runner.main()
+        return json.loads(output.getvalue()), code
+
+    def test_api_option_accepted_on_all_four_command_surfaces(self):
+        selection = ["--provider", "muse", "--muse-auth", "api"]
+        launch = ["--workspace", str(self.root), "--task-file", str(self.task), "--dry-run"]
+        for command in (["status"], ["status", "--activity", "implementation"],
+                        ["implement", *launch], ["dispatch", "--activity", "implementation", *launch],
+                        ["quota-set", "--reason", "Operator API limit"]):
+            with self.subTest(command=command):
+                result, code = self.cli([*command, *selection])
+                self.assertEqual(code, 0, result)
+                if "routes" in result:
+                    items = result["routes"]
+                elif "result" in result:
+                    items = [result["result"]]
+                else:
+                    items = [result]
+                for item in items:
+                    self.assertEqual(item["muse_auth"], "api")
+                    self.assertTrue(item["quota_path"].endswith("muse-api-quota.json"))
+
+    def test_api_option_rejects_implicit_provider_wrong_provider_profile_and_review(self):
+        launch = ["--workspace", str(self.root), "--task-file", str(self.task), "--dry-run"]
+        commands = [
+            ["status"], ["status", "--provider", "gemini"],
+            ["status", "--activity", "implementation", "--profile", "muse-wonder"],
+            ["status", "--activity", "implementation", "--provider", "muse", "--profile", "muse-wonder"],
+            ["quota-set", "--provider", "claude", "--reason", "limit"],
+            ["implement", *launch], ["implement", "--provider", "gemini", *launch],
+            ["review", "--provider", "muse", *launch],
+            ["dispatch", "--activity", "implementation", *launch],
+            ["dispatch", "--activity", "implementation", "--profile", "muse-wonder", *launch]]
+        for command in commands:
+            with self.subTest(command=command):
+                result, code = self.cli([*command, "--muse-auth", "api"])
+                self.assertEqual(code, 1, result)
+                self.assertIn("error", result)
+
+    def test_windows_user_key_reader_never_uses_a_shell(self):
+        registry = mock.MagicMock()
+        registry.QueryValueEx.return_value = ("dummy-registry-key", 1)
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch.dict(sys.modules, {"winreg": registry}), \
+                mock.patch.object(runner.subprocess, "run", side_effect=AssertionError("no shell")):
+            self.assertEqual(runner.windows_user_secret("META_API_KEY"), "dummy-registry-key")
+            registry.QueryValueEx.assert_called_once_with(registry.OpenKey.return_value.__enter__.return_value, "META_API_KEY")
+            registry.OpenKey.side_effect = PermissionError("User environment unavailable")
+            self.assertIsNone(runner.windows_user_secret("META_API_KEY"))
 
 
 if __name__ == "__main__":

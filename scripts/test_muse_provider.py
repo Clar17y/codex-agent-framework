@@ -14,6 +14,10 @@ import unittest
 from unittest import mock
 import uuid
 
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
 import provider_runner as runner
 
 
@@ -74,6 +78,300 @@ class MuseProviderTests(unittest.TestCase):
     def pending(self):
         path = runner.workspace_state_dir(self.state, self.root) / "gemini-pending"
         return [runner.read_json(item) for item in path.glob("*.json")]
+
+    def test_api_key_is_only_in_explicit_child_and_all_artifacts_are_redacted(self):
+        self.args.muse_auth = "api"
+        process_key = "dummy-process-meta-key-124899"
+        user_key = "dummy-user-meta-key-873377"
+        custom_key = "dummy-custom-meta-key-441122"
+        model_key = "dummy-model-api-key-734932"
+        self.settings["providers"]["muse"]["api_key_env"] = "CUSTOM_META_KEY"
+        self.settings["providers"]["muse"]["heartbeat_seconds"] = 5
+        self.fake.write_text(
+            "import json, os, sys\n"
+            "assert os.environ['META_API_KEY'] == " + repr(process_key) + "\n"
+            "assert all(n not in os.environ for n in ['CUSTOM_META_KEY', 'MUSE_API_KEY', 'META_MODEL_API_KEY', 'MODEL_API_KEY'])\n"
+            "print(" + repr(json.dumps(linked())) + ")\n"
+            "event = " + repr(terminal()) + "\n"
+            "event['payload']['text'] = 'Done ' + os.environ['META_API_KEY']\n"
+            "print(json.dumps(event))\n"
+            "print(" + repr(user_key + " " + custom_key) + ", file=sys.stderr)\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"META_API_KEY": process_key, "CUSTOM_META_KEY": custom_key,
+                                         "MODEL_API_KEY": model_key}), \
+                mock.patch.object(runner, "windows_user_secret", side_effect=lambda n: user_key if n == "META_API_KEY" else None):
+            result, code = self.run_muse()
+            self.assertEqual(os.environ["META_API_KEY"], process_key)
+            secrets = runner.redaction_secrets(self.settings)
+            self.assertTrue({process_key, user_key, custom_key, model_key}.issubset(secrets))
+        self.assertEqual((result["status"], code, result["muse_auth"]), ("completed", 0, "api"))
+        self.assertTrue(result["quota_path"].endswith("muse-api-quota.json"))
+        for key in (process_key, user_key, custom_key):
+            self.assertNotIn(key, json.dumps(result))
+            for path in Path(result["logs"]).iterdir():
+                if path.is_file():
+                    self.assertNotIn(key, path.read_text(encoding="utf-8"), str(path))
+        for name in ("progress.json", "heartbeat.json"):
+            self.assertEqual(runner.read_json(Path(result["logs"]) / name)["muse_auth"], "api")
+        self.assertEqual(self.pending()[0]["muse_auth"], "api")
+
+    def test_api_user_environment_key_and_short_secret_redaction(self):
+        self.args.muse_auth = "api"
+        with mock.patch.dict(os.environ):
+            os.environ.pop("META_API_KEY", None)
+            with mock.patch.object(runner, "windows_user_secret", side_effect=lambda n: "z9Q" if n == "META_API_KEY" else None), \
+                    mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("no launch")):
+                with self.assertRaisesRegex(runner.UnsafeSecretError, "too short"):
+                    self.run_muse()
+        self.assertNotIn("z9Q", runner._sanitize_all_secrets("value z9Q", ["z9Q"]))
+
+    def test_prompt_secret_collision_fails_before_writing_or_launching(self):
+        secret = "credential-overlap-123456"
+        task = runner.read_json(self.task)
+        task["objective"] += " " + secret
+        runner.write_json(self.task, task)
+        self.args.muse_auth = "api"
+        with mock.patch.dict(os.environ, {"META_API_KEY": secret}), \
+                mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("no launch")):
+            with self.assertRaisesRegex(runner.UnsafeSecretError, "task text"):
+                self.run_muse()
+        self.assertEqual(self.pending(), [])
+
+    def test_common_short_secret_fails_without_corrupting_the_task(self):
+        task = runner.read_json(self.task)
+        task["objective"] = "Run the testing checks"
+        runner.write_json(self.task, task)
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test"}), \
+                mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("no launch")):
+            with self.assertRaisesRegex(runner.UnsafeSecretError, "too short"):
+                self.run_muse()
+        self.assertEqual(runner.read_json(self.task)["objective"], "Run the testing checks")
+
+    def test_protocol_word_secret_fails_before_any_launch(self):
+        for secret in ("completed", "provider_error"):
+            with self.subTest(secret=secret), mock.patch.dict(os.environ, {"META_API_KEY": secret}), \
+                    mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("no launch")):
+                with self.assertRaisesRegex(runner.UnsafeSecretError, "control text"):
+                    self.run_muse()
+
+    def test_auth_failure_classification_precedes_secret_redaction(self):
+        self.settings["profiles"] = {
+            "first": {"provider": "muse", "model": "muse-wonder-1.0", "effort": "medium"},
+            "second": {"provider": "muse", "model": "muse-spark-1.3", "effort": "medium"}}
+        self.settings["activities"] = {"implementation": ["first", "second"]}
+        runner.write_json(self.config, self.settings)
+        self.emit([linked(), terminal("failed", "", "API error 401: authentication required (auth_error)")], 1)
+        args = argparse.Namespace(**{**vars(self.args), "role": "dispatch", "activity": "implementation",
+                                     "profile": None, "muse_auth": "api", "review_reason": None})
+        with mock.patch.dict(os.environ, {"META_API_KEY": "authentication"}):
+            result, code = runner.dispatch_activity(args)
+        self.assertEqual((result["status"], code), ("all_routes_unavailable", 20))
+        self.assertEqual([a["status"] for a in result["attempts"]],
+                         ["provider_error", "skipped_account_block"])
+        self.assertNotIn("authentication", json.dumps(result))
+
+    def test_user_key_redaction_for_quota_launch_failure_and_live_telemetry(self):
+        import io
+        import time
+        secret = "dummy-user-only-meta-secret-8823"
+        self.args.muse_auth = "api"
+        runner.write_json(self.config, self.settings)
+        with mock.patch.dict(os.environ), \
+                mock.patch.object(runner, "windows_user_secret", side_effect=lambda n: secret if n == "META_API_KEY" else None):
+            os.environ.pop("META_API_KEY", None)
+            args = argparse.Namespace(**{**vars(self.args), "reason": "Reported limit " + secret, "reset_at": None})
+            result, code = runner.cli_quota_set(args)
+            self.assertEqual(code, 0)
+            self.assertNotIn(secret, json.dumps(result))
+            self.assertNotIn(secret, (self.state / "muse-api-quota.json").read_text())
+            self.state = self.root / "launch_failure_state"
+            self.args.state_dir = str(self.state)
+            with mock.patch.object(runner.subprocess, "Popen", side_effect=OSError("setup " + secret)):
+                result, code = self.run_muse()
+            self.assertEqual(code, 1)
+            self.assertNotIn(secret, json.dumps(result))
+            self.assertNotIn(secret, json.dumps(self.pending()))
+            self.assertEqual(self.pending()[0]["status"], "resolved")
+            output = self.root / "telemetry"
+            output.mkdir()
+            (output / "stdout.log").write_text(json.dumps(record(secret, {})) + "\n", encoding="utf-8")
+            state = runner.new_progress_state("muse")
+            state["_redaction_secrets"] = runner.redaction_secrets(self.settings)
+            snapshot, _ = runner.refresh_progress(output, state, time.time(), time.monotonic())
+            relay = io.StringIO()
+            with mock.patch.object(sys, "stderr", relay):
+                runner.emit_progress(snapshot)
+            self.assertNotIn(secret, relay.getvalue())
+            self.assertNotIn(secret, (output / "progress.json").read_text())
+
+    def test_api_missing_or_blank_key_fails_before_any_launch(self):
+        self.args.muse_auth = "api"
+        for value, user_value in ((None, None), ("", "persisted-key"), (" \t ", "persisted-key")):
+            with self.subTest(value=value), mock.patch.dict(os.environ), \
+                    mock.patch.object(runner, "windows_user_secret", return_value=user_value), \
+                    mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("no launch")):
+                os.environ.pop("META_API_KEY", None)
+                if value is not None:
+                    os.environ["META_API_KEY"] = value
+                with self.assertRaisesRegex(ValueError, "nonempty META_API_KEY"):
+                    self.run_muse()
+                self.assertEqual(self.pending(), [])
+
+    def test_api_local_status_and_dry_run_do_not_require_key(self):
+        self.args.muse_auth = "api"
+        self.args.dry_run = True
+        with mock.patch.dict(os.environ), mock.patch.object(runner, "windows_user_secret", return_value=None), \
+                mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("local only")):
+            os.environ.pop("META_API_KEY", None)
+            result, code = self.run_muse()
+            status, status_code = runner.cli_quota_status(self.args)
+        self.assertEqual((code, result["status"], result["muse_auth"]), (0, "dry_run", "api"))
+        self.assertEqual((status_code, status["status"], status["muse_auth"]), (0, "available_to_try", "api"))
+        self.assertIn("muse-api-quota.json", status["quota_path"])
+
+    def test_api_full_profiles_use_wonder_for_launch_status_and_manual_quota(self):
+        self.args.muse_auth = "api"
+        self.args.dry_run = True
+        runner.write_json(self.config, self.settings)
+        for profile, effort in (("complex", "medium"), ("escalation", "high")):
+            with self.subTest(profile=profile):
+                self.args.muse_profile = profile
+                result, code = self.run_muse()
+                status, status_code = runner.cli_quota_status(self.args)
+                self.assertEqual((code, status_code), (0, 0))
+                self.assertEqual((result["model"], status["model"]),
+                                 ("muse-wonder-1.0", "muse-wonder-1.0"))
+                self.assertEqual(result["effort"], effort)
+                self.assertEqual(result["command"][result["command"].index("--model") + 1],
+                                 "muse-wonder-1.0")
+                self.assertEqual(self.settings["providers"]["muse"]["profiles"][profile]["model"],
+                                 "muse-wonder-full-1.0")
+        args = argparse.Namespace(**{**vars(self.args), "reason": "API limit", "reset_at": None})
+        recorded, code = runner.cli_quota_set(args)
+        self.assertEqual((code, recorded["quota"]["model"]), (0, "muse-wonder-1.0"))
+        self.args.muse_auth = None
+        status, _ = runner.cli_quota_status(self.args)
+        self.assertEqual(status["model"], "muse-wonder-full-1.0")
+
+    def test_api_cli_default_is_pinned_to_an_api_model(self):
+        self.settings["providers"]["muse"]["model"] = "cli-default"
+        self.args.muse_auth = "api"
+        self.args.dry_run = True
+        result, code = self.run_muse()
+        self.assertEqual((code, result["model"]), (0, "muse-wonder-1.0"))
+        self.assertEqual(result["command"][result["command"].index("--model") + 1], "muse-wonder-1.0")
+
+    def test_api_quota_record_preflight_and_default_state_are_independent(self):
+        # Old metadata-free state must keep its bytes while API limits are recorded.
+        runner.write_json(self.state / "muse-quota.json", {"provider": "muse", "retry_at": 4102444800})
+        legacy = (self.state / "muse-quota.json").read_bytes()
+        self.args.muse_auth = "api"
+        self.emit([linked(), terminal("failed", "", "API error 403: Weekly usage limit reached. Resets in 1h. (quota_exhausted)")], 1)
+        with mock.patch.dict(os.environ, {"META_API_KEY": "fake-api-key"}):
+            result, code = self.run_muse()
+            self.assertEqual((result["status"], code, result["cached"]), ("fallback_required", 20, False))
+            self.assertEqual(result["quota"]["muse_auth"], "api")
+            with mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("cached")):
+                result, code = self.run_muse()
+                self.assertEqual((code, result["cached"]), (20, True))
+        self.assertEqual((self.state / "muse-quota.json").read_bytes(), legacy)
+        state = runner.read_json(self.state / "muse-api-quota.json")
+        state["retry_at"] = 1
+        runner.write_json(self.state / "muse-api-quota.json", state)
+        self.emit([linked(), terminal()])
+        with mock.patch.dict(os.environ, {"META_API_KEY": "fake-api-key"}):
+            result, code = self.run_muse()
+        self.assertEqual((code, result["status"]), (0, "completed"))
+        self.assertEqual((self.state / "muse-quota.json").read_bytes(), legacy)
+
+    def test_api_manual_limits_do_not_block_default_and_preserve_longer_retry(self):
+        runner.write_json(self.config, self.settings)
+        args = argparse.Namespace(provider="muse", config=str(self.config), state_dir=str(self.state),
+                                  reason="User reported API limit", reset_at=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2)).isoformat(),
+                                  muse_auth="api")
+        first, _ = runner.cli_quota_set(args)
+        args.reset_at = None
+        second, _ = runner.cli_quota_set(args)
+        self.assertEqual(first["quota"]["retry_at"], second["quota"]["retry_at"])
+        self.assertEqual(second["muse_auth"], "api")
+        self.assertTrue(second["quota_path"].endswith("muse-api-quota.json"))
+        self.assertFalse((self.state / "muse-quota.json").exists())
+        self.emit([linked(), terminal()])
+        result, code = self.run_muse()
+        self.assertEqual((code, result["muse_auth"]), (0, "stored"))
+
+    def test_malformed_quota_only_blocks_its_auth_mode(self):
+        for broken_mode, other_mode in (("api", None), (None, "api")):
+            with self.subTest(broken_mode=broken_mode):
+                self.state = self.root / uuid.uuid4().hex
+                self.args.state_dir = str(self.state)
+                path = runner.quota_path(self.state, "muse", muse_auth=broken_mode or "stored")
+                path.parent.mkdir()
+                path.write_text('{"retry_at":"bad"}', encoding="utf-8")
+                self.args.muse_auth = broken_mode
+                with mock.patch.dict(os.environ, {"META_API_KEY": "fake-api-key"}), \
+                        mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("malformed")):
+                    result, code = self.run_muse()
+                self.assertEqual((result["status"], code), ("state_error", 1))
+                self.args.muse_auth = other_mode
+                self.emit([linked(), terminal()])
+                with mock.patch.dict(os.environ, {"META_API_KEY": "fake-api-key"}):
+                    result, code = self.run_muse()
+                self.assertEqual((result["status"], code), ("completed", 0))
+                self.assertEqual(path.read_text(), '{"retry_at":"bad"}')
+
+    def test_unresolved_writers_block_across_auth_modes(self):
+        for first, second in ((None, "api"), ("api", None)):
+            with self.subTest(first=first):
+                self.state = self.root / uuid.uuid4().hex
+                self.args.state_dir = str(self.state)
+                self.args.muse_auth = first
+                self.emit([linked()])  # Missing terminal preserves the shared claim.
+                with mock.patch.dict(os.environ, {"META_API_KEY": "fake-api-key"}):
+                    result, code = self.run_muse()
+                    self.assertEqual((result["status"], code), ("uncertain_exit", 1))
+                    self.args.muse_auth = second
+                    with mock.patch.object(runner.subprocess, "Popen", side_effect=AssertionError("shared writer")):
+                        blocked, code = self.run_muse()
+                self.assertEqual((blocked["status"], code), ("blocked_pending_run", 1))
+
+    def test_api_dispatch_real_fake_cli_retries_limits_and_uncertain_ownership(self):
+        self.settings["profiles"] = {
+            "muse-first": {"provider": "muse", "model": "muse-wonder-1.0", "effort": "medium"},
+            "muse-next": {"provider": "muse", "model": "muse-spark-1.3", "effort": "medium"}}
+        self.settings["activities"] = {"implementation": ["muse-first", "muse-next"]}
+        runner.write_json(self.config, self.settings)
+        reasons = {
+            "model": "API error 400: invalid model (invalid_request_error)",
+            "limit": "API error 403: Weekly usage limit reached. Resets in 1h. (quota_exhausted)",
+            "auth": "API error 401: authentication required (auth_error)",
+            "unknown": None}
+        for mode, reason in reasons.items():
+            with self.subTest(mode=mode):
+                state_dir = self.root / ("dispatch_" + mode)
+                launches = self.root / (mode + "_launches.txt")
+                self.fake.write_text(
+                    "import os, sys\nfrom pathlib import Path\n"
+                    "assert os.environ['META_API_KEY'] == 'fake-dispatch-meta-key'\n"
+                    "model = sys.argv[sys.argv.index('--model') + 1]\n"
+                    "with Path(" + repr(str(launches)) + ").open('a') as out: out.write(model + '\\n')\n"
+                    "print(" + repr(json.dumps(linked())) + ")\n"
+                    "if model == 'muse-wonder-1.0':\n" +
+                    ("    sys.exit(0)\n" if mode == "unknown" else
+                     "    print(" + repr(json.dumps(terminal("failed", "", reason))) + ")\n    sys.exit(1)\n") +
+                    "print(" + repr(json.dumps(terminal())) + ")\n", encoding="utf-8")
+                args = argparse.Namespace(**{**vars(self.args), "role": "dispatch", "activity": "implementation",
+                                             "profile": None, "muse_auth": "api", "review_reason": None,
+                                             "state_dir": str(state_dir)})
+                with mock.patch.dict(os.environ, {"META_API_KEY": "fake-dispatch-meta-key"}):
+                    result, code = runner.dispatch_activity(args)
+                self.assertEqual(len(launches.read_text().splitlines()), 2 if mode == "model" else 1)
+                expected = ("completed", 0) if mode == "model" else ("blocked_pending_run", 1) if mode == "unknown" else ("all_routes_unavailable", 20)
+                self.assertEqual((result["status"], code), expected, result)
+                self.assertEqual((state_dir / "muse-api-quota.json").exists(), mode == "limit")
+                self.assertFalse((state_dir / "muse-quota.json").exists())
+                if mode == "model":
+                    self.assertEqual(result["result"]["muse_auth"], "api")
+                    self.assertEqual(result["selected"], "muse-next")
 
     def test_command_and_cli_default(self):
         self.emit([linked(), terminal()])
@@ -310,10 +608,11 @@ class MuseProviderTests(unittest.TestCase):
         config = {"providers": {"muse": {"api_key_env": "CUSTOM_META_KEY"}},
                   "retired_secret_env_vars": ["OLD_KEY"]}
         values = {"META_API_KEY": "meta-secret", "MUSE_API_KEY": "muse-secret",
-                  "META_MODEL_API_KEY": "model-secret", "CUSTOM_META_KEY": "custom-secret",
+                  "META_MODEL_API_KEY": "model-secret", "MODEL_API_KEY": "generic-model-secret",
+                  "CUSTOM_META_KEY": "custom-secret",
                   "OLD_KEY": "retired-secret", "TYPESAFE_API_KEY": "helper-secret"}
         with mock.patch.dict(os.environ, values):
-            for provider in ("muse", "gemini", "claude"):
+            for provider in ("muse", "gemini", "claude", "openai", "inception"):
                 with self.subTest(provider=provider):
                     child = runner.child_environment(config, provider)
                     self.assertTrue(values.keys().isdisjoint(child))

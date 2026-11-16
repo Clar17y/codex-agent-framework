@@ -22,7 +22,7 @@ CLAUDE_END_MARKER = '<!-- END CLAUDE MULTI-PROVIDER FRAMEWORK -->'
 ROLE_FILES = (
     'complex-implementer', 'correctness-gate', 'docs-researcher', 'explorer',
     'implementer', 'planner', 'quality-gate-max', 'refactor-auditor',
-    'reviewer', 'security-reviewer', 'test-engineer', 'verifier',
+    'reviewer', 'security-reviewer', 'structured-thinker', 'test-engineer', 'verifier',
 )
 
 # Claude skills authored for Claude Code; framework-simplify is derived from
@@ -123,8 +123,9 @@ def collect_sources(source, host='codex'):
              'routing.example.json', 'install.py', 'scripts/provider_runner.py',
              'agents/framework-reader.md',
              'scripts/test_provider_runner.py', 'scripts/test_install.py',
-             'scripts/test_activity_dispatch.py',
-             'scripts/test_muse_provider.py', 'docs/FRAMEWORK.md',
+             'scripts/test_activity_dispatch.py', 'scripts/run_tests.py', 'scripts/test_run_tests.py',
+             'scripts/test_muse_provider.py', 'scripts/mercury_provider.py', 'scripts/mercury_reader.py',
+             'scripts/test_mercury_provider.py', 'scripts/test_mercury_reader.py', 'docs/FRAMEWORK.md',
              'scripts/jev_client.py', 'scripts/jev_search.py', 'scripts/jev_review.py',
              'scripts/test_jev_client.py', 'scripts/test_jev_search.py', 'scripts/test_jev_review.py']
     names += [f'agents/{name}.toml' for name in ROLE_FILES]
@@ -148,6 +149,26 @@ MUSE_PROFILE_DEFAULTS = {
     'escalation': {'model': 'muse-wonder-full-1.0', 'effort': 'high'},
 }
 MUSE_EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+
+
+# Exact v12 packaged chains eligible for the one-time v13 migration.
+V12_ACTIVITY_DEFAULTS = {
+    'orchestration': ['openai-sol', 'claude-opus', 'muse-full', 'claude-sonnet', 'gemini-flash', 'muse-wonder'],
+    'planning': ['openai-sol', 'claude-opus', 'muse-full', 'claude-sonnet', 'gemini-flash-high'],
+    'exploration': ['openai-luna', 'claude-haiku', 'gemini-flash', 'muse-wonder'],
+    'implementation': ['gemini-flash', 'muse-wonder', 'claude-sonnet', 'openai-sol'],
+    'implementation_complex': ['openai-sol-high', 'muse-full', 'claude-opus', 'claude-sonnet-high', 'gemini-flash-high'],
+    'implementation_long_horizon': ['muse-full', 'claude-opus', 'openai-sol-high', 'claude-sonnet-high', 'gemini-flash-high'],
+    'test_design': ['openai-sol', 'claude-opus', 'muse-full', 'claude-sonnet', 'gemini-flash'],
+    'testing': ['openai-sol', 'claude-sonnet', 'gemini-flash', 'muse-wonder'],
+    'verification': ['openai-luna', 'gemini-flash', 'claude-haiku', 'muse-wonder'],
+    'independent_review': ['claude-opus', 'openai-sol', 'muse-full', 'claude-sonnet', 'gemini-flash-high', 'muse-wonder'],
+    'security_review': ['claude-opus-high', 'openai-sol-high', 'muse-full-high', 'claude-sonnet-high', 'gemini-flash-high'],
+    'refactor_audit': ['openai-luna', 'claude-sonnet', 'gemini-flash', 'muse-wonder'],
+    'documentation': ['gemini-flash', 'openai-luna', 'claude-haiku', 'muse-wonder'],
+    'docs_research': ['gemini-flash', 'openai-luna', 'claude-haiku', 'muse-wonder'],
+    'deep_review': ['openai-astra', 'claude-opus-high', 'muse-full-high', 'openai-sol-high', 'gemini-flash-high'],
+}
 
 
 def merge_muse_profiles(entry, source_defaults):
@@ -222,7 +243,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
 
     source_defaults = example['providers'] if preserving else {}
 
-    target_version = config.get('version', 1) if preserving else 12
+    target_version = config.get('version', 1) if preserving else 13
     if isinstance(target_version, bool) or not isinstance(target_version, int):
         raise PreflightError('Routing configuration version must be an integer.')
 
@@ -230,14 +251,15 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
         ('gemini', 'agy', gemini_override),
         ('claude', 'claude', claude_override),
         ('muse', 'muse', muse_override),
-        ('openai', 'codex', None)
+        ('openai', 'codex', None),
+        ('inception', 'python', None)
     ]
     for provider, command, override in providers_info:
         entry = config['providers'].get(provider)
         if entry is None and preserving:
             default_entry = source_defaults.get(provider, {
                 'executable': command,
-                'model': {'gemini': 'gemini-3.8-flash-medium', 'claude': 'claude-opus-5-5', 'muse': 'muse-wonder-1.0', 'openai': 'gpt-6.1-sol'}[provider]
+                'model': {'gemini': 'gemini-3.8-flash-medium', 'claude': 'claude-opus-5-5', 'muse': 'muse-wonder-1.0', 'openai': 'gpt-6.1-sol', 'inception': 'mercury-3'}[provider]
             })
             entry = copy.deepcopy(default_entry)
             config['providers'][provider] = entry
@@ -263,6 +285,12 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
                              source_defaults.get('openai', {}).get('orchestration_windows_sandbox', entry['windows_sandbox']))
             entry.setdefault('orchestration_writable_roots',
                              copy.deepcopy(source_defaults.get('openai', {}).get('orchestration_writable_roots', [])))
+        if preserving and provider == 'inception' and isinstance(entry, dict):
+            for key, value in source_defaults.get('inception', {}).items():
+                entry.setdefault(key, copy.deepcopy(value))
+        if provider == 'inception' and isinstance(entry, dict):
+            entry.pop('api_key', None)
+            entry.pop('INCEPTION_API_KEY', None)
 
         if not isinstance(entry, dict) or not entry.get('model') or not entry.get('executable'):
             raise PreflightError(f'Invalid routing entry: {provider}')
@@ -297,7 +325,7 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
         # Stream telemetry is universal in v7. Make the effective default
         # visible in preserved routing files while retaining every explicit
         # operator value, including zero (disabled).
-        for provider_name in ('gemini', 'claude', 'muse'):
+        for provider_name in ('gemini', 'claude', 'muse', 'inception'):
             entry = config['providers'].get(provider_name)
             provider_defaults = source_defaults.get(provider_name, {})
             if (isinstance(entry, dict) and 'heartbeat_seconds' not in entry and
@@ -337,11 +365,11 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
                     raise PreflightError('retired_secret_env_vars must be a list of environment variable names.')
                 if env_name not in names:
                     names.append(env_name)
-            config['version'] = 12
+            config['version'] = 13
         else:
-            config['version'] = max(target_version, 12)
+            config['version'] = max(target_version, 13)
     else:
-        config['version'] = 12
+        config['version'] = 13
     # v12 adds editable activity chains. Retain explicit operator choices and
     # carry forward legacy provider pin customizations into the routine profile.
     default_profiles = example.get('profiles', {})
@@ -368,6 +396,15 @@ def resolve_routing(source, root, gemini_override=None, claude_override=None, re
         for old, new in (('complex', 'muse-full'), ('escalation', 'muse-full-high')):
             if new not in profiles and old in muse_profiles:
                 profiles[new] = {'provider': 'muse', **copy.deepcopy(muse_profiles[old])}
+    # Migrate exact packaged chains only. A changed profile used by a chain
+    # is also an operator choice, even if the list itself is unchanged.
+    if preserving and target_version < 13:
+        for name, previous in V12_ACTIVITY_DEFAULTS.items():
+            if (activities.get(name) == previous and
+                    all(profiles.get(profile) == default_profiles.get(profile) for profile in previous) and
+                    all(profile not in profiles or profiles[profile] == default_profiles.get(profile)
+                        for profile in default_activities[name])):
+                activities[name] = copy.deepcopy(default_activities[name])
     for name, value in default_profiles.items():
         profiles.setdefault(name, copy.deepcopy(value))
     for name, value in default_activities.items():

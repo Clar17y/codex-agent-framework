@@ -346,6 +346,38 @@ class TestMercuryReader(unittest.TestCase):
         for source in ('password:\npublic: visible\n', 'password:\n}\npublic: visible\n'):
             self.assertIn('visible', redact_text(source))
 
+    def test_quoted_credential_logical_value_boundaries(self):
+        from scripts.mercury_reader import redact_text
+        cases = [
+            "password: 'prefix''\n  OPAQUE_VALUE'\npublic: visible\n",
+            "password:\n  'prefix''''\n  OPAQUE_VALUE'''\npublic: visible\n",
+            "password: '''prefix\n  OPAQUE_VALUE'\npublic: visible\n",
+            "password: 'OPAQUE_VALUE\\'\npublic: visible\n",
+            "password: \"prefix\\\"\n  OPAQUE_VALUE\"\npublic: visible\n",
+            "password = 'prefix' 'OPAQUE_VALUE'\npublic = 'visible'\n",
+            "password = 'prefix' \\\n  r'OPAQUE_VALUE'\npublic = 'visible'\n",
+            "password = r'prefix\\'still hidden\nOPAQUE_VALUE'\npublic = 'visible'\n",
+            "password: [\n 'prefix'''' ] /* not a comment */\n OPAQUE_VALUE',\n 'tail'\n]\npublic: visible\n",
+            "password = (\n 'prefix' # comment with quote '\n r'OPAQUE_VALUE'\n)\npublic = 'visible'\n",
+        ]
+        cases.append("password = 'prefix'" + " 'OPAQUE_VALUE'" * 800 + "\npublic = 'visible'\n")
+        for pairs in range(1, 5):
+            escaped = "''" * pairs
+            cases.append("password: 'prefix" + escaped + "\n  OPAQUE_VALUE" + escaped + "'\npublic: visible\n")
+            cases.append("password:\n  'prefix" + escaped + "\n  OPAQUE_VALUE" + escaped + "'\npublic: visible\n")
+        for source in cases:
+            with self.subTest(source=source):
+                (self.root / 'config.yaml').write_text(source, encoding='utf-8')
+                sanitized = redact_text(source)
+                self.assertNotIn('OPAQUE_VALUE', sanitized)
+                self.assertEqual(sanitized.count('\n'), source.count('\n'))
+                for number in range(1, len(source.splitlines()) + 1):
+                    partial = read_file(self.root, 'config.yaml', start=number, end=number)['text']
+                    self.assertNotIn('OPAQUE_VALUE', partial)
+                    self.assertIn(f'{number} |', partial)
+                self.assertEqual(search(self.root, 'OPAQUE_VALUE', 'config.yaml')['count'], 0)
+                self.assertIn('visible', read_file(self.root, 'config.yaml')['text'])
+
     def test_detached_plain_credential_logical_boundaries(self):
         from scripts.mercury_reader import redact_text
         cases = [

@@ -43,26 +43,47 @@ class _CredentialBlocks:
 
     def __init__(self):
         self.quote = None
+        self.quote_yaml = False
         self.indent = None
         self.pending = False
+        self.pending_yaml = False
         self.pending_indent = 0
         self.plain_indent = None
         self.pending_comment = False
         self.container = []
+        self.container_yaml = False
         self.container_quote = None
         self.container_comment = False
 
     @staticmethod
-    def closing(body, quote):
+    def closing(body, quote, *, yaml=False):
         offset = 0
         while True:
             pos = body.find(quote, offset)
             if pos < 0:
                 return -1
+            if yaml and quote == "'":
+                if body.startswith("''", pos):
+                    offset = pos + 2
+                    continue
+                return pos
             preceding = len(body[:pos]) - len(body[:pos].rstrip('\\'))
             if preceding % 2 == 0:
                 return pos
             offset = pos + len(quote)
+
+    @staticmethod
+    def opening(value, yaml=False):
+        if value.startswith(('\\\"', "\\\'")):
+            return value[:2], 2, False
+        # YAML's three initial apostrophes are an opening quote plus an escaped
+        # apostrophe, not a Python triple-quoted string.
+        if yaml and value.startswith("'"):
+            return "'", 1, True
+        match = re.match(r"""(?i)[rubf]{0,2}("{3}|'{3}|"|')""", value)
+        if match:
+            return match[1], match.end(), yaml and value[0] in ('"', "'")
+        return None
 
     @staticmethod
     def field_start(value):
@@ -76,11 +97,11 @@ class _CredentialBlocks:
         if self.container:
             return self.container_value(body, ending)
         if self.quote:
-            close = self.closing(body, self.quote)
+            close = self.closing(body, self.quote, yaml=self.quote_yaml)
             if close < 0:
                 return '[REDACTED]' + ending
             quote, self.quote = self.quote, None
-            return '[REDACTED]' + quote + self.line(body[close + len(quote):]) + ending
+            return '[REDACTED]' + quote + self.quote_tail(body[close + len(quote):], ending, yaml=self.quote_yaml, adjacent=len(quote) != 2)
         if self.plain_indent is not None:
             stripped = body.lstrip(' \t')
             indent = len(body) - len(stripped)
@@ -122,7 +143,7 @@ class _CredentialBlocks:
             if (not value.startswith(('}', ']', ',')) and value not in ('---', '...') and
                     (indent > self.pending_indent or not self.field_start(value))):
                 return self.value(body[:offset], value, ending, pending=True,
-                                  plain_indent=self.pending_indent)
+                                  plain_indent=self.pending_indent, yaml=self.pending_yaml)
         match = self.assignment.search(body)
         if not match:
             return line
@@ -131,39 +152,63 @@ class _CredentialBlocks:
         indent = len(body) - len(body.lstrip(' \t'))
         key_indent = match.start() if body[:match.start()].strip() == '-' else indent
         self.pending_indent = key_indent
+        yaml_scalar = prefix.rstrip().endswith(':') and body[:match.start()].strip() in ('', '-')
+        self.pending_yaml = yaml_scalar
         if not value or value.startswith(('#', '//')):
             self.pending = True
             return line
         if value.startswith('/*'):
             self.pending = True
             return prefix + self.line(value) + ending
-        yaml_scalar = prefix.rstrip().endswith(':') and body[:match.start()].strip() in ('', '-')
-        return self.value(prefix, value, ending, plain_indent=key_indent if yaml_scalar else None)
+        return self.value(prefix, value, ending, plain_indent=key_indent if yaml_scalar else None, yaml=yaml_scalar)
 
-    def value(self, prefix, value, ending, *, pending=False, plain_indent=None):
+    def value(self, prefix, value, ending, *, pending=False, plain_indent=None, yaml=False):
         if re.fullmatch(r'[|>][1-9+\-]*[ \t]*(?:#.*)?', value):
             self.indent = len(prefix) - len(prefix.lstrip(' \t'))
             return prefix + value + ending
         if value.startswith(('[', '{', '(')):
+            self.container_yaml = yaml
             return prefix + self.container_value(value, ending)
-        opening = re.match(r"""(?i)[rubf]{0,2}("{3}|'{3}|"|')""", value)
-        escaped = value.startswith(('\\"', "\\'"))
-        if opening or escaped:
-            quote = value[:2] if escaped else opening[1]
-            end = 2 if escaped else opening.end()
-            rest = value[end:]
-            close = self.closing(rest, quote)
-            prefix += value[:end]
-            if close < 0:
-                self.quote = quote
-                return prefix + '[REDACTED]' + ending
-            return prefix + '[REDACTED]' + quote + self.line(rest[close + len(quote):]) + ending
+        if self.opening(value, yaml):
+            return self.quoted_value(prefix, value, ending, yaml=yaml)
         if plain_indent is not None:
             self.plain_indent = plain_indent
         # Inline bare values retain the scalar sanitizer below. Detached plain
         # values and their continuation subtree stay hidden until a real field
         # or structural/document boundary at the credential key's indentation.
         return prefix + ('[REDACTED]' if pending or plain_indent is not None else value) + ending
+
+    def quote_tail(self, tail, ending, *, yaml=False, adjacent=True):
+        if not yaml and adjacent:
+            if re.fullmatch(r'[ \t]*\\[ \t]*', tail):
+                self.pending = True
+                self.pending_yaml = False
+                return tail + ending
+            offset = len(tail) - len(tail.lstrip(' \t'))
+            if self.opening(tail[offset:]):
+                return self.quoted_value(tail[:offset], tail[offset:], ending)
+        return self.line(tail) + ending
+
+    def quoted_value(self, prefix, value, ending, *, yaml=False):
+        parts = []
+        while True:
+            quote, end, quote_yaml = self.opening(value, yaml)
+            parts.extend((value[:end], '[REDACTED]'))
+            rest = value[end:]
+            close = self.closing(rest, quote, yaml=quote_yaml)
+            if close < 0:
+                self.quote, self.quote_yaml = quote, quote_yaml
+                return prefix + ''.join(parts) + ending
+            parts.append(quote)
+            tail = rest[close + len(quote):]
+            offset = len(tail) - len(tail.lstrip(' \t'))
+            if not quote_yaml and len(quote) != 2 and self.opening(tail[offset:]):
+                # Adjacent literals belong to the same recognized value.
+                # Iterate without recursive depth proportional to literal count.
+                parts.append(tail[:offset])
+                value = tail[offset:]
+                continue
+            return prefix + ''.join(parts) + self.quote_tail(tail, ending, yaml=quote_yaml, adjacent=len(quote) != 2)
 
     def container_value(self, body, ending):
         """Suppress balanced compound values without buffering the source."""
@@ -177,7 +222,7 @@ class _CredentialBlocks:
                 self.container_comment = False
                 i = close + 2
             elif self.container_quote:
-                close = self.closing(body[i:], self.container_quote)
+                close = self.closing(body[i:], self.container_quote, yaml=self.container_yaml)
                 if close < 0:
                     break
                 i += close + len(self.container_quote)
@@ -188,7 +233,7 @@ class _CredentialBlocks:
             elif body.startswith('//', i) or body[i] == '#':
                 break
             elif body[i] in ('"', "'"):
-                self.container_quote = body[i] * (3 if body.startswith(body[i] * 3, i) else 1)
+                self.container_quote = self.opening(body[i:], self.container_yaml)[0]
                 i += len(self.container_quote)
             elif body[i] in '[{(':
                 self.container.append(body[i])

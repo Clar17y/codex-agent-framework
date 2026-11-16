@@ -499,7 +499,17 @@ class TestMercuryProvider(unittest.TestCase):
         self.assertEqual(result['tool_calls_count'], 2)
 
     def test_multiline_credentials_absent_from_requests_and_artifacts(self):
-        sources = ['database_password: PRIVATE_FIXTURE_FIRST\n  PRIVATE_FIXTURE_SECOND\npublic: visible\n',
+        sources = ["password: 'PRIVATE_FIXTURE_FIRST\\'\npublic: visible\n",
+                   "password: \"prefix\\\"\n  PRIVATE_FIXTURE_FIRST\"\npublic: visible\n",
+                   "password = r'prefix\\'still hidden\nPRIVATE_FIXTURE_FIRST'\npublic = 'visible'\n",
+                   "password = (\n 'prefix' # comment with quote '\n r'PRIVATE_FIXTURE_FIRST'\n)\npublic = 'visible'\n",
+                   "password: 'prefix''\n  PRIVATE_FIXTURE_FIRST'\npublic: visible\n",
+                   "password:\n  'prefix''''\n  PRIVATE_FIXTURE_FIRST'''\npublic: visible\n",
+                   "password: '''prefix\n  PRIVATE_FIXTURE_FIRST'\npublic: visible\n",
+                   "password = 'prefix' 'PRIVATE_FIXTURE_FIRST'\npublic = 'visible'\n",
+                   "password = 'prefix' \\\n  r'PRIVATE_FIXTURE_FIRST'\npublic = 'visible'\n",
+                   "password: [\n 'prefix'''' ] /* not a comment */\n PRIVATE_FIXTURE_FIRST',\n 'tail'\n]\npublic: visible\n",
+                   'database_password: PRIVATE_FIXTURE_FIRST\n  PRIVATE_FIXTURE_SECOND\npublic: visible\n',
                    '- database_password:\n    PRIVATE_FIXTURE_FIRST\n    PRIVATE_FIXTURE_SECOND\n  public: visible\n',
                    'database_password:\n  proto://PRIVATE_FIXTURE_FIRST@host/db\npublic: visible\n',
                    'database_password:\n  PRIVATE_FIXTURE_FIRST\n  PRIVATE_FIXTURE_SECOND\npublic: visible\n',
